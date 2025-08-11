@@ -1,0 +1,7 @@
+streamlit
+pandas
+PyMuPDF
+openpyxl
+requests
+supabase
+numpy
