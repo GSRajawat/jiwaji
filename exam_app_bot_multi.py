@@ -70,6 +70,18 @@ def get_center_filepath(filename):
     os.makedirs(center_dir, exist_ok=True) # Ensure the directory exists
     return os.path.join(center_dir, filename)
 
+def _format_paper_code(paper_code_str):
+    """
+    Standardizes paper codes by stripping whitespace, removing spaces,
+    converting to uppercase, and removing non-alphanumeric characters
+    except hyphens.
+    """
+    if pd.isna(paper_code_str):
+        return ""
+    code = str(paper_code_str).strip().replace(" ", "").upper()
+    # Remove any non-alphanumeric characters except '-'
+    code = re.sub(r'[^A-Z0-9-]', '', code)
+    return code
 
 # --- CORRECTED: upload_csv_to_supabase function ---
 def upload_csv_to_supabase(table_name, csv_path, unique_cols=None):
