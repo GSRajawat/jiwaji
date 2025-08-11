@@ -70,19 +70,20 @@ def get_center_filepath(filename):
     os.makedirs(center_dir, exist_ok=True) # Ensure the directory exists
     return os.path.join(center_dir, filename)
 
+# --- Helper for paper code formatting ---
 def _format_paper_code(paper_code_str):
     """
     Standardizes paper codes by stripping whitespace, removing spaces,
-    converting to uppercase, and removing non-alphanumeric characters
+    converting to lowercase, and removing non-alphanumeric characters
     except hyphens.
     """
     if pd.isna(paper_code_str):
         return ""
-    code = str(paper_code_str).strip().replace(" ", "").upper()
-    # Remove any non-alphanumeric characters except '-'
-    code = re.sub(r'[^A-Z0-9-]', '', code)
+    # 👇 CHANGE .upper() to .lower() here
+    code = str(paper_code_str).strip().replace(" ", "").lower()
+    # Remove any non-alphanumeric characters except '-' (adjust regex for lowercase alphabet)
+    code = re.sub(r'[^a-z0-9-]', '', code)
     return code
-
 # --- CORRECTED: upload_csv_to_supabase function ---
 def upload_csv_to_supabase(table_name, csv_path, unique_cols=None):
     try:
@@ -1147,7 +1148,7 @@ def process_sitting_plan_pdfs(zip_file_buffer, output_sitting_plan_path, output_
     else:
         st.warning("No roll numbers extracted from PDFs to update sitting plan.")
 
-    # Process unique exams for timetable generation
+     # Process unique exams for timetable generation
     if unique_exams_for_timetable:
         df_new_timetable_entries = pd.DataFrame(unique_exams_for_timetable).drop_duplicates().reset_index(drop=True)
         
@@ -1159,8 +1160,9 @@ def process_sitting_plan_pdfs(zip_file_buffer, output_sitting_plan_path, output_
             try:
                 existing_timetable_df = pd.read_csv(output_timetable_path)
                 existing_timetable_df.columns = existing_timetable_df.columns.str.strip() # Clean column names
+                # CRITICAL FIX HERE: Apply _format_paper_code to existing data to ensure consistency with new entries
                 if 'Paper Code' in existing_timetable_df.columns:
-                    existing_timetable_df['Paper Code'] = existing_timetable_df['Paper Code'].astype(str).str.strip()
+                    existing_timetable_df['Paper Code'] = existing_timetable_df['Paper Code'].apply(_format_paper_code)
             except Exception as e:
                 st.warning(f"Could not load existing timetable: {e}. Starting fresh.")
                 existing_timetable_df = pd.DataFrame(columns=expected_columns) # Create empty with all cols
@@ -1181,14 +1183,22 @@ def process_sitting_plan_pdfs(zip_file_buffer, output_sitting_plan_path, output_
 
         combined_df = pd.concat([existing_timetable_df, df_new_timetable_entries], ignore_index=True)
         
-        # Drop duplicates based on unique exam fields
-        unique_fields = ["Date", "Shift", "Time", "Class", "Paper", "Paper Code", "Paper Name"]
-        # Ensure 'Time' is included in unique fields for proper deduplication
-        # Ensure all unique_fields are in combined_df before dropping duplicates
-        unique_fields = [f for f in unique_fields if f in combined_df.columns]
+        # --- CRITICAL FIX: Deduplicate based on Supabase unique constraint and enforce consistent casing ---
+        # These are the columns that must be unique in the DB: date, shift, class, paper_code
+        unique_fields_for_supabase_constraint = ["Date", "Shift", "Class", "Paper Code"]
+        
+        for col in unique_fields_for_supabase_constraint:
+            if col in combined_df.columns:
+                # Convert to string to handle potential mixed types/None, strip whitespace, and LOWERCASE
+                combined_df[col] = combined_df[col].astype(str).str.strip().str.lower()
+            else:
+                st.error(f"Error: Required unique column '{col}' missing from combined_df in process_sitting_plan_pdfs for timetable deduplication.")
+                return False, f"Missing critical column '{col}' for timetable deduplication."
 
-
-        df_timetable_final = combined_df.drop_duplicates(subset=unique_fields, keep='first').reset_index(drop=True)
+        df_timetable_final = combined_df.drop_duplicates(
+            subset=unique_fields_for_supabase_constraint, # Use the Supabase constraint fields
+            keep='first' 
+        ).reset_index(drop=True)
         
         # Re-assign SN column sequentially
         df_timetable_final["SN"] = range(1, len(df_timetable_final) + 1)
@@ -1201,6 +1211,7 @@ def process_sitting_plan_pdfs(zip_file_buffer, output_sitting_plan_path, output_
         return False, "No data to process."
 
     return True, "PDF processing complete."
+    
 
 def process_attestation_pdfs(zip_file_buffer, output_csv_path):
     all_data = []
