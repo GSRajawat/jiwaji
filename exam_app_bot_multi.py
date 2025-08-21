@@ -37,7 +37,7 @@ if 'traded_value_threshold' not in st.session_state:
 if 'high_low_diff_multiplier' not in st.session_state:
     st.session_state.high_low_diff_multiplier = 4
 if 'capital' not in st.session_state:
-    st.session_state.capital = 100000
+    st.session_state.capital = 10000
 if 'quantity_factor' not in st.session_state:
     st.session_state.quantity_factor = 10
 if 'stoploss_factor' not in st.session_state:
