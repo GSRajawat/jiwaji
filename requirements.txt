@@ -1,7 +1,5 @@
-streamlit
-pandas
-PyMuPDF
-openpyxl
 requests
-supabase
-numpy
+websocket_client
+./dist/NorenRestApi-0.0.29-py3-none-any.whl
+pandas
+pyyaml
