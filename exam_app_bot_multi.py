@@ -29,26 +29,21 @@ EXCHANGE = 'NSE'
 CANDLE_INTERVAL = '1'  # 1-minute candles
 REQUIRED_CANDLES = 21 # Latest candle + previous 20 for calculations
 
-# --- NEW: Entry/Exit Buffers and Risk Parameters ---
-ENTRY_BUFFER_PERCENT = 0.0005 # 0.05% buffer for crossing high/low for entry
-RISK_PERCENTAGE_OF_CAPITAL = 0.01 # 1% of capital risked per trade
-
 # Initialize session state variables for modifiable parameters
 if 'volume_multiplier' not in st.session_state:
     st.session_state.volume_multiplier = 10
 if 'traded_value_threshold' not in st.session_state:
-    st.session_state.traded_value_threshold = 10000000
+    st.session_state.traded_value_threshold = 100000000
 if 'high_low_diff_multiplier' not in st.session_state:
     st.session_state.high_low_diff_multiplier = 4
 if 'capital' not in st.session_state:
-    st.session_state.capital = 100000
+    st.session_state.capital = 10000
+if 'quantity_factor' not in st.session_state:
+    st.session_state.quantity_factor = 10
+if 'stoploss_factor' not in st.session_state:
+    st.session_state.stoploss_factor = 1000
 if 'target_multiplier' not in st.session_state:
-    st.session_state.target_multiplier = 4 # Target is X times potential loss
-
-# New session state for pending entries
-if 'pending_entries' not in st.session_state:
-    st.session_state.pending_entries = {} # {tsym: {signal_candle_high, signal_candle_low, buy_or_sell, calculated_sl_price, calculated_tp_price, calculated_quantity}}
-
+    st.session_state.target_multiplier = 4
 if 'open_tracked_trades' not in st.session_state:
     st.session_state.open_tracked_trades = {} # To track trades placed by the app
 
@@ -129,12 +124,14 @@ def screen_stock(stock_info, api):
         api (NorenApiPy): The initialized Flattrade API object.
 
     Returns:
-        tuple: (stock_symbol, 'BUY'/'SELL'/'NEUTRAL', reason, current_price, signal_candle_high, signal_candle_low)
-               signal_candle_high/low are None if no signal or insufficient data.
+        tuple: (stock_symbol, 'BUY'/'SELL'/'NEUTRAL', reason, current_price)
+               current_price is returned only if a signal is generated, else None.
     """
     exchange = stock_info['exchange']
     token = stock_info['token']
     tradingsymbol = stock_info['tsym']
+
+    # st.info(f"Screening {tradingsymbol}...") # Too verbose for Streamlit display
 
     # Calculate start time for fetching 21 candles (20 for average + 1 current)
     end_time = datetime.datetime.now()
@@ -151,7 +148,7 @@ def screen_stock(stock_info, api):
 
         if not candle_data or len(candle_data) < REQUIRED_CANDLES:
             logging.warning(f"Not enough 1-min candle data for {tradingsymbol}. Needed: {REQUIRED_CANDLES}, Got: {len(candle_data) if candle_data else 0}")
-            return tradingsymbol, 'NEUTRAL', 'Insufficient candle data', None, None, None
+            return tradingsymbol, 'NEUTRAL', 'Insufficient candle data', None
 
         current_candle = candle_data[0]
         previous_20_candles = candle_data[1:REQUIRED_CANDLES] 
@@ -159,28 +156,28 @@ def screen_stock(stock_info, api):
         # --- 1. Volume Check ---
         current_volume = float(current_candle.get('intv', 0))
         if current_volume == 0:
-            return tradingsymbol, 'NEUTRAL', 'Current candle volume is zero', None, None, None
+            return tradingsymbol, 'NEUTRAL', 'Current candle volume is zero', None
             
         previous_volumes = [float(c.get('intv', 0)) for c in previous_20_candles]
         non_zero_previous_volumes = [v for v in previous_volumes if v > 0]
 
         if not non_zero_previous_volumes:
-            return tradingsymbol, 'NEUTRAL', 'No valid volume data in previous 20 candles', None, None, None
+            return tradingsymbol, 'NEUTRAL', 'No valid volume data in previous 20 candles', None
 
         average_volume_last_20 = sum(non_zero_previous_volumes) / len(non_zero_previous_volumes)
 
         if not (current_volume > st.session_state.volume_multiplier * average_volume_last_20):
-            return tradingsymbol, 'NEUTRAL', 'Volume condition not met', None, None, None
+            return tradingsymbol, 'NEUTRAL', 'Volume condition not met', None
 
         # --- 2. Traded Value Check ---
         current_close_price = float(current_candle.get('intc', 0))
         if current_close_price == 0:
-            return tradingsymbol, 'NEUTRAL', 'Current candle close price is zero', None, None, None
+            return tradingsymbol, 'NEUTRAL', 'Current candle close price is zero', None
             
         current_traded_value = current_volume * current_close_price
         
         if not (current_traded_value > st.session_state.traded_value_threshold):
-            return tradingsymbol, 'NEUTRAL', 'Traded value condition not met', None, None, None
+            return tradingsymbol, 'NEUTRAL', 'Traded value condition not met', None
 
         # --- 3. High-Low Difference Check ---
         current_high = float(current_candle.get('inth', 0))
@@ -188,7 +185,7 @@ def screen_stock(stock_info, api):
         current_high_low_diff = current_high - current_low
 
         if current_high_low_diff <= 0: 
-            return tradingsymbol, 'NEUTRAL', 'Current high-low difference invalid', None, None, None
+            return tradingsymbol, 'NEUTRAL', 'Current high-low difference invalid', None
 
         previous_high_low_diffs = []
         for c in previous_20_candles:
@@ -200,40 +197,38 @@ def screen_stock(stock_info, api):
                     previous_high_low_diffs.append(diff)
 
         if not previous_high_low_diffs:
-            return tradingsymbol, 'NEUTRAL', 'No valid high-low diff data in previous 20 candles', None, None, None
+            return tradingsymbol, 'NEUTRAL', 'No valid high-low diff data in previous 20 candles', None
 
         average_high_low_diff_last_20 = sum(previous_high_low_diffs) / len(previous_high_low_diffs)
 
         if not (current_high_low_diff > st.session_state.high_low_diff_multiplier * average_high_low_diff_last_20):
-            return tradingsymbol, 'NEUTRAL', 'High-low diff condition not met', None, None, None
+            return tradingsymbol, 'NEUTRAL', 'High-low diff condition not met', None
 
         # --- 4. Candle Color Check ---
         current_open_price = float(current_candle.get('into', 0))
         
-        # Return signal along with current_ltp, and the high/low of the signal candle
         if current_close_price > current_open_price:
-            return tradingsymbol, 'BUY', 'All conditions met: Green candle', current_close_price, current_high, current_low
+            return tradingsymbol, 'BUY', 'All conditions met: Green candle', current_close_price
         elif current_close_price < current_open_price:
-            return tradingsymbol, 'SELL', 'All conditions met: Red candle', current_close_price, current_high, current_low
+            return tradingsymbol, 'SELL', 'All conditions met: Red candle', current_close_price
         else:
-            return tradingsymbol, 'NEUTRAL', 'Current candle is Doji (Open == Close)', None, None, None
+            return tradingsymbol, 'NEUTRAL', 'Current candle is Doji (Open == Close)', None
 
     except Exception as e:
         logging.error(f"Error screening {tradingsymbol}: {e}", exc_info=True)
-        return tradingsymbol, 'NEUTRAL', f'Error during screening: {e}', None, None, None
+        return tradingsymbol, 'NEUTRAL', f'Error during screening: {e}', None
 
 def place_intraday_order(
-    buy_or_sell, tradingsymbol, quantity, entry_price, api
+    buy_or_sell, tradingsymbol, quantity, current_price, api
 ):
     """
-    Places a regular Intraday (MIS) order.
-    Returns: order_response dictionary
+    Places a regular Intraday (MIS) order. Stoploss and target will be managed by the app.
     """
-    if quantity <= 0:
-        st.warning(f"Cannot place order for {tradingsymbol}: Calculated quantity is zero or negative ({quantity}).")
-        return {'stat': 'Not_Ok', 'emsg': 'Quantity is zero or negative'}
+    if quantity == 0:
+        st.warning(f"Cannot place order for {tradingsymbol}: Quantity is zero.")
+        return {'stat': 'Not_Ok', 'emsg': 'Quantity is zero'}
 
-    st.info(f"Placing {buy_or_sell} Intraday order for {tradingsymbol}: Qty={quantity}, Price={entry_price}")
+    st.info(f"Placing {buy_or_sell} Intraday order for {tradingsymbol}: Qty={quantity}, Price={current_price}")
 
     try:
         order_response = api.place_order(
@@ -243,8 +238,8 @@ def place_intraday_order(
             tradingsymbol=tradingsymbol,
             quantity=int(quantity),
             discloseqty=0,
-            price_type='LMT',  # Use Limit order for entry at desired price
-            price=entry_price,
+            price_type='LMT',  # Entry order as Limit order
+            price=current_price,
             trigger_price=None,
             retention='DAY',
             remarks='Automated_Screener_Trade_Manual_SL_TP'
@@ -252,6 +247,31 @@ def place_intraday_order(
         if order_response and order_response.get('stat') == 'Ok':
             st.success(f"Order placed successfully for {tradingsymbol}: {order_response}")
             logging.info(f"Order placed successfully for {tradingsymbol}: {order_response}")
+
+            # Calculate SL/TP prices based on current price and factors
+            stoploss_amount_total = st.session_state.capital / st.session_state.stoploss_factor
+            stoploss_points_per_share = round(stoploss_amount_total / quantity, 2)
+            target_points_per_share = round(st.session_state.target_multiplier * stoploss_points_per_share, 2)
+
+            if buy_or_sell == 'B':
+                sl_price = round(current_price - stoploss_points_per_share, 2)
+                tp_price = round(current_price + target_points_per_share, 2)
+            else: # SELL
+                sl_price = round(current_price + stoploss_points_per_share, 2)
+                tp_price = round(current_price - target_points_per_share, 2)
+
+            # Store the trade for monitoring
+            st.session_state.open_tracked_trades[tradingsymbol] = {
+                'order_no': order_response.get('norenordno'),
+                'entry_price': current_price,
+                'quantity': quantity, # Use the actual quantity used for order
+                'sl_price': sl_price,
+                'target_price': tp_price,
+                'buy_or_sell': buy_or_sell,
+                'status': 'OPEN'
+            }
+            st.info(f"Tracking trade for {tradingsymbol}: Entry={current_price}, SL={sl_price}, Target={tp_price}")
+
         else:
             st.error(f"Failed to place order for {tradingsymbol}: {order_response.get('emsg', 'Unknown error')}")
             logging.error(f"Failed to place order for {tradingsymbol}: {order_response.get('emsg', 'Unknown error')}")
@@ -271,7 +291,7 @@ def exit_position(exchange, tradingsymbol, product_type, netqty, api):
             exchange=exchange,
             tradingsymbol=tradingsymbol,
             product_type=product_type,
-            quantity=abs(int(netqty)) # Ensure positive quantity for exit
+            quantity=abs(int(netqty))
         )
         if response and response.get('stat') == 'Ok':
             st.success(f"Position for {tradingsymbol} exited successfully: {response}")
@@ -296,15 +316,16 @@ def monitor_open_trades(api):
     trades_to_close = []
     
     # Get current quotes for all open tracked trades
-    # Filter for 'OPEN' and 'CLOSING_SL'/'CLOSING_TP' statuses to fetch quotes
-    tracked_tsyms = [tsym for tsym, trade_info in st.session_state.open_tracked_trades.items() if trade_info['status'].startswith('OPEN') or trade_info['status'].startswith('CLOSING')]
-    
     tokens_to_fetch = []
-    for tsym in tracked_tsyms:
-        for symbol_data in nifty500_symbols:
-            if symbol_data['tsym'] == tsym:
-                tokens_to_fetch.append(f"{EXCHANGE}|{symbol_data['token']}")
-                break
+    tsym_to_token_map = {}
+    for tsym, trade_info in st.session_state.open_tracked_trades.items():
+        if trade_info['status'] == 'OPEN':
+            # Find the token from nifty500_symbols based on tsym
+            for symbol_data in nifty500_symbols:
+                if symbol_data['tsym'] == tsym:
+                    tokens_to_fetch.append(f"{EXCHANGE}|{symbol_data['token']}")
+                    tsym_to_token_map[f"{EXCHANGE}|{symbol_data['token']}"] = tsym
+                    break
     
     if not tokens_to_fetch:
         return # No open trades to monitor
@@ -314,8 +335,7 @@ def monitor_open_trades(api):
         if quotes and quotes.get('stat') == 'Ok' and quotes.get('values'):
             live_quotes = {item['tsym']: float(item['lp']) for item in quotes['values']}
             
-            for tsym in tracked_tsyms:
-                trade_info = st.session_state.open_tracked_trades[tsym]
+            for tsym, trade_info in st.session_state.open_tracked_trades.items():
                 if trade_info['status'] == 'OPEN' and tsym in live_quotes:
                     current_ltp = live_quotes[tsym]
                     sl_price = trade_info['sl_price']
@@ -344,10 +364,10 @@ def monitor_open_trades(api):
                             trades_to_close.append({'tsym': tsym, 'quantity': quantity, 'action': 'BUY'})
                             trade_info['status'] = 'CLOSING_TP' # Mark for closing
         else:
-            logging.warning(f"Failed to get live quotes for monitoring open trades: {quotes}")
+            logging.warning(f"Failed to get live quotes for monitoring: {quotes}")
 
     except Exception as e:
-        logging.error(f"Error monitoring open trades: {e}", exc_info=True)
+        logging.error(f"Error monitoring trades: {e}", exc_info=True)
 
     # Execute closing orders
     for trade in trades_to_close:
@@ -378,113 +398,6 @@ def monitor_open_trades(api):
             # If failed, keep status as CLOSING_SL/TP to retry in next cycle or manually handle
             logging.error(f"Failed to place closing order for {tsym}: {close_response}")
 
-def monitor_pending_entries(api):
-    """
-    Monitors pending entries for their entry conditions (crossing signal candle high/low).
-    Places initial orders if conditions are met.
-    """
-    entries_to_execute = []
-    
-    # Get current quotes for all pending entries
-    tokens_to_fetch = []
-    for tsym, entry_info in st.session_state.pending_entries.items():
-        if entry_info['status'] == 'PENDING':
-            for symbol_data in nifty500_symbols:
-                if symbol_data['tsym'] == tsym:
-                    tokens_to_fetch.append(f"{EXCHANGE}|{symbol_data['token']}")
-                    break
-    
-    if not tokens_to_fetch:
-        return # No pending entries to monitor
-
-    try:
-        quotes = api.get_quotes(tokens_to_fetch)
-        if quotes and quotes.get('stat') == 'Ok' and quotes.get('values'):
-            live_quotes = {item['tsym']: float(item['lp']) for item in quotes['values']}
-            
-            for tsym, entry_info in st.session_state.pending_entries.items():
-                if entry_info['status'] == 'PENDING' and tsym in live_quotes:
-                    current_ltp = live_quotes[tsym]
-                    signal_candle_high = entry_info['signal_candle_high']
-                    signal_candle_low = entry_info['signal_candle_low']
-                    buy_or_sell = entry_info['buy_or_sell']
-                    quantity = entry_info['calculated_quantity']
-                    calculated_sl_price = entry_info['calculated_sl_price']
-                    calculated_tp_price = entry_info['calculated_tp_price']
-
-                    st.markdown(f"**Pending {tsym} ({buy_or_sell}):** LTP={current_ltp:.2f}, Signal High={signal_candle_high:.2f}, Signal Low={signal_candle_low:.2f}")
-
-                    entry_triggered = False
-                    if buy_or_sell == 'B': # BUY entry
-                        trigger_price = round(signal_candle_high * (1 + ENTRY_BUFFER_PERCENT), 2)
-                        if current_ltp >= trigger_price:
-                            st.success(f"BUY Entry Triggered for {tsym}! LTP {current_ltp} >= Trigger {trigger_price}")
-                            entries_to_execute.append({
-                                'tsym': tsym,
-                                'quantity': quantity,
-                                'action': 'B',
-                                'entry_price': current_ltp, # Use current LTP as actual entry price
-                                'sl_price': calculated_sl_price,
-                                'target_price': calculated_tp_price
-                            })
-                            entry_info['status'] = 'EXECUTING_BUY' # Mark for execution
-                            entry_triggered = True
-                    elif buy_or_sell == 'S': # SELL entry
-                        trigger_price = round(signal_candle_low * (1 - ENTRY_BUFFER_PERCENT), 2)
-                        if current_ltp <= trigger_price:
-                            st.success(f"SELL Entry Triggered for {tsym}! LTP {current_ltp} <= Trigger {trigger_price}")
-                            entries_to_execute.append({
-                                'tsym': tsym,
-                                'quantity': quantity,
-                                'action': 'S',
-                                'entry_price': current_ltp, # Use current LTP as actual entry price
-                                'sl_price': calculated_sl_price,
-                                'target_price': calculated_tp_price
-                            })
-                            entry_info['status'] = 'EXECUTING_SELL' # Mark for execution
-                            entry_triggered = True
-        else:
-            logging.warning(f"Failed to get live quotes for monitoring pending entries: {quotes}")
-
-    except Exception as e:
-        logging.error(f"Error monitoring pending entries: {e}", exc_info=True)
-
-    # Execute pending entry orders
-    for entry in entries_to_execute:
-        tsym = entry['tsym']
-        action = entry['action']
-        quantity = entry['quantity']
-        entry_price = entry['entry_price']
-        sl_price = entry['sl_price']
-        target_price = entry['target_price']
-
-        st.info(f"Placing initial {action} order for {tsym} (Qty: {quantity}) at LTP {entry_price}...")
-        order_response = place_intraday_order(
-            buy_or_sell=action,
-            tradingsymbol=tsym,
-            quantity=quantity,
-            entry_price=entry_price, # Use the current LTP as the entry price for the limit order
-            api=api
-        )
-        if order_response and order_response.get('stat') == 'Ok':
-            # Move from pending_entries to open_tracked_trades upon successful order placement
-            # The 'place_intraday_order' now directly handles adding to open_tracked_trades with actual entry_price
-            # So, remove from pending_entries
-            if tsym in st.session_state.pending_entries:
-                del st.session_state.pending_entries[tsym]
-            st.session_state.open_tracked_trades[tsym] = {
-                'order_no': order_response.get('norenordno'),
-                'entry_price': entry_price, # Actual entry price
-                'quantity': quantity,
-                'sl_price': sl_price,
-                'target_price': target_price,
-                'buy_or_sell': action,
-                'status': 'OPEN'
-            }
-        else:
-            st.error(f"Failed to place entry order for {tsym}. Reverting status to PENDING.")
-            st.session_state.pending_entries[tsym]['status'] = 'PENDING' # Keep as pending if order fails
-
 
 # --- Streamlit App Layout ---
 st.set_page_config(layout="wide", page_title="Flattrade Algo Screener")
@@ -513,75 +426,81 @@ st.session_state.high_low_diff_multiplier = st.sidebar.number_input(
 
 st.sidebar.subheader("Trading Parameters")
 st.session_state.capital = st.sidebar.number_input(
-    "Available Capital (INR) for Qty Calc",
+    "Available Capital (INR)",
     min_value=1000,
     max_value=10000000,
     value=int(st.session_state.capital),
     step=1000
 )
-
-# Display RISK_PERCENTAGE_OF_CAPITAL, but make it static for now as it's a constant
-st.sidebar.markdown(f"**Risk Percentage per Trade:** {RISK_PERCENTAGE_OF_CAPITAL * 100:.2f}%")
-
+st.session_state.quantity_factor = st.sidebar.number_input(
+    "Quantity Factor (Capital / Factor = Investment per trade)",
+    min_value=1, value=int(st.session_state.quantity_factor), step=1
+)
+st.session_state.stoploss_factor = st.sidebar.number_input(
+    "Stoploss Factor (Capital / Factor = SL amount per trade)",
+    min_value=100, value=int(st.session_state.stoploss_factor), step=100
+)
 st.session_state.target_multiplier = st.sidebar.number_input(
-    "Target Multiplier (Potential Loss * Multiplier = Target Profit)",
+    "Target Multiplier (SL amount * Multiplier = Target amount)",
     min_value=1, value=int(st.session_state.target_multiplier), step=1
 )
 
-# Recalculate and display risk/reward based on the parameters
-calculated_risk_amount = st.session_state.capital * RISK_PERCENTAGE_OF_CAPITAL
-st.sidebar.markdown(f"**Risk Amount per Trade:** ₹{calculated_risk_amount:,.2f}")
-st.sidebar.markdown(f"**Reward Amount per Trade:** ₹{calculated_risk_amount * st.session_state.target_multiplier:,.2f}")
+st.sidebar.markdown(f"**Calculated Order Value (per trade):** ₹{st.session_state.capital / st.session_state.quantity_factor:,.2f}")
+st.sidebar.markdown(f"**Risk per trade (approx.):** ₹{st.session_state.capital / st.session_state.stoploss_factor:,.2f}")
+st.sidebar.markdown(f"**Reward per trade (approx.):** ₹{st.session_state.capital / st.session_state.stoploss_factor * st.session_state.target_multiplier:,.2f}")
 
 
-# Main content area setup for fixed and dynamic sections
-# Account Information
+# Main content area setup with columns for fixed and dynamic sections
+
 st.header("Account Information")
 account_info_col, refresh_btn_col = st.columns([0.7, 0.3])
 
+# Account Information section (now fixed, updates on full rerun)
 with account_info_col:
-    # Use a global placeholder for account info to update it once per full rerun
-    # This block runs every time the script reruns.
-    st.info("Fetching account limits...")
-    cash_margin = None 
-    try:
-        limits = api.get_limits()
-        if limits and isinstance(limits, dict) and limits.get('stat') == 'Ok':
-            # Prioritize top-level 'cash'
-            if 'cash' in limits and limits['cash'] is not None:
-                try:
-                    cash_margin = float(limits['cash'])
-                except ValueError:
-                    logging.error(f"Could not convert top-level 'cash' to float: {limits['cash']}")
+    account_info_placeholder = st.empty()
+    with account_info_placeholder.container():
+        st.info("Fetching account limits...")
+        cash_margin = None # Initialize to None
+        try:
+            limits = api.get_limits()
+            if limits and isinstance(limits, dict) and limits.get('stat') == 'Ok':
+                # Prioritize top-level 'cash'
+                if 'cash' in limits and limits['cash'] is not None:
+                    try:
+                        cash_margin = float(limits['cash'])
+                    except ValueError:
+                        logging.error(f"Could not convert top-level 'cash' to float: {limits['cash']}")
 
-            # If 'cash' not found at top-level or conversion failed, check 'prange'
-            if cash_margin is None and 'prange' in limits and isinstance(limits['prange'], list):
-                for item in limits['prange']:
-                    if isinstance(item, dict) and 'cash' in item and item['cash'] is not None:
-                        try:
-                            cash_margin = float(item['cash'])
-                            break # Found cash, exit loop
-                        except ValueError:
-                            logging.error(f"Could not convert 'prange' item 'cash' to float: {item['cash']}")
-        
-        if cash_margin is not None:
-            st.success(f"**Available Cash Margin:** ₹{cash_margin:,.2f}")
-        else:
-            st.warning("Could not fetch account limits: 'cash' data not found in expected locations or invalid format.")
-            logging.warning(f"Account limits response (final check failed): {limits}") 
-    except Exception as e:
-        st.error(f"Error fetching account limits: {e}")
-        logging.error(f"Error fetching account limits: {e}", exc_info=True)
+                # If 'cash' not found at top-level or conversion failed, check 'prange'
+                if cash_margin is None and 'prange' in limits and isinstance(limits['prange'], list):
+                    for item in limits['prange']:
+                        if isinstance(item, dict) and 'cash' in item and item['cash'] is not None:
+                            try:
+                                cash_margin = float(item['cash'])
+                                break # Found cash, exit loop
+                            except ValueError:
+                                logging.error(f"Could not convert 'prange' item 'cash' to float: {item['cash']}")
+            
+            if cash_margin is not None:
+                st.success(f"**Available Cash Margin:** ₹{cash_margin:,.2f}")
+            else:
+                st.warning("Could not fetch account limits: 'cash' data not found in expected locations or invalid format.")
+                logging.warning(f"Account limits response (final check failed): {limits}") # Log full response if still not found
+        except Exception as e:
+            st.error(f"Error fetching account limits: {e}")
+            logging.error(f"Error fetching account limits: {e}", exc_info=True)
 
 with refresh_btn_col:
+    # Button to force a full rerun and refresh the static data
     if st.button("Refresh Data", key="refresh_all_data"):
         st.rerun()
 
 st.markdown("---") # Separator
 
-# Broker Open Positions (fixed panel)
 st.header("Broker Open Positions 💼 (For manual management or verification)")
-with st.container():
+position_placeholder = st.empty()
+# This block will now also run only on a full script rerun, making it "fixed"
+with position_placeholder.container():
     st.info("Fetching broker open positions...")
     try:
         positions = api.get_positions()
@@ -602,7 +521,7 @@ with st.container():
             
             df_positions = pd.DataFrame(positions_data)
             if not df_positions.empty:
-                st.dataframe(df_positions)
+                st.dataframe(df_positions) # Removed hide_row_index
                 st.markdown("---")
                 st.markdown("### Exit Broker Positions Manually")
                 for _, row in df_positions.iterrows():
@@ -632,13 +551,14 @@ with st.container():
 
 st.markdown("---") # Separator
 
-# Dynamic content for Signals and App-Tracked Trades
 st.header("Signals & App-Tracked Trades")
 
+# Create placeholders for dynamic content within the continuous loop
 signal_placeholder = st.empty()
 tracked_trades_placeholder = st.empty()
 status_placeholder = st.empty() # For continuous screening status messages
 
+# Load symbols from CSV file
 nifty500_symbols = get_nifty500_symbols()
 
 if not nifty500_symbols:
@@ -648,120 +568,76 @@ if not nifty500_symbols:
 # Main continuous screening loop
 while run_screener:
     with status_placeholder.container():
-        st.info(f"Running screening cycle at {datetime.datetime.now().strftime('%H:%M:%S')}...")
+        st.info(f"Running screening at {datetime.datetime.now().strftime('%H:%M:%S')}...")
     
-    # --- Phase 1: Monitor OPEN trades for SL/TP ---
-    st.markdown("---")
-    st.subheader("Monitoring Open Trades...")
-    monitor_open_trades(api)
-
-    # --- Phase 2: Monitor PENDING entries for trigger ---
-    st.markdown("---")
-    st.subheader("Monitoring Pending Entries...")
-    monitor_pending_entries(api)
-
-    # --- Phase 3: Screen for new signals (only non-tracked/non-pending stocks) ---
-    st.markdown("---")
-    st.subheader("Screening for New Signals...")
     buy_signals_data = []
     sell_signals_data = []
 
-    # Get symbols that are neither OPEN nor PENDING in app-tracked trades
-    eligible_for_screening = []
-    for s in nifty500_symbols:
-        tsym = s['tsym']
-        if (tsym not in st.session_state.open_tracked_trades or st.session_state.open_tracked_trades[tsym]['status'] == 'CLOSED') and \
-           (tsym not in st.session_state.pending_entries or st.session_state.pending_entries[tsym]['status'] == 'CANCELLED'): # Assuming a 'CANCELLED' status for pending entries that should be re-screened
-            eligible_for_screening.append(s)
+    # --- Run Screening for non-tracked stocks ---
+    progress_bar = st.progress(0, text="Screening for new signals...")
+    # Create a list of symbols not currently being tracked by the app for new entries
+    nontracked_symbols = [
+        s for s in nifty500_symbols 
+        if s['tsym'] not in st.session_state.open_tracked_trades or 
+           st.session_state.open_tracked_trades[s['tsym']]['status'] != 'OPEN'
+    ]
 
-    if not eligible_for_screening:
-        status_placeholder.info("All relevant symbols are either being tracked, pending entry, or no new symbols to screen.")
-        # Clear progress bar
-        with progress_bar: # Ensure progress_bar is defined
-            st.empty()
+    # Handle case where all symbols are being tracked or none loaded
+    if not nontracked_symbols:
+        status_placeholder.info("All relevant symbols are either being tracked or no new symbols to screen.")
+        # If no non-tracked symbols, progress bar should be 100% or empty
+        progress_bar.empty() 
     else:
-        progress_bar = st.progress(0, text="Screening eligible stocks for new signals...")
-        for i, stock in enumerate(eligible_for_screening):
-            symbol_info, signal, reason, current_price, signal_high, signal_low = screen_stock(stock, api)
+        for i, stock in enumerate(nontracked_symbols):
+            symbol_info, signal, reason, current_price = screen_stock(stock, api)
             
-            if signal in ['BUY', 'SELL'] and current_price and signal_high and signal_low:
-                # Calculate potential loss and quantity based on new logic
-                # For buy: SL is signal_low - buffer
-                # For sell: SL is signal_high + buffer
-                
-                if signal == 'BUY':
-                    potential_stoploss_price = round(signal_low * (1 - ENTRY_BUFFER_PERCENT), 2)
-                    potential_loss_per_share = current_price - potential_stoploss_price # Using current_price as proxy for entry
-                    
-                    if potential_loss_per_share <= 0:
-                        logging.warning(f"Invalid potential loss for BUY {symbol_info}: {potential_loss_per_share}. Skipping.")
-                        continue
-                    
-                    calculated_quantity = int( (st.session_state.capital * RISK_PERCENTAGE_OF_CAPITAL) / potential_loss_per_share )
-                    
-                    buy_signals_data.append({
-                        'Symbol': symbol_info,
-                        'Signal': 'BUY',
-                        'Reason': reason,
-                        'Price': f"{current_price:,.2f}",
-                        'Signal High': f"{signal_high:,.2f}",
-                        'Signal Low': f"{signal_low:,.2f}",
-                        'Est. Qty': calculated_quantity
-                    })
-                    
-                    # Add to pending entries
+            if signal == 'BUY':
+                buy_signals_data.append({
+                    'Symbol': symbol_info,
+                    'Signal': 'BUY',
+                    'Reason': reason,
+                    'Price': f"{current_price:,.2f}" if current_price else 'N/A'
+                })
+                if current_price:
+                    total_investment_amount = st.session_state.capital / st.session_state.quantity_factor
+                    calculated_quantity = int(total_investment_amount / current_price) if current_price > 0 else 0
                     if calculated_quantity > 0:
-                        st.session_state.pending_entries[symbol_info] = {
-                            'buy_or_sell': 'B',
-                            'signal_candle_high': signal_high,
-                            'signal_candle_low': signal_low,
-                            'calculated_quantity': calculated_quantity,
-                            'calculated_sl_price': potential_stoploss_price,
-                            'calculated_tp_price': round(current_price + (potential_loss_per_share * st.session_state.target_multiplier), 2),
-                            'status': 'PENDING'
-                        }
-                        status_placeholder.info(f"Added BUY signal for {symbol_info} to pending entries. Qty: {calculated_quantity}")
+                        status_placeholder.info(f"Attempting to place BUY order for {symbol_info} with quantity {calculated_quantity}...")
+                        place_intraday_order(
+                            buy_or_sell='B',
+                            tradingsymbol=stock['tsym'],
+                            quantity=calculated_quantity,
+                            current_price=current_price,
+                            api=api
+                        )
                     else:
-                        status_placeholder.warning(f"Calculated quantity for BUY {symbol_info} is zero. Not adding to pending entries.")
+                        status_placeholder.warning(f"Calculated quantity for {symbol_info} is zero. Not placing order. (Capital: {st.session_state.capital}, Price: {current_price}, Investment Amount: {total_investment_amount})")
 
-
-                elif signal == 'SELL':
-                    potential_stoploss_price = round(signal_high * (1 + ENTRY_BUFFER_PERCENT), 2)
-                    potential_loss_per_share = potential_stoploss_price - current_price # Using current_price as proxy for entry
-
-                    if potential_loss_per_share <= 0:
-                        logging.warning(f"Invalid potential loss for SELL {symbol_info}: {potential_loss_per_share}. Skipping.")
-                        continue
-
-                    calculated_quantity = int( (st.session_state.capital * RISK_PERCENTAGE_OF_CAPITAL) / potential_loss_per_share )
-
-                    sell_signals_data.append({
-                        'Symbol': symbol_info,
-                        'Signal': 'SELL',
-                        'Reason': reason,
-                        'Price': f"{current_price:,.2f}",
-                        'Signal High': f"{signal_high:,.2f}",
-                        'Signal Low': f"{signal_low:,.2f}",
-                        'Est. Qty': calculated_quantity
-                    })
-
-                    # Add to pending entries
+            elif signal == 'SELL':
+                sell_signals_data.append({
+                    'Symbol': symbol_info,
+                    'Signal': 'SELL',
+                    'Reason': reason,
+                    'Price': f"{current_price:,.2f}" if current_price else 'N/A'
+                })
+                if current_price:
+                    total_investment_amount = st.session_state.capital / st.session_state.quantity_factor
+                    calculated_quantity = int(total_investment_amount / current_price) if current_price > 0 else 0
                     if calculated_quantity > 0:
-                        st.session_state.pending_entries[symbol_info] = {
-                            'buy_or_sell': 'S',
-                            'signal_candle_high': signal_high,
-                            'signal_candle_low': signal_low,
-                            'calculated_quantity': calculated_quantity,
-                            'calculated_sl_price': potential_stoploss_price,
-                            'calculated_tp_price': round(current_price - (potential_loss_per_share * st.session_state.target_multiplier), 2),
-                            'status': 'PENDING'
-                        }
-                        status_placeholder.info(f"Added SELL signal for {symbol_info} to pending entries. Qty: {calculated_quantity}")
+                        status_placeholder.info(f"Attempting to place SELL order for {symbol_info} with quantity {calculated_quantity}...")
+                        place_intraday_order(
+                            buy_or_sell='S',
+                            tradingsymbol=stock['tsym'],
+                            quantity=calculated_quantity,
+                            current_price=current_price,
+                            api=api
+                        )
                     else:
-                        status_placeholder.warning(f"Calculated quantity for SELL {symbol_info} is zero. Not adding to pending entries.")
+                        status_placeholder.warning(f"Calculated quantity for {symbol_info} is zero. Not placing order. (Capital: {st.session_state.capital}, Price: {current_price}, Investment Amount: {total_investment_amount})")
             
-            progress_bar.progress((i + 1) / len(eligible_for_screening), text=f"Screening {stock['tsym']}...")
-        progress_bar.empty() # Clear progress bar
+            progress_bar.progress((i + 1) / len(nontracked_symbols), text=f"Screening {stock['tsym']}...")
+        progress_bar.empty()
+
 
     # Display Signals in their placeholder
     with signal_placeholder.container():
@@ -779,41 +655,32 @@ while run_screener:
 
     # --- Monitor and Display Tracked Trades (new section) ---
     with tracked_trades_placeholder.container():
-        st.subheader("App-Tracked Trades (Pending & Open) 🚀")
-        tracked_data = []
-        # Combine pending and open trades for display
-        for tsym, trade in st.session_state.pending_entries.items():
-            if trade['status'] == 'PENDING':
-                tracked_data.append({
-                    'Symbol': tsym,
-                    'Action': trade['buy_or_sell'],
-                    'Qty': trade['calculated_quantity'],
-                    'Entry Ref Price': f"{trade['signal_candle_high'] if trade['buy_or_sell'] == 'B' else trade['signal_candle_low']:,.2f}",
-                    'SL Price': f"{trade['calculated_sl_price']:,.2f}",
-                    'Target Price': f"{trade['calculated_tp_price']:,.2f}",
-                    'Status': 'PENDING ENTRY'
-                })
-        for tsym, trade in st.session_state.open_tracked_trades.items():
-            if trade['status'] == 'OPEN' or trade['status'].startswith('CLOSING'):
+        st.subheader("App-Tracked Trades 🚀")
+        # Filter out 'CLOSED' trades for display, but keep them in session_state for history if needed
+        active_tracked_trades = {tsym: trade for tsym, trade in st.session_state.open_tracked_trades.items() if trade['status'] != 'CLOSED'}
+        
+        if active_tracked_trades:
+            tracked_data = []
+            for tsym, trade in active_tracked_trades.items():
                 tracked_data.append({
                     'Symbol': tsym,
                     'Action': trade['buy_or_sell'],
                     'Qty': trade['quantity'],
-                    'Entry Ref Price': f"{trade['entry_price']:,.2f}", # Actual entry price
+                    'Entry Price': f"{trade['entry_price']:,.2f}",
                     'SL Price': f"{trade['sl_price']:,.2f}",
                     'Target Price': f"{trade['target_price']:,.2f}",
                     'Status': trade['status']
                 })
-        
-        if tracked_data:
             st.dataframe(pd.DataFrame(tracked_data))
         else:
-            st.info("No active or pending trades being tracked by the app.")
+            st.info("No active trades being tracked by the app.")
 
+    # --- Monitor Open Positions for SL/TP (triggers closing orders) ---
+    monitor_open_trades(api)
     
     # Wait for the specified interval before the next screening cycle
     if run_screener: # Only sleep if continuous mode is still active
-        st.info(f"Next full screening cycle in {screen_interval} seconds...")
+        st.info(f"Next screening cycle in {screen_interval} seconds...")
         time.sleep(screen_interval)
         # No st.rerun() here, only updates placeholders
 
