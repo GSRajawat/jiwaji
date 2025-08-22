@@ -31,11 +31,11 @@ REQUIRED_CANDLES = 21 # Latest candle + previous 20 for calculations
 
 # Initialize session state variables for modifiable parameters
 if 'volume_multiplier' not in st.session_state:
-    st.session_state.volume_multiplier = 6
+    st.session_state.volume_multiplier = 10
 if 'traded_value_threshold' not in st.session_state:
     st.session_state.traded_value_threshold = 60000000
 if 'high_low_diff_multiplier' not in st.session_state:
-    st.session_state.high_low_diff_multiplier = 3
+    st.session_state.high_low_diff_multiplier = 5
 if 'capital' not in st.session_state:
     st.session_state.capital = 10000
 if 'quantity_factor' not in st.session_state:
