@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # IMPORTANT: Replace with your actual Flattrade user ID and session token.
 # For production Streamlit apps, consider using Streamlit Secrets for credentials.
 # Learn more: https://docs.streamlit.io/library/advanced-features/secrets
-USER_SESSION = st.secrets.get("FLATTRADE_USER_SESSION", "6ef8514a342258801329936e109c54720ca84a08596c9adda1d635f1195d4708")
+USER_SESSION = st.secrets.get("FLATTRADE_USER_SESSION", "d60c6135374be8544d9baef693281faf81e6f68e4326900419fb132d112fe23e")
 USER_ID = st.secrets.get("FLATTRADE_USER_ID", "FZ03508")
 
 EXCHANGE = 'NSE'
