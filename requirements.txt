@@ -6,4 +6,9 @@ pyyaml
 supabase
 streamlit
 requests
+streamlit
+pandas
+supabase-py
+requests
+
 
