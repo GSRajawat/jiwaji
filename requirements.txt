@@ -4,3 +4,6 @@ websocket_client
 pandas
 pyyaml
 supabase
+streamlit
+requests
+
