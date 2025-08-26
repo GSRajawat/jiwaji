@@ -2,11 +2,12 @@ requests
 websocket_client
 ./dist/NorenRestApi-0.0.29-py3-none-any.whl
 pyyaml
-streamlit==1.36.0
-pandas==2.2.3
-supabase==2.4.1
-requests==2.28.3
-python-dotenv==1.0.1
+streamlit
+pandas
+supabase
+requests
+python-dotenv
+
 
 
 
