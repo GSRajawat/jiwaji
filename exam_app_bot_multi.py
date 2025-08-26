@@ -20,7 +20,7 @@ from api_helper import NorenApiPy
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Flattrade API Credentials ---
-USER_SESSION = st.secrets.get("FLATTRADE_USER_SESSION", "7c9f587443ccbcf8b9c3fa5cd3fb426dfd477febb9b86a8eeedd8dd5e999bc65")
+USER_SESSION = st.secrets.get("FLATTRADE_USER_SESSION", "d60c6135374be8544d9baef693281faf81e6f68e4326900419fb132d112fe23e")
 USER_ID = st.secrets.get("FLATTRADE_USER_ID", "FZ03508")
 
 # --- Supabase Credentials ---
@@ -29,7 +29,7 @@ SUPABASE_KEY = st.secrets.get("SUPABASE_KEY","eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVC
 
 EXCHANGE = 'NSE'
 CANDLE_INTERVAL = '1'  # 1-minute candles
-REQUIRED_CANDLES = 41 # Latest candle + previous 20 for calculations
+REQUIRED_CANDLES = 21 # Latest candle + previous 20 for calculations
 
 # --- Entry/Exit Buffers and Risk Parameters (Constants) ---
 ENTRY_BUFFER_PERCENT = 0.0005 # 0.05% buffer for crossing high/low for entry
@@ -39,7 +39,7 @@ RISK_PERCENTAGE_OF_CAPITAL = 0.01 # 1% of capital risked per trade
 if 'volume_multiplier' not in st.session_state:
     st.session_state.volume_multiplier = 10
 if 'traded_value_threshold' not in st.session_state:
-    st.session_state.traded_value_threshold = 80000000
+    st.session_state.traded_value_threshold = 10000000
 if 'high_low_diff_multiplier' not in st.session_state:
     st.session_state.high_low_diff_multiplier = 4
 if 'capital' not in st.session_state:
