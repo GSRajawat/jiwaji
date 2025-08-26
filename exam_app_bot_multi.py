@@ -2267,4 +2267,4 @@ while run_screener:
         time.sleep(screen_interval)
 
 if not run_screener:
-    status_placeholder.info("Screener is paused. Check 'Run Screener Continuously' in sidebar to start.")
+    status_placeholder.info("Screener is paused. Check 'Run Screener Continuously' in sidebar to 
