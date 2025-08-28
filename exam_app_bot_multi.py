@@ -21,7 +21,7 @@ from api_helper import NorenApiPy
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Flattrade API Credentials ---
-USER_SESSION = st.secrets.get("FLATTRADE_USER_SESSION", "87157f5ad3c28cefab77351b4bdbc49644b53a91de70fdba30497c2abccb1a43")
+USER_SESSION = st.secrets.get("FLATTRADE_USER_SESSION", "aacb18080516688cf6ed6b7ebbe6b64113f4519fa772095da602d57de992d2e3")
 USER_ID = st.secrets.get("FLATTRADE_USER_ID", "FZ03508")
 
 # --- Supabase Credentials ---
