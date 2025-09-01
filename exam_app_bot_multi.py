@@ -8,7 +8,6 @@ import pandas as pd
 from supabase import create_client, Client
 import requests # New import for Tradetron API
 import json # New import for JSON string formatting
-# Removed 'import uuid' as it's no longer needed for key generation in this approach
 
 # Add the parent directory to the sys.path to import api_helper
 # This assumes api_helper.py is in the parent directory of this script.
@@ -21,7 +20,7 @@ from api_helper import NorenApiPy
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Flattrade API Credentials ---
-USER_SESSION = st.secrets.get("FLATTRADE_USER_SESSION", "11369d3987d181d34ea9ea80e8676b3153e890ca6a7dc21eae8c668465470663")
+USER_SESSION = st.secrets.get("FLATTRADE_USER_SESSION", "7bce606944df3e146a2458169a0c9d8a8428c9753af20bad803a84e21a8c29c4")
 USER_ID = st.secrets.get("FLATTRADE_USER_ID", "FZ03508")
 
 # --- Supabase Credentials ---
@@ -33,14 +32,21 @@ CANDLE_INTERVAL = '1'  # 1-minute candles
 REQUIRED_CANDLES = 21 # Latest candle + previous 20 for calculations
 
 # --- Entry/Exit Buffers and Risk Parameters (Constants) ---
+ENTRY_BUFFER_PERCENT = 0.0005 # 0.05% buffer for crossing high/low for entry
 RISK_PERCENTAGE_OF_CAPITAL = 0.01 # 1% of capital risked per trade
 
 
 # --- Initialize ALL session state variables first and foremost ---
+# Add a counter that increments with each widget
+if 'simple_counter' not in st.session_state:
+    st.session_state.simple_counter = 0
+# METHOD 1: Initialize at the top of your script (RECOMMENDED)
+if 'widget_key_tracker' not in st.session_state:
+    st.session_state.widget_key_tracker = {}
 if 'volume_multiplier' not in st.session_state:
     st.session_state.volume_multiplier = 10
-if 'traded_value_divisor' not in st.session_state:
-    st.session_state.traded_value_divisor = 100
+if 'traded_value_threshold' not in st.session_state:
+    st.session_state.traded_value_threshold = 10000000
 if 'high_low_diff_multiplier' not in st.session_state:
     st.session_state.high_low_diff_multiplier = 4
 if 'capital' not in st.session_state:
@@ -51,8 +57,6 @@ if 'sl_buffer_points' not in st.session_state:
     st.session_state.sl_buffer_points = 0.25 # Points buffer below signal low for initial SL
 if 'trailing_step_points' not in st.session_state:
     st.session_state.trailing_step_points = 1.00 # Points for trailing SL adjustment
-if 'entry_buffer_percent' not in st.session_state:
-    st.session_state.entry_buffer_percent = 0.0005 # 0.05% buffer for crossing high/low for entry
 
 if 'pending_entries' not in st.session_state:
     st.session_state.pending_entries = {} # {tsym: {signal_candle_high, signal_candle_low, buy_or_sell, initial_sl_price, initial_tp_price, calculated_quantity, token}}
@@ -92,10 +96,6 @@ if st.session_state.last_reset_date != current_date:
     st.session_state.daily_traded_symbols = set()
     st.session_state.last_reset_date = current_date
 
-# 1. Add global variable to track current balance (add this near the top after other globals)
-if 'current_account_balance' not in st.session_state:
-    st.session_state.current_account_balance = None
-
 # --- End of session state initialization ---
 
 # Global for Supabase client
@@ -118,6 +118,106 @@ supabase = get_supabase_client(SUPABASE_URL, SUPABASE_KEY)
 
 if supabase is None:
     st.stop() # Stop the app if Supabase connection fails
+
+# SOLUTION 1: Define current_manual_sl before using it
+def fix_manual_sl_input_v1(cols, tsym):
+    """
+    Fix by defining current_manual_sl from session state
+    """
+    # Define current_manual_sl by extracting from session state
+    current_manual_sl = st.session_state.manual_overrides.get(tsym, {}).get('sl_price')
+    
+    # Handle None values and ensure it's a valid number
+    if current_manual_sl is None or current_manual_sl <= 0:
+        current_manual_sl = 0.0
+    
+    # Create unique key
+    unique_timestamp = int(time.time() * 1000000)
+    
+    new_manual_sl = cols[8].number_input(
+        "Manual SL", 
+        value=current_manual_sl,
+        step=0.01,
+        format="%.2f",
+        key=f'manual_sl_{tsym}_pending_{unique_timestamp}_{hash(tsym) % 1000}'
+    )
+    return new_manual_sl
+
+def display_trades_with_unique_keys():
+    """
+    Display trades with guaranteed unique keys
+    """
+    # Reset key tracker for this run (optional)
+    # st.session_state.widget_key_tracker.clear()  # Uncomment if you want fresh keys each run
+    
+    # Display pending trades
+    # Example: Display pending trades
+    if hasattr(st.session_state, 'pending_trades'):
+        display_trades_safely(st.session_state.pending_trades, "pending")
+        st.subheader("📋 Pending Trades")
+        
+        # NOW tsym is defined within this loop
+        for tsym, trade_data in st.session_state.pending_trades.items():
+            cols = st.columns([1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+            
+            # Display basic trade info
+            cols[0].write(tsym)
+            cols[1].write(trade_data.get('buy_or_sell', 'N/A'))
+            cols[2].write(str(trade_data.get('quantity', 0)))
+            
+            # Get current manual SL
+            current_manual_sl = st.session_state.manual_overrides.get(tsym, {}).get('sl_price', 0.0)
+            if current_manual_sl is None or current_manual_sl < 0:
+                current_manual_sl = 0.0
+            
+            # NOW it's safe to use tsym because it's defined in the loop
+            st.session_state.simple_counter += 1
+            unique_key = f"manual_sl_{tsym}_pending_{st.session_state.simple_counter}"
+            
+            new_manual_sl = cols[8].number_input(
+                "Manual SL", 
+                value=current_manual_sl,
+                step=0.01,
+                format="%.2f",
+                key=unique_key
+            )
+    
+    # Example: Display open trades
+    if hasattr(st.session_state, 'open_tracked_trades'):
+        display_trades_safely(st.session_state.open_tracked_trades, "open")
+        st.subheader("🔄 Open Trades")
+        
+        # NOW tsym is defined within this loop
+        for tsym, trade_info in st.session_state.open_tracked_trades.items():
+            cols = st.columns([1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+            
+            # Display basic trade info
+            cols[0].write(tsym)
+            cols[1].write(trade_info.get('buy_or_sell', 'N/A'))
+            cols[2].write(str(trade_info.get('quantity', 0)))
+            
+            # Get current manual SL
+            current_manual_sl = st.session_state.manual_overrides.get(tsym, {}).get('sl_price', 0.0)
+            if current_manual_sl is None or current_manual_sl < 0:
+                current_manual_sl = trade_info.get('sl_price', 0.0)
+            
+            # NOW it's safe to use tsym because it's defined in the loop
+            st.session_state.simple_counter += 1
+            unique_key = f"manual_sl_{tsym}_open_{st.session_state.simple_counter}"
+            
+            new_manual_sl = cols[8].number_input(
+                "Manual SL", 
+                value=current_manual_sl,
+                step=0.01,
+                format="%.2f",
+                key=unique_key
+            )
+            
+            # Handle changes
+            if new_manual_sl != current_manual_sl:
+                if tsym not in st.session_state.manual_overrides:
+                    st.session_state.manual_overrides[tsym] = {}
+                st.session_state.manual_overrides[tsym]['sl_price'] = new_manual_sl
 
 # --- Supabase Database Operations ---
 def upsert_trade_to_supabase(trade_data):
@@ -270,7 +370,7 @@ def get_api_instance(user_id, user_session):
             return None
     except Exception as e:
         st.error(f"An exception occurred during API session setup: {e}")
-        logging.critical(f"An exception occurred during API setup: {e}", exc_info=True)
+        logging.critical(f"An exception occurred during API session setup: {e}", exc_info=True)
         return None
 
 # Get API instance
@@ -284,17 +384,17 @@ if api is None:
 def load_symbols_from_csv(file_path="NSE_Equity.csv"):
     """
     Loads stock symbols and tokens from the provided CSV file.
-    Filters for 'EQ' (Equity) and 'IND' (Index) instruments. Assumes 'Token' and 'Tradingsymbol' are present.
+    Filters for 'EQ' (Equity) instruments only. Assumes 'Token' and 'Tradingsymbol' are present.
     Returns a dictionary mapping tradingsymbol (tsym) to its token.
     """
     try:
         df = pd.read_csv(file_path)
         if all(col in df.columns for col in ['Exchange', 'Token', 'Tradingsymbol', 'Instrument']):
-            equity_symbols = df[(df['Instrument'] == 'EQ') | (df['Instrument'] == 'IND')][['Exchange', 'Token', 'Tradingsymbol']].copy()
+            equity_symbols = df[df['Instrument'] == 'EQ'][['Exchange', 'Token', 'Tradingsymbol']].copy()
             
             # Create a dictionary mapping tsym to token
             symbols_map = {row['Tradingsymbol']: str(row['Token']) for index, row in equity_symbols.iterrows()}
-            st.success(f"Loaded {len(symbols_map)} equity and index symbols from {file_path}.")
+            st.success(f"Loaded {len(symbols_map)} equity symbols from {file_path}.")
             return symbols_map
         else:
             st.error(f"CSV file '{file_path}' must contain 'Exchange', 'Token', 'Tradingsymbol', and 'Instrument' columns. Found: {', '.join(df.columns)}")
@@ -309,183 +409,51 @@ def load_symbols_from_csv(file_path="NSE_Equity.csv"):
         logging.error(f"Error loading symbols from CSV: {e}", exc_info=True)
         return {}
 
-def calculate_current_exposure(api):
-    """
-    Calculates the total traded value of current open positions.
-    Returns the sum of (quantity * current_price) for all open positions.
-    """
-    total_exposure = 0.0
-    try:
-        # Get current positions from broker
-        positions = api.get_positions()
-        if positions and isinstance(positions, list):
-            for position in positions:
-                net_qty = int(position.get('netqty', 0))
-                if net_qty != 0:  # Only consider non-zero positions
-                    # Get current market price
-                    token = position.get('token')
-                    tsym = position.get('tsym')
-                    if token:
-                        try:
-                            quote_resp = api.get_quotes(exchange=EXCHANGE, token=token)
-                            if quote_resp and quote_resp.get('stat') == 'Ok' and quote_resp.get('values'):
-                                current_price = float(quote_resp['values'][0]['lp'])
-                                position_value = abs(net_qty) * current_price
-                                total_exposure += position_value
-                                logging.info(f"Position exposure for {tsym}: {abs(net_qty)} x {current_price} = {position_value}")
-                        except Exception as e:
-                            logging.error(f"Error getting price for position {tsym}: {e}")
-                            # If we can't get current price, use average price from position
-                            avg_price = float(position.get('avgprc', 0))
-                            if avg_price > 0:
-                                position_value = abs(net_qty) * avg_price
-                                total_exposure += position_value
-                                logging.warning(f"Using avg price for {tsym}: {abs(net_qty)} x {avg_price} = {position_value}")
-        
-        logging.info(f"Total current exposure: {total_exposure}")
-        return total_exposure
-        
-    except Exception as e:
-        logging.error(f"Error calculating current exposure: {e}")
-        return 0.0
 
-def calculate_new_order_value(quantity, current_ltp):
+def fetch_and_update_ltp():
     """
-    Calculates the traded value for the new order being placed.
+    Fetches the live LTP for all pending and open trades and updates the session state.
+    This creates a live market watch for the tracked trades.
     """
-    return quantity * current_ltp
+    # Create a unified list of all symbols to check
+    all_tracked_symbols = set(list(st.session_state.pending_entries.keys()) + list(st.session_state.open_tracked_trades.keys()))
 
-def check_balance_before_order(api, new_order_quantity, new_order_ltp, available_balance=None):
-    """
-    Checks if placing a new order would exceed the leverage limit.
-    
-    Args:
-        api: Trading API instance
-        new_order_quantity: Quantity of the new order
-        new_order_ltp: Current LTP for the new order
-        available_balance: Available cash balance (fetched if None)
-    
-    Returns:
-        tuple: (can_place_order: bool, reason: str, current_exposure: float, new_order_value: float, total_exposure: float, max_allowed: float)
-    """
-    try:
-        # Get current balance if not provided
-        if available_balance is None:
-            limits = api.get_limits()
-            if limits and isinstance(limits, dict) and limits.get('stat') == 'Ok':
-                available_balance = None
-                
-                if 'cash' in limits and limits['cash'] is not None:
-                    try:
-                        available_balance = float(limits['cash'])
-                    except ValueError:
-                        logging.error(f"Could not convert top-level 'cash' to float: {limits['cash']}")
+    if not all_tracked_symbols:
+        logging.info("No tracked symbols to update LTP.")
+        return
 
-                if available_balance is None and 'prange' in limits and isinstance(limits['prange'], list):
-                    for item in limits['prange']:
-                        if isinstance(item, dict) and 'cash' in item and item['cash'] is not None:
-                            try:
-                                available_balance = float(item['cash'])
-                                break
-                            except ValueError:
-                                continue
-                
-                if available_balance is None:
-                    return False, "Could not retrieve account balance", 0, 0, 0, 0
+    logging.info(f"Fetching LTP for {len(all_tracked_symbols)} symbols: {all_tracked_symbols}")
+
+    for tsym in all_tracked_symbols:
+        # Check if the symbol is in pending entries
+        if tsym in st.session_state.pending_entries:
+            trade_data = st.session_state.pending_entries[tsym]
+            current_ltp = get_tradetron_ltp_simple(
+                tsym.replace('-EQ', ''), # Ensure symbol format is correct for Tradetron
+                st.session_state.tradetron_cookie,
+                st.session_state.tradetron_user_agent
+            )
+            # Update the LTP if a valid number is returned
+            if isinstance(current_ltp, (int, float)):
+                trade_data['current_ltp'] = current_ltp
+                logging.info(f"Updated LTP for PENDING trade {tsym} to {current_ltp}")
             else:
-                return False, "Failed to fetch account limits", 0, 0, 0, 0
-        
-        # Calculate current exposure
-        current_exposure = calculate_current_exposure(api)
-        
-        # Calculate new order value
-        new_order_value = calculate_new_order_value(new_order_quantity, new_order_ltp)
-        
-        # Calculate total exposure if this order is placed
-        total_exposure = current_exposure + new_order_value
-        
-        # Calculate maximum allowed exposure (balance * 4.5)
-        max_allowed_exposure = available_balance * 4.5
-        
-        # Check if total exposure exceeds limit
-        can_place = total_exposure <= max_allowed_exposure
-        
-        if can_place:
-            reason = f"Order allowed: Total exposure {total_exposure:,.2f} <= Max allowed {max_allowed_exposure:,.2f}"
-        else:
-            reason = f"Order rejected: Total exposure {total_exposure:,.2f} > Max allowed {max_allowed_exposure:,.2f}"
-        
-        logging.info(f"Balance check - Balance: {available_balance:,.2f}, Current exposure: {current_exposure:,.2f}, New order: {new_order_value:,.2f}, Total: {total_exposure:,.2f}, Max allowed: {max_allowed_exposure:,.2f}, Result: {can_place}")
-        
-        return can_place, reason, current_exposure, new_order_value, total_exposure, max_allowed_exposure
-        
-    except Exception as e:
-        logging.error(f"Error in balance check: {e}")
-        return False, f"Error during balance check: {e}", 0, 0, 0, 0
+                logging.warning(f"Failed to get LTP for PENDING trade {tsym}: {current_ltp}")
 
-def should_stop_screening(api, available_balance=None):
-    """
-    Determines if screening should be stopped due to leverage limits.
-    This is a more conservative check - stops screening if we're already near the limit.
-    
-    Args:
-        api: Trading API instance
-        available_balance: Available cash balance (fetched if None)
-    
-    Returns:
-        tuple: (should_stop: bool, reason: str)
-    """
-    try:
-        # Get current balance if not provided
-        if available_balance is None:
-            limits = api.get_limits()
-            if limits and isinstance(limits, dict) and limits.get('stat') == 'Ok':
-                available_balance = None
-                
-                if 'cash' in limits and limits['cash'] is not None:
-                    try:
-                        available_balance = float(limits['cash'])
-                    except ValueError:
-                        pass
-
-                if available_balance is None and 'prange' in limits and isinstance(limits['prange'], list):
-                    for item in limits['prange']:
-                        if isinstance(item, dict) and 'cash' in item and item['cash'] is not None:
-                            try:
-                                available_balance = float(item['cash'])
-                                break
-                            except ValueError:
-                                continue
-                
-                if available_balance is None:
-                    return True, "Could not retrieve account balance - stopping screening"
-        
-        # Calculate current exposure
-        current_exposure = calculate_current_exposure(api)
-        
-        # Calculate maximum allowed exposure
-        max_allowed_exposure = available_balance * 4.5
-        
-        # Stop screening if we're using more than 90% of allowed leverage
-        # This leaves room for one more reasonably sized trade
-        utilization_threshold = 0.90
-        current_utilization = current_exposure / max_allowed_exposure if max_allowed_exposure > 0 else 1.0
-        
-        should_stop = current_utilization >= utilization_threshold
-        
-        if should_stop:
-            reason = f"Stopping screening: Current utilization {current_utilization:.1%} >= threshold {utilization_threshold:.1%}"
-        else:
-            reason = f"Continuing screening: Current utilization {current_utilization:.1%} < threshold {utilization_threshold:.1%}"
-        
-        logging.info(f"Screening check - {reason}")
-        return should_stop, reason
-        
-    except Exception as e:
-        logging.error(f"Error in screening stop check: {e}")
-        return True, f"Error during screening check: {e}"
-
-
+        # Check if the symbol is in open tracked trades
+        elif tsym in st.session_state.open_tracked_trades:
+            trade_data = st.session_state.open_tracked_trades[tsym]
+            current_ltp = get_tradetron_ltp_simple(
+                tsym.replace('-EQ', ''), # Ensure symbol format is correct for Tradetron
+                st.session_state.tradetron_cookie,
+                st.session_state.tradetron_user_agent
+            )
+            # Update the LTP if a valid number is returned
+            if isinstance(current_ltp, (int, float)):
+                trade_data['current_ltp'] = current_ltp
+                logging.info(f"Updated LTP for OPEN trade {tsym} to {current_ltp}")
+            else:
+                logging.warning(f"Failed to get LTP for OPEN trade {tsym}: {current_ltp}")
 def get_nifty500_symbols():
     """
     Uses the load_symbols_from_csv function to get the actual symbols.
@@ -608,6 +576,28 @@ def get_tradetron_ltp(symbol, tradetron_cookie, tradetron_user_agent):
         print(f"DEBUG - Unexpected Error: {e}")
         logging.error(f"Unexpected error fetching Tradetron LTP for {symbol}: {e}", exc_info=True)
         return "Unknown Error"
+# OPTION 2: More robust fix with error handling
+def get_current_manual_sl(tsym, trade_info=None):
+    """
+    Safely get current manual SL with fallbacks
+    """
+    try:
+        # Try session state manual overrides first
+        manual_sl = st.session_state.manual_overrides.get(tsym, {}).get('sl_price')
+        if manual_sl is not None and manual_sl > 0:
+            return float(manual_sl)
+        
+        # Try from trade_info if provided
+        if trade_info and 'sl_price' in trade_info:
+            trade_sl = trade_info.get('sl_price')
+            if trade_sl is not None and trade_sl > 0:
+                return float(trade_sl)
+        
+        # Default fallback
+        return 0.0
+        
+    except (ValueError, TypeError, AttributeError):
+        return 0.0
 
 def get_tradetron_ltp_simple(symbol, tradetron_cookie, tradetron_user_agent):
     """ Simplified version for production use after debugging """
@@ -650,7 +640,320 @@ def get_tradetron_ltp_simple(symbol, tradetron_cookie, tradetron_user_agent):
             
     # If all time ranges fail
     return "No Data"
+# Additional debugging function to test symbol formats
+def test_tradetron_symbol_formats(base_symbol, tradetron_cookie, tradetron_user_agent):
+    """
+    Test different symbol formats to find the correct one for Tradetron API
+    """
+    if not tradetron_cookie or not tradetron_user_agent:
+        print("Cookie or User-Agent missing")
+        return
+    
+    # Test various symbol formats
+    formats_to_test = [
+        base_symbol,  # Original
+        base_symbol.replace('-EQ', ''),  # Remove -EQ
+        f"NSE:{base_symbol.replace('-EQ', '')}",  # Add NSE prefix
+        f"{base_symbol.replace('-EQ', '')}-EQ",  # Keep -EQ
+        f"NSE:{base_symbol}",  # NSE with original
+    ]
+    
+    print(f"Testing symbol formats for {base_symbol}:")
+    
+    for test_symbol in formats_to_test:
+        print(f"\n--- Testing format: {test_symbol} ---")
+        result = get_tradetron_ltp(test_symbol, tradetron_cookie, tradetron_user_agent)
+        print(f"Result: {result}")
+        if isinstance(result, (int, float)):
+            print(f"SUCCESS! Correct format is: {test_symbol}")
+            return test_symbol
+    
+    print("No working format found")
+    return None
 
+# Test script to debug Tradetron API issues
+# Add this to your Streamlit app or run separately
+
+def debug_tradetron_api():
+    """
+    Debug function to test Tradetron API with your credentials
+    """
+    st.write("## Tradetron API Debug")
+    
+    # Get credentials from session state
+    cookie = st.session_state.tradetron_cookie
+    user_agent = st.session_state.tradetron_user_agent
+    
+    if not cookie or not user_agent:
+        st.error("Please enter your Tradetron cookie and user-agent in the sidebar first")
+        return
+    
+    # Test with a known symbol
+    test_symbol = st.text_input("Enter symbol to test (e.g., ACC, GRASIM, RELIANCE)", value="ACC")
+    
+    if st.button("Test Tradetron API"):
+        st.write(f"Testing symbol: {test_symbol}")
+        
+        # Test different formats
+        st.write("### Testing different symbol formats:")
+        
+        formats_to_test = [
+            test_symbol,
+            f"NSE:{test_symbol}",
+            f"{test_symbol}-EQ",
+            f"NSE:{test_symbol}-EQ",
+        ]
+        
+        for format_test in formats_to_test:
+            st.write(f"**Testing format: {format_test}**")
+            
+            # Manual API call for debugging
+            current_time = datetime.datetime.now()
+            etime_ms = int(current_time.timestamp() * 1000)
+            stime_ms = int((current_time - datetime.timedelta(minutes=5)).timestamp() * 1000)
+            
+            url = f"https://tradetron.tech/tv/api/v3?symbol={format_test}&stime={stime_ms}&etime={etime_ms}&candle=1m"
+            
+            headers = {
+                "authority": "tradetron.tech",
+                "method": "GET",
+                "path": "/tv/api/v3",
+                "scheme": "https",
+                "accept": "*/*",
+                "accept-encoding": "gzip, deflate, br, zstd",
+                "accept-language": "en-US,en;q=0.9",
+                "referer": "https://tradetron.tech/user/dashboard",
+                "sec-ch-ua": '"Not;A=Brand";v="99", "Google Chrome";v="139", "Chromium";v="139"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+                "user-agent": user_agent,
+                "cookie": cookie
+            }
+            
+            try:
+                response = requests.get(url, headers=headers, timeout=10)
+                st.write(f"Status Code: {response.status_code}")
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    st.write(f"Response: {data}")
+                    
+                    if data.get('success') and data.get('Data') and len(data['Data']) > 0:
+                        ltp = data['Data'][0].get('close')
+                        st.success(f"✅ SUCCESS! LTP: {ltp}")
+                        st.write(f"**Correct format: {format_test}**")
+                        break
+                    else:
+                        st.warning(f"❌ No data or unsuccessful")
+                else:
+                    st.error(f"❌ HTTP Error: {response.status_code}")
+                    st.write(f"Response: {response.text}")
+                    
+            except Exception as e:
+                st.error(f"❌ Exception: {e}")
+            
+            st.write("---")
+
+
+if st.sidebar.button("Debug Tradetron API"):
+    debug_tradetron_api()
+
+if st.button("Test Single Symbol"):
+    test_result = get_tradetron_ltp("ACC", st.session_state.tradetron_cookie, st.session_state.tradetron_user_agent)
+    st.write(f"Test result: {test_result}")
+# Add this comprehensive debug section to your Streamlit app
+# Place it in the sidebar or main area for testing
+# Add this to your sidebar
+if st.sidebar.button("🔄 Refresh LTP (Tradetron)", type="secondary"):
+    fetch_and_update_ltp()
+    st.success("LTP data refreshed from Tradetron API!")
+
+if __name__ == "__main__":
+    st.title("Trade Monitor Dashboard")
+    
+    # Place credentials input in a sidebar to keep the main view clean
+    with st.sidebar:
+        st.header("Tradetron API Credentials")
+        st.session_state.tradetron_cookie = st.text_input("Tradetron Cookie", type="password")
+        st.session_state.tradetron_user_agent = st.text_input("User-Agent", type="password")
+        
+        # Add a refresh button for manual updates
+        if st.button("Refresh Live Prices", type="primary"):
+            fetch_and_update_ltp()
+            st.success("LTP data refreshed!")
+    
+    # Main Dashboard View
+    if not st.session_state.tradetron_cookie or not st.session_state.tradetron_user_agent:
+        st.warning("Please enter your Tradetron API credentials in the sidebar to fetch live data.")
+    else:
+        # Load and display trades
+        load_tracked_trades_from_supabase()
+        
+        # Display the live-updating tables
+        st.header("Live App-Tracked Trades")
+        
+        # ... (rest of your display logic for pending and open trades goes here)
+        # You will need to add the st.dataframe() or st.table() calls for the session state data.
+
+import uuid
+import hashlib
+# SOLUTION 2: Use a global counter that persists across reruns
+
+def display_trades_safely(trades_dict, section_name):
+    """
+    Safely display trades with proper tsym scope
+    """
+    if not trades_dict:
+        st.write(f"No {section_name} trades to display")
+        return
+    
+    # Initialize counter if not exists
+    if 'simple_counter' not in st.session_state:
+        st.session_state.simple_counter = 0
+    
+    # Initialize manual overrides if not exists
+    if 'manual_overrides' not in st.session_state:
+        st.session_state.manual_overrides = {}
+    
+    st.subheader(f"📋 {section_name.title()} Trades")
+    
+    # Create header row
+    header_cols = st.columns([1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+    headers = ["Symbol", "Side", "Qty", "Entry", "Current", "SL", "Target", "Status", "Manual SL", "Manual Target"]
+    for i, header in enumerate(headers):
+        header_cols[i].write(f"**{header}**")
+    
+    # Display each trade - tsym is properly defined here
+    for tsym, trade_info in trades_dict.items():
+        cols = st.columns([1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+        
+        # Display trade information
+        cols[0].write(tsym)
+        cols[1].write(trade_info.get('buy_or_sell', 'N/A'))
+        cols[2].write(str(trade_info.get('quantity', 0)))
+        cols[3].write(f"{trade_info.get('entry_price', 0):.2f}")
+        cols[4].write(f"{trade_info.get('current_ltp', 0):.2f}")
+        cols[5].write(f"{trade_info.get('sl_price', 0):.2f}")
+        cols[6].write(f"{trade_info.get('target_price', 0):.2f}")
+        cols[7].write(trade_info.get('status', 'Unknown'))
+        
+        # Manual SL input - tsym is available here
+        current_manual_sl = st.session_state.manual_overrides.get(tsym, {}).get('sl_price', 0.0)
+        if current_manual_sl is None or current_manual_sl < 0:
+            current_manual_sl = trade_info.get('sl_price', 0.0)
+        
+        st.session_state.simple_counter += 1
+        unique_key = f"manual_sl_{tsym}_{section_name}_{st.session_state.simple_counter}"
+        
+        new_manual_sl = cols[8].number_input(
+            "Manual SL", 
+            value=current_manual_sl,
+            step=0.01,
+            format="%.2f",
+            key=unique_key,
+            label_visibility="collapsed"
+        )
+        
+        # Manual Target input
+        current_manual_target = st.session_state.manual_overrides.get(tsym, {}).get('target_price', 0.0)
+        if current_manual_target is None or current_manual_target < 0:
+            current_manual_target = trade_info.get('target_price', 0.0)
+        
+        st.session_state.simple_counter += 1
+        target_unique_key = f"manual_target_{tsym}_{section_name}_{st.session_state.simple_counter}"
+        
+        new_manual_target = cols[9].number_input(
+            "Manual Target", 
+            value=current_manual_target,
+            step=0.01,
+            format="%.2f",
+            key=target_unique_key,
+            label_visibility="collapsed"
+        )
+        
+        # Handle changes
+        if new_manual_sl != current_manual_sl or new_manual_target != current_manual_target:
+            if tsym not in st.session_state.manual_overrides:
+                st.session_state.manual_overrides[tsym] = {}
+            
+            if new_manual_sl != current_manual_sl:
+                st.session_state.manual_overrides[tsym]['sl_price'] = new_manual_sl
+            
+            if new_manual_target != current_manual_target:
+                st.session_state.manual_overrides[tsym]['target_price'] = new_manual_target
+
+# SOLUTION 2: Use a global counter that persists across reruns
+def get_unique_widget_key_counter(base_key, tsym, section=""):
+    """
+    Generate unique key using a persistent counter
+    """
+    # Initialize counter if not exists
+    if 'global_widget_counter' not in st.session_state:
+        st.session_state.global_widget_counter = 0
+    
+    # Increment counter for each new widget
+    st.session_state.global_widget_counter += 1
+    
+    return f"{base_key}_{tsym}_{section}_{st.session_state.global_widget_counter}"
+
+# SOLUTION 3: Hash-based approach with position tracking
+def get_unique_widget_key_hash(base_key, tsym, row_index, section=""):
+    """
+    Generate unique key using hash with position
+    """
+    # Create a unique string from multiple components
+    components = f"{base_key}_{tsym}_{section}_{row_index}_{id(st.session_state)}"
+    hash_value = hashlib.md5(components.encode()).hexdigest()[:8]
+    
+    return f"{base_key}_{tsym}_{section}_{row_index}_{hash_value}"
+def get_unique_widget_key_counter(base_key, tsym, section=""):
+    """
+    Generate unique key using a persistent counter
+    """
+    # Initialize counter if not exists
+    if 'global_widget_counter' not in st.session_state:
+        st.session_state.global_widget_counter = 0
+    
+    # Increment counter for each new widget
+    st.session_state.global_widget_counter += 1
+    
+    return f"{base_key}_{tsym}_{section}_{st.session_state.global_widget_counter}"
+
+# SOLUTION 3: Hash-based approach with position tracking
+def get_unique_widget_key_hash(base_key, tsym, row_index, section=""):
+    """
+    Generate unique key using hash with position
+    """
+    # Create a unique string from multiple components
+    components = f"{base_key}_{tsym}_{section}_{row_index}_{id(st.session_state)}"
+    hash_value = hashlib.md5(components.encode()).hexdigest()[:8]
+    
+    return f"{base_key}_{tsym}_{section}_{row_index}_{hash_value}"
+# SOLUTION 1: Use UUID with session-based tracking (RECOMMENDED)
+def get_unique_widget_key(base_key, tsym, section="", additional_id=""):
+    """
+    Generate a truly unique widget key using UUID and session tracking
+    """
+    # Initialize unique key tracker in session state
+    if 'widget_key_tracker' not in st.session_state:
+        st.session_state.widget_key_tracker = {}
+    
+    # Create a base identifier
+    identifier = f"{base_key}_{tsym}_{section}_{additional_id}"
+    
+    # If we've seen this identifier before, use the stored UUID
+    if identifier in st.session_state.widget_key_tracker:
+        return st.session_state.widget_key_tracker[identifier]
+    
+    # Generate new UUID and store it
+    unique_id = str(uuid.uuid4())[:12]  # Use 12 chars for readability
+    full_key = f"{identifier}_{unique_id}"
+    st.session_state.widget_key_tracker[identifier] = full_key
+    
+    return full_key
 def comprehensive_tradetron_debug():
     """
     Comprehensive debugging for Tradetron API issues
@@ -776,126 +1079,307 @@ def comprehensive_tradetron_debug():
                         
                 elif response.status_code == 401:
                     st.error("❌ 401 Unauthorized - Your cookie has expired")
-                    st.write("Please get a fresh cookie from...")
-            except requests.exceptions.ConnectionError as e:
-                st.error(f"❌ Connection error: {e}")
+                    st.write("Please get a fresh cookie from your browser")
+                    
+                elif response.status_code == 403:
+                    st.error("❌ 403 Forbidden - Access denied")
+                    
+                else:
+                    st.error(f"❌ HTTP {response.status_code}")
+                    st.write(f"Response: {response.text[:200]}...")
+                    
+            except requests.exceptions.Timeout:
+                st.error("❌ Request timed out")
+            except requests.exceptions.ConnectionError:
+                st.error("❌ Connection error")
             except Exception as e:
                 st.error(f"❌ Unexpected error: {e}")
-                
-    st.write("---")
+            
+            st.write("---")
     
     # Step 4: Manual URL test
     st.write("### Step 4: Manual URL Test")
     st.write("Copy this URL and test it manually in your browser while logged into Tradetron:")
+    
     current_time = datetime.datetime.now()
     etime_ms = int(current_time.timestamp() * 1000)
     stime_ms = int((current_time - datetime.timedelta(minutes=15)).timestamp() * 1000)
+    
     manual_test_url = f"https://tradetron.tech/tv/api/v3?symbol=ACC&stime={stime_ms}&etime={etime_ms}&candle=1m"
     st.code(manual_test_url)
+    
     st.write("If this URL works in your browser but not in the app, it's a cookie/authentication issue.")
 
-if st.sidebar.button("Debug Tradetron API"):
-    comprehensive_tradetron_debug()
-
-if st.button("Test Single Symbol"):
-    test_result = get_tradetron_ltp("ACC", st.session_state.tradetron_cookie, st.session_state.tradetron_user_agent)
-    st.write(f"Test result: {test_result}")
-
-
-# Moved function definitions here to ensure they are defined before being called
-def fetch_and_update_ltp():
-    """
-    Fetches LTP from Tradetron API for all pending and open trades and updates the session state.
-    This creates a live market watch for the tracked trades using Tradetron API.
-    """
-    tradetron_cookie = st.session_state.tradetron_cookie
-    tradetron_user_agent = st.session_state.tradetron_user_agent
     
-    all_tracked_tsyms = list(st.session_state.pending_entries.keys()) + list(st.session_state.open_tracked_trades.keys())
-    
-    if not tradetron_cookie or not tradetron_user_agent:
-        st.warning("Tradetron credentials are not set. Live price updates disabled.")
-        return
-        
-    for tsym in all_tracked_tsyms:
-        ltp = get_tradetron_ltp_simple(tsym, tradetron_cookie, tradetron_user_agent)
-        
-        if isinstance(ltp, float):
-            # Update pending entries
-            if tsym in st.session_state.pending_entries:
-                st.session_state.pending_entries[tsym]['current_ltp'] = ltp
-            
-            # Update open trades and check for SL/Target hits
-            if tsym in st.session_state.open_tracked_trades:
-                st.session_state.open_tracked_trades[tsym]['current_ltp'] = ltp
-                
-                # Update highest/lowest price seen for trailing SL
-                trade_info = st.session_state.open_tracked_trades[tsym]
-                if trade_info['buy_or_sell'] == 'B': # BUY position
-                    if ltp > trade_info['highest_price_seen']:
-                        trade_info['highest_price_seen'] = ltp
-                else: # SELL position
-                    if ltp < trade_info['lowest_price_seen']:
-                        trade_info['lowest_price_seen'] = ltp
-
-
-def calculate_quantity_and_sl_new(entry_price, sl_price, capital):
+def calculate_quantity_and_sl(signal_type, signal_candle_high, signal_candle_low, expected_entry_price, capital):
     """
-    Calculate quantity using the new formula: Capital * 0.01 / SL_Points
-    Args:
-        entry_price (float): Entry price of the trade
-        sl_price (float): Stop loss price
-        capital (float): Available capital
-    Returns:
-        tuple: (calculated_quantity, sl_points, potential_loss)
-    """
-    sl_points = abs(entry_price - sl_price)
-    if sl_points == 0:
-        return 0, 0, 0
-    
-    # NEW FORMULA: Quantity = Capital * 0.01 / SL_Points
-    calculated_quantity = int((capital * 0.01) / sl_points)
-    potential_loss = sl_points * calculated_quantity
-    
-    return calculated_quantity, sl_points, potential_loss
-
-
-def calculate_quantity_sl_tp(signal_candle_high, signal_candle_low, signal_type, capital):
-    """
-    Calculates the quantity, SL, and TP based on signal candle high/low,
-    risk percentage of capital, and target multiplier.
+    Modified quantity calculation: capital * 0.01 / SL_points
+    SL adjustment: 1x potential loss instead of fixed points
     """
     if signal_type == 'BUY':
-        # Expected entry price is the high plus a small buffer
-        expected_entry_price = round(signal_candle_high * (1 + st.session_state.entry_buffer_percent), 2)
         # SL at signal candle low minus buffer
         sl_price = round(signal_candle_low - st.session_state.sl_buffer_points, 2)
         sl_points = expected_entry_price - sl_price
+        
         # Trailing step = 1x potential loss
         trailing_step = sl_points
-    else: # SELL
-        # Expected entry price is the low minus a small buffer
-        expected_entry_price = round(signal_candle_low * (1 - st.session_state.entry_buffer_percent), 2)
-        # SL at signal candle high plus buffer
+        
+    else:  # SELL
+        # SL at signal candle high plus buffer  
         sl_price = round(signal_candle_high + st.session_state.sl_buffer_points, 2)
         sl_points = sl_price - expected_entry_price
+        
         # Trailing step = 1x potential loss
         trailing_step = sl_points
-
+    
     if sl_points <= 0.01:
         return 0, sl_price, 0, trailing_step
     
     # Modified quantity calculation: capital * 0.01 / SL_points
     calculated_quantity = int((capital * 0.01) / sl_points)
-
+    
     # Target = entry + (potential_loss * multiplier)
     target_price = expected_entry_price + (sl_points * st.session_state.target_multiplier) if signal_type == 'BUY' else expected_entry_price - (sl_points * st.session_state.target_multiplier)
     
     return calculated_quantity, sl_price, target_price, trailing_step
 
+# Add this button to your sidebar
+if st.sidebar.button("🔍 Debug Tradetron API"):
+    comprehensive_tradetron_debug()
 
+# Also create a simplified working version once we identify the issue
+def get_tradetron_ltp_simple(symbol, tradetron_cookie, tradetron_user_agent):
+    """
+    Simplified version for production use after debugging
+    """
+    if not tradetron_cookie or not tradetron_user_agent:
+        return "Auth Missing"
+
+    current_time = datetime.datetime.now()
+    
+    # Try different time ranges if first one fails
+    time_ranges = [1, 5, 10, 20]  # minutes
+    
+    for minutes in time_ranges:
+        etime_ms = int(current_time.timestamp() * 1000)
+        stime_ms = int((current_time - datetime.timedelta(minutes=minutes)).timestamp() * 1000)
+        
+        url = f"https://tradetron.tech/tv/api/v3?symbol={symbol}&stime={stime_ms}&etime={etime_ms}&candle=1m"
+        
+        headers = {
+            "authority": "tradetron.tech",
+            "accept": "*/*",
+            "accept-language": "en-US,en;q=0.9",
+            "referer": "https://tradetron.tech/user/dashboard",
+            "user-agent": tradetron_user_agent,
+            "cookie": tradetron_cookie
+        }
+        
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if (data and 
+                    data.get('success') is True and 
+                    'Data' in data and 
+                    isinstance(data['Data'], list) and 
+                    len(data['Data']) > 0 and
+                    isinstance(data['Data'][0], dict) and
+                    'close' in data['Data'][0]):
+                    
+                    return float(data['Data'][0]['close'])
+            
+        except Exception as e:
+            logging.error(f"Error fetching Tradetron data for {symbol} with {minutes}min range: {e}")
+            continue
+    
+    # If all time ranges fail
+    return "No Data"
+
+def screen_stock(stock_info, api, all_symbols_map):
+    """
+    Modified screening function with updated conditions:
+    1. Volume condition: Current volume > average of last 20 candles × 2 (reduced from 10)
+    2. Traded value condition: Current traded value > 5 million INR (more realistic threshold)
+    3. Range condition: Current open-close difference > average of last 20 candles × 2 (reduced from 4)
+    4. PVI condition remains the same
+    5. Check if symbol already traded today
+    6. Risk management: No trade if trade value > 4.5 × (cash balance - open positions value)
+    """
+    exchange = stock_info['exchange']
+    token = stock_info['token']
+    tradingsymbol = stock_info['tsym']
+    
+    # Check if already traded today
+    if tradingsymbol in st.session_state.daily_traded_symbols:
+        return tradingsymbol, 'NEUTRAL', 'Already traded today', None, None, None, None
+    
+    # Calculate start time for fetching candles (need more for PVI calculation)
+    end_time = datetime.datetime.now()
+    start_time = end_time - datetime.timedelta(minutes=20)  # Extra candles for PVI calculation
+    
+    try:
+        candle_data = api.get_time_price_series(
+            exchange=exchange,
+            token=token,
+            starttime=int(start_time.timestamp()),
+            endtime=int(end_time.timestamp()),
+            interval=CANDLE_INTERVAL
+        )
+        
+        if not candle_data or len(candle_data) < 20:  # Need more candles for PVI
+            logging.warning(f"Not enough candle data for {tradingsymbol}. Needed: 20+, Got: {len(candle_data) if candle_data else 0}")
+            return tradingsymbol, 'NEUTRAL', 'Insufficient candle data', None, None, None, None
+        
+        current_candle = candle_data[0]  # Most recent candle
+        previous_20_candles = candle_data[1:21]  # Previous 20 candles for average calculation
+        
+        # Extract values from current candle
+        current_volume = float(current_candle.get('intv', 0))
+        current_close_price = float(current_candle.get('intc', 0))
+        current_open_price = float(current_candle.get('into', 0))
+        current_high = float(current_candle.get('inth', 0))
+        current_low = float(current_candle.get('intl', 0))
+        
+        # Get signal candle timestamp
+        signal_candle_time = current_candle.get('time', 'Unknown')
+        if isinstance(signal_candle_time, str) and signal_candle_time.isdigit():
+            signal_candle_time = datetime.datetime.fromtimestamp(int(signal_candle_time)).strftime('%H:%M:%S')
+        
+        if current_volume == 0 or current_close_price == 0 or current_high == 0 or current_low == 0:
+            return tradingsymbol, 'NEUTRAL', 'Current candle data is zero/invalid', None, None, None, signal_candle_time
+
+        # --- MODIFIED CONDITION 1: Volume Check (Reduced multiplier from 10 to 2) ---
+        previous_volumes = [float(c.get('intv', 0)) for c in previous_20_candles if float(c.get('intv', 0)) > 0]
+        if not previous_volumes:
+            return tradingsymbol, 'NEUTRAL', 'No valid volume data in previous 20 candles', None, None, None, signal_candle_time
+        
+        average_volume_last_20 = sum(previous_volumes) / len(previous_volumes)
+        volume_multiplier = 10  # Reduced from st.session_state.volume_multiplier (which was 10)
+        if not (current_volume > volume_multiplier * average_volume_last_20):
+            return tradingsymbol, 'NEUTRAL', f'Volume condition not met (Current: {current_volume:,.0f}, Avg×{volume_multiplier}: {volume_multiplier * average_volume_last_20:,.0f})', None, None, None, signal_candle_time
+
+        # --- MODIFIED CONDITION 2: Traded Value Check (Fixed threshold instead of variable) ---
+        current_traded_value = current_volume * current_close_price
+        traded_value_threshold = 50000000  # Fixed 5 million INR threshold
+        if not (current_traded_value > traded_value_threshold):
+            return tradingsymbol, 'NEUTRAL', f'Traded value condition not met (Current: ₹{current_traded_value:,.0f}, Required: ₹{traded_value_threshold:,.0f})', None, None, None, signal_candle_time
+
+        # --- MODIFIED CONDITION 3: Open-Close Range Check (Reduced multiplier from 4 to 2) ---
+        current_open_close_diff = abs(current_close_price - current_open_price)
+        if current_open_close_diff <= 0:
+            return tradingsymbol, 'NEUTRAL', 'Current open-close difference invalid', None, None, None, signal_candle_time
+        
+        previous_open_close_diffs = []
+        for c in previous_20_candles:
+            open_price = float(c.get('into', 0))
+            close_price = float(c.get('intc', 0))
+            if open_price > 0 and close_price > 0:
+                diff = abs(close_price - open_price)
+                if diff > 0:
+                    previous_open_close_diffs.append(diff)
+        
+        if not previous_open_close_diffs:
+            return tradingsymbol, 'NEUTRAL', 'No valid open-close diff data in previous 20 candles', None, None, None, signal_candle_time
+
+        average_open_close_diff_last_20 = sum(previous_open_close_diffs) / len(previous_open_close_diffs)
+        range_multiplier = 4  # Reduced from st.session_state.high_low_diff_multiplier (which was 4)
+        if not (current_open_close_diff > range_multiplier * average_open_close_diff_last_20):
+            return tradingsymbol, 'NEUTRAL', f'Open-close diff condition not met (Current: {current_open_close_diff:.2f}, Avg×{range_multiplier}: {range_multiplier * average_open_close_diff_last_20:.2f})', None, None, None, signal_candle_time
+
+        # --- CONDITION 4: PVI Condition Check (Unchanged) ---
+    
+
+        # --- CONDITION 5: Calculate potential trade value and check risk management ---
+        # First determine the signal type and calculate potential trade parameters
+        signal_type = None
+        if current_close_price > current_open_price:
+            signal_type = 'BUY'
+        elif current_close_price < current_open_price:
+            signal_type = 'SELL'
+        
+        if signal_type:
+            # Calculate expected entry price and stop loss
+            if signal_type == 'BUY':
+                expected_entry_price = round(current_high * (1 + 0.0005), 2)  # Entry buffer
+                initial_sl_price = round(current_low - st.session_state.sl_buffer_points, 2)
+            else:  # SELL
+                expected_entry_price = round(current_low * (1 - 0.0005), 2)  # Entry buffer  
+                initial_sl_price = round(current_high + st.session_state.sl_buffer_points, 2)
+            
+            potential_loss_per_share = abs(expected_entry_price - initial_sl_price)
+            if potential_loss_per_share <= 0.01:
+                return tradingsymbol, 'NEUTRAL', f'{signal_type} signal but invalid SL distance', None, None, None, signal_candle_time
+            
+            # Calculate quantity using the capital * 0.01 / SL_points formula
+            calculated_quantity = int((st.session_state.capital * 0.01) / potential_loss_per_share)
+            
+            if calculated_quantity <= 0:
+                return tradingsymbol, 'NEUTRAL', f'{signal_type} signal but calculated quantity is zero', None, None, None, signal_candle_time
+            
+            # Calculate total trade value
+            total_trade_value = calculated_quantity * expected_entry_price
+            
+            # --- NEW CONDITION 6: Risk Management Check ---
+            # Get current cash balance and open positions value
+            try:
+                # Fetch account limits
+                limits = api.get_limits()
+                cash_balance = 0
+                if limits and isinstance(limits, dict) and limits.get('stat') == 'Ok':
+                    if 'cash' in limits and limits['cash'] is not None:
+                        try:
+                            cash_balance = float(limits['cash'])
+                        except ValueError:
+                            logging.error(f"Could not convert cash balance to float: {limits['cash']}")
+                    elif 'prange' in limits and isinstance(limits['prange'], list):
+                        for item in limits['prange']:
+                            if isinstance(item, dict) and 'cash' in item and item['cash'] is not None:
+                                try:
+                                    cash_balance = float(item['cash'])
+                                    break
+                                except ValueError:
+                                    continue
+                
+                # Calculate total value of open positions
+                open_positions_value = 0
+                positions = api.get_positions()
+                if isinstance(positions, list):
+                    for pos in positions:
+                        if pos.get('netqty', 0) != 0:
+                            net_qty = int(pos.get('netqty', 0))
+                            ltp = float(pos.get('lp', 0))
+                            position_value = abs(net_qty * ltp)
+                            open_positions_value += position_value
+                
+                # Calculate available capital for new trades
+                net_available_capital = cash_balance * 4.5 - open_positions_value
+                max_allowed_trade_value = net_available_capital
+                
+                if total_trade_value > max_allowed_trade_value:
+                    return tradingsymbol, 'NEUTRAL', f'{signal_type} signal but trade value ₹{total_trade_value:,.0f} exceeds limit ₹{max_allowed_trade_value:,.0f} (Cash: ₹{cash_balance:,.0f}, Open: ₹{open_positions_value:,.0f})', None, None, None, signal_candle_time
+                
+            except Exception as e:
+                logging.error(f"Error checking risk management for {tradingsymbol}: {e}")
+                return tradingsymbol, 'NEUTRAL', f'{signal_type} signal but risk check failed: {str(e)}', None, None, None, signal_candle_time
+            
+            # All conditions passed
+            return tradingsymbol, signal_type, f'All conditions met: {signal_type} signal + Risk cleared (Trade: ₹{total_trade_value:,.0f}, Max: ₹{max_allowed_trade_value:,.0f}, Vol: {current_volume:,.0f} vs {volume_multiplier * average_volume_last_20:,.0f})', current_close_price, current_high, current_low, signal_candle_time
+        
+
+    except Exception as e:
+        logging.error(f"Error screening {tradingsymbol}: {e}", exc_info=True)
+        return tradingsymbol, 'NEUTRAL', f'Error during screening: {e}', None, None, None, None
+    
 def place_intraday_order(
-    buy_or_sell, tradingsymbol, quantity, entry_price, api, token
+    buy_or_sell,
+    tradingsymbol,
+    quantity,
+    entry_price,
+    api,
+    token
 ):
     """
     Places a regular Intraday (MIS) order.
@@ -906,26 +1390,27 @@ def place_intraday_order(
         logging.warning(f"Order skipped for {tradingsymbol}: Quantity is zero or negative ({quantity}).")
         return {'stat': 'Not_Ok', 'emsg': 'Quantity is zero or negative'}
 
-    ret = api.place_order(
-        buy_or_sell=buy_or_sell,
-        product_type='I',  # 'I' for Intraday
-        exchange=EXCHANGE,
-        tradingsymbol=tradingsymbol,
-        quantity=quantity,
-        discloseqty=0,
-        price_type='MKT',  # Market order
-        price=0,
-        trigger_price=None,
-        retention='DAY',
-        token=token
-    )
+    st.info(f"Attempting to place {buy_or_sell} Intraday order for {tradingsymbol}: Qty={int(quantity)}, Price={entry_price:.2f}")
+    logging.info(f"Placing order for {tradingsymbol}. Action: {buy_or_sell}, Qty: {quantity}, Entry Ref Price: {entry_price:.2f}, Product: I, Exchange: {EXCHANGE}")
     
-    order_response = ret
     try:
+        order_response = api.place_order(
+            buy_or_sell=buy_or_sell,
+            product_type='I', # 'I' for Intraday (MIS)
+            exchange=EXCHANGE,
+            tradingsymbol=tradingsymbol,
+            quantity=int(quantity),
+            discloseqty=0,
+            price_type='MKT', # Use Market order for entry once triggered
+            price=0, # Not relevant for MKT order
+            trigger_price=None,
+            retention='DAY',
+            remarks='Automated_Screener_Trade_Manual_SL_TP'
+        )
+        
         if order_response and order_response.get('stat') == 'Ok':
-            st.success(f"Order placed successfully for {tradingsymbol}: {order_response}")
+            st.success(f"Order placed successfully for {tradingsymbol}. Order ID: {order_response.get('norenordno')}")
             logging.info(f"Order placed successfully for {tradingsymbol}: {order_response}")
-            return order_response
         else:
             error_msg = order_response.get('emsg', 'Unknown error') if isinstance(order_response, dict) else str(order_response)
             st.error(f"Failed to place order for {tradingsymbol}: {error_msg}")
@@ -935,287 +1420,566 @@ def place_intraday_order(
         st.error(f"An exception occurred while placing order for {tradingsymbol}: {e}")
         logging.error(f"An exception occurred while placing order for {tradingsymbol}: {e}", exc_info=True)
         return {'stat': 'Not_Ok', 'emsg': str(e)}
-
+    
 def exit_position(exchange, tradingsymbol, product_type, netqty, api, token):
     """
     Exits an existing position.
     """
+    st.info(f"Attempting to exit position for {tradingsymbol} (Qty: {netqty}, Product: {product_type})...")
     try:
-        # Determine action (BUY or SELL) based on netqty
-        buy_or_sell = 'S' if netqty > 0 else 'B'
-        
-        # Place a market order to close the position
-        order_response = api.place_order(
-            buy_or_sell=buy_or_sell,
-            product_type=product_type,
+        response = api.exit_order(
             exchange=exchange,
             tradingsymbol=tradingsymbol,
-            quantity=abs(netqty),
+            product_type=product_type,
+            quantity=abs(int(netqty)) # Ensure positive quantity for exit
+        )
+        if response and response.get('stat') == 'Ok':
+            st.success(f"Position for {tradingsymbol} exited successfully: {response}")
+            logging.info(f"Position for {tradingsymbol} exited successfully: {response}")
+            
+            # Mark the tracked trade as closed and delete from Supabase
+            if tradingsymbol in st.session_state.open_tracked_trades:
+                st.session_state.open_tracked_trades[tradingsymbol]['status'] = 'CLOSED'
+                delete_trade_from_supabase(tsym=tradingsymbol) # Delete from DB
+
+        else:
+            error_msg = response.get('emsg', 'Unknown error') if isinstance(response, dict) else str(response)
+            st.error(f"Failed to exit position for {tradingsymbol}: {error_msg}")
+            logging.error(f"Failed to exit position for {tradingsymbol}: {error_msg}. Full response: {response}")
+            return response
+            
+    except Exception as e:
+        st.error(f"An error occurred while exiting position for {tradingsymbol}: {e}")
+        logging.error(f"An error occurred while exiting position for {tradingsymbol}: {e}", exc_info=True)
+        return {'stat': 'Not_Ok', 'emsg': str(e)}
+
+def fetch_and_update_ltp():
+    """
+    Fetches LTP from Tradetron API for all pending and open trades and updates the session state.
+    This creates a live market watch for the tracked trades using Tradetron API.
+    """
+    tradetron_cookie = st.session_state.get('tradetron_cookie')
+    tradetron_user_agent = st.session_state.get('tradetron_user_agent')
+
+    if not tradetron_cookie or not tradetron_user_agent:
+        st.warning("Tradetron API credentials (cookie and user-agent) are missing. Please enter them in the sidebar to get live LTP updates.")
+        return
+
+    # Create a unified list of all symbols to check
+    all_tracked_symbols = set(list(st.session_state.pending_entries.keys()) + list(st.session_state.open_tracked_trades.keys()))
+
+    if not all_tracked_symbols:
+        logging.info("No tracked symbols to update LTP.")
+        return
+
+    logging.info(f"Fetching LTP for {len(all_tracked_symbols)} symbols: {all_tracked_symbols}")
+
+    for tsym in all_tracked_symbols:
+        # Clean up symbol format for Tradetron API
+        clean_symbol = tsym.replace('-EQ', '').strip()
+        
+        # Use the same function that works for Market Watch
+        ltp = get_tradetron_ltp(clean_symbol, tradetron_cookie, tradetron_user_agent)
+        
+        # Check if the symbol is in pending entries
+        if tsym in st.session_state.pending_entries:
+            st.session_state.pending_entries[tsym]['current_ltp'] = ltp
+            logging.info(f"Updated LTP for PENDING trade {tsym} to {ltp}")
+
+        # Check if the symbol is in open tracked trades
+        if tsym in st.session_state.open_tracked_trades:
+            st.session_state.open_tracked_trades[tsym]['current_ltp'] = ltp
+            logging.info(f"Updated LTP for OPEN trade {tsym} to {ltp}")
+
+
+
+
+def monitor_open_trades(api, all_symbols_map):
+    """
+    Monitors actively tracked trades for stoploss/target conditions and applies trailing stop-loss.
+    Uses Tradetron API for live quotes and triggers closing orders if conditions are met.
+    
+    Key Changes:
+    - Trailing SL based on 1x potential loss amount instead of fixed points
+    - Dynamic calculation: BUY SL = highest_price - potential_loss, SELL SL = lowest_price + potential_loss
+    """
+    trades_to_close = []
+    
+    tracked_tsyms_for_quotes = []
+    for tsym, trade_info in st.session_state.open_tracked_trades.items():
+        if trade_info['status'].startswith('OPEN') or trade_info['status'].startswith('CLOSING'):
+            tracked_tsyms_for_quotes.append(tsym)
+
+    if not tracked_tsyms_for_quotes:
+        logging.debug("No open trades to monitor.")
+        return # No open trades to monitor
+
+    # Get Tradetron credentials
+    tradetron_cookie = st.session_state.get('tradetron_cookie')
+    tradetron_user_agent = st.session_state.get('tradetron_user_agent')
+
+    if not tradetron_cookie or not tradetron_user_agent:
+        st.warning("Tradetron credentials missing. Cannot fetch live prices for monitoring.")
+        return
+
+    for tsym in tracked_tsyms_for_quotes:
+        trade_info = st.session_state.open_tracked_trades[tsym]
+        token = all_symbols_map.get(tsym) # Get token from the map for order placement
+        
+        if not token:
+            logging.warning(f"Token not found for {tsym}. Skipping monitoring for this trade.")
+            trade_info['current_ltp'] = "Token Missing"
+            continue
+
+        logging.debug(f"Fetching Tradetron LTP for open trade {tsym}")
+        try:
+            # Clean up symbol format for Tradetron
+            clean_symbol = tsym.replace('-EQ', '').strip()
+            
+            # Fetch LTP using Tradetron API
+            current_ltp = get_tradetron_ltp(clean_symbol, tradetron_cookie, tradetron_user_agent)
+            
+            # Check if we got a valid numeric LTP
+            if isinstance(current_ltp, (int, float)):
+                trade_info['current_ltp'] = current_ltp # Store LTP for display
+                
+                buy_or_sell = trade_info['buy_or_sell']
+                quantity = trade_info['quantity']
+
+                # Get potential loss from trade data (calculated during order placement)
+                potential_loss = trade_info.get('potential_loss', 0)
+                if potential_loss <= 0:
+                    logging.warning(f"No potential loss found for {tsym}. Cannot apply trailing SL.")
+                    continue
+
+                # --- Determine effective SL and TP (manual override or calculated/trailing) ---
+                manual_sl_override = st.session_state.manual_overrides.get(tsym, {}).get('sl_price')
+                manual_tp_override = st.session_state.manual_overrides.get(tsym, {}).get('target_price')
+
+                effective_sl_price = manual_sl_override if manual_sl_override is not None and manual_sl_override > 0 else trade_info['sl_price']
+                effective_target_price = manual_tp_override if manual_tp_override is not None and manual_tp_override > 0 else trade_info['target_price']
+
+                # Apply trailing stop only if NO manual SL override is active
+                if manual_sl_override is None or manual_sl_override <= 0:
+                    if buy_or_sell == 'B': # Long position
+                        if 'highest_price_seen' not in trade_info or current_ltp > trade_info['highest_price_seen']:
+                            trade_info['highest_price_seen'] = current_ltp
+                            upsert_trade_to_supabase({
+                                'tsym': tsym,
+                                'highest_price_seen': trade_info['highest_price_seen']
+                            })
+                        
+                        # NEW: Trailing SL = highest_price_seen - potential_loss (instead of fixed points)
+                        new_potential_sl = round(trade_info['highest_price_seen'] - potential_loss, 2)
+                        if effective_sl_price is None or new_potential_sl > effective_sl_price: # Only move SL up
+                            trade_info['sl_price'] = new_potential_sl # Update internal TSL
+                            effective_sl_price = new_potential_sl # Use updated TSL for monitoring
+                            st.info(f"Trailing SL for BUY {tsym} updated to {effective_sl_price:.2f} (Highest: {trade_info['highest_price_seen']:.2f} - Loss: {potential_loss:.2f})")
+                            upsert_trade_to_supabase({'tsym': tsym, 'sl_price': effective_sl_price})
+
+                    elif buy_or_sell == 'S': # Short position
+                        if 'lowest_price_seen' not in trade_info or current_ltp < trade_info['lowest_price_seen']:
+                            trade_info['lowest_price_seen'] = current_ltp
+                            upsert_trade_to_supabase({
+                                'tsym': tsym,
+                                'lowest_price_seen': trade_info['lowest_price_seen']
+                            })
+
+                        # NEW: Trailing SL = lowest_price_seen + potential_loss (instead of fixed points)
+                        new_potential_sl = round(trade_info['lowest_price_seen'] + potential_loss, 2)
+                        if effective_sl_price is None or new_potential_sl < effective_sl_price: # Only move SL down
+                            trade_info['sl_price'] = new_potential_sl # Update internal TSL
+                            effective_sl_price = new_potential_sl # Use updated TSL for monitoring
+                            st.info(f"Trailing SL for SELL {tsym} updated to {effective_sl_price:.2f} (Lowest: {trade_info['lowest_price_seen']:.2f} + Loss: {potential_loss:.2f})")
+                            upsert_trade_to_supabase({'tsym': tsym, 'sl_price': effective_sl_price})
+                
+                st.markdown(f"**Monitoring {tsym}:** LTP={current_ltp:.2f}, SL={effective_sl_price if effective_sl_price is not None else 'N/A':.2f}, Target={effective_target_price if effective_target_price is not None else 'N/A':.2f}, PotLoss={potential_loss:.2f}")
+
+                # Check for SL or Target hit with effective prices
+                if buy_or_sell == 'B': # Long position
+                    if effective_sl_price is not None and current_ltp <= effective_sl_price:
+                        st.warning(f"Stoploss HIT for BUY {tsym}! LTP {current_ltp} <= SL {effective_sl_price}")
+                        trades_to_close.append({'tsym': tsym, 'quantity': quantity, 'action': 'SELL', 'token': token})
+                        trade_info['status'] = 'CLOSING_SL' 
+                    elif effective_target_price is not None and current_ltp >= effective_target_price:
+                        st.success(f"Target HIT for BUY {tsym}! LTP {current_ltp} >= Target {effective_target_price}")
+                        trades_to_close.append({'tsym': tsym, 'quantity': quantity, 'action': 'SELL', 'token': token})
+                        trade_info['status'] = 'CLOSING_TP' 
+
+                elif buy_or_sell == 'S': # Short position
+                    if effective_sl_price is not None and current_ltp >= effective_sl_price:
+                        st.warning(f"Stoploss HIT for SELL {tsym}! LTP {current_ltp} >= SL {effective_sl_price}")
+                        trades_to_close.append({'tsym': tsym, 'quantity': quantity, 'action': 'BUY', 'token': token})
+                        trade_info['status'] = 'CLOSING_SL' 
+                    elif effective_target_price is not None and current_ltp <= effective_target_price:
+                        st.success(f"Target HIT for SELL {tsym}! LTP {current_ltp} <= Target {effective_target_price}")
+                        trades_to_close.append({'tsym': tsym, 'quantity': quantity, 'action': 'BUY', 'token': token})
+                        trade_info['status'] = 'CLOSING_TP' 
+            else:
+                trade_info['current_ltp'] = current_ltp  # Store the error message
+                logging.warning(f"Failed to get Tradetron LTP for {tsym}: {current_ltp}")
+
+        except Exception as e:
+            trade_info['current_ltp'] = "Error"
+            logging.error(f"Error monitoring open trade {tsym}: {e}", exc_info=True)
+
+    # Execute closing orders using Flattrade API
+    for trade in trades_to_close:
+        tsym = trade['tsym']
+        action = trade['action']
+        quantity = trade['quantity']
+        token = trade['token']
+
+        st.info(f"Placing closing {action} order for {tsym} (Qty: {quantity})...")
+        close_response = api.place_order(
+            buy_or_sell=action,
+            product_type='I', # Assuming it's an Intraday position ('I')
+            exchange=EXCHANGE,
+            tradingsymbol=tsym,
+            quantity=int(quantity),
             discloseqty=0,
-            price_type='MKT',
-            price=0,
+            price_type='MKT', # Market order to ensure quick exit
+            price=0, # Not relevant for MKT order
             trigger_price=None,
             retention='DAY',
+            remarks=f'Automated_Exit_{st.session_state.open_tracked_trades[tsym]["status"]}'
+        )
+        if close_response and close_response.get('stat') == 'Ok':
+            st.success(f"Closing order for {tsym} successful: {close_response}")
+            st.session_state.open_tracked_trades[tsym]['status'] = 'CLOSED' # Officially mark as closed
+            delete_trade_from_supabase(tsym=tsym) # Delete from DB
+            if tsym in st.session_state.manual_overrides:
+                del st.session_state.manual_overrides[tsym] # Clean up manual overrides
+        else:
+            st.error(f"Failed to place closing order for {tsym}: {close_response.get('emsg', 'Unknown error')}")
+            logging.error(f"Failed to place closing order for {tsym}: {close_response}")
+
+
+def calculate_quantity_and_sl(entry_price, sl_price, capital):
+    """
+    Calculate quantity using the new formula: Capital * 0.01 / SL_Points
+    
+    Args:
+        entry_price (float): Entry price of the trade
+        sl_price (float): Stop loss price
+        capital (float): Available capital
+    
+    Returns:
+        tuple: (calculated_quantity, sl_points, potential_loss)
+    """
+    sl_points = abs(entry_price - sl_price)
+    
+    if sl_points == 0:
+        return 0, 0, 0
+    
+    # NEW FORMULA: Quantity = Capital * 0.01 / SL_Points
+    calculated_quantity = int((capital * 0.01) / sl_points)
+    
+    # Calculate potential loss (this will be used for trailing SL)
+    potential_loss = sl_points  # 1x potential loss = SL distance
+    
+    return calculated_quantity, sl_points, potential_loss
+
+
+def place_trade_with_new_logic(api, tsym, buy_or_sell, entry_price, sl_price, target_price, capital, token):
+    """
+    Place a trade using the new quantity calculation and store potential loss for trailing SL.
+    
+    Args:
+        api: Trading API instance
+        tsym (str): Trading symbol
+        buy_or_sell (str): 'B' for buy, 'S' for sell
+        entry_price (float): Entry price
+        sl_price (float): Stop loss price
+        target_price (float): Target price
+        capital (float): Available capital
+        token (str): Trading token
+    
+    Returns:
+        dict: Order response
+    """
+    # Calculate quantity using new formula
+    quantity, sl_points, potential_loss = calculate_quantity_and_sl(entry_price, sl_price, capital)
+    
+    if quantity <= 0:
+        st.error(f"Invalid quantity calculated: {quantity}. Check SL distance.")
+        return None
+    
+    st.info(f"Calculated Quantity: {quantity} (Capital: {capital}, SL Points: {sl_points:.2f}, Potential Loss: {potential_loss:.2f})")
+    
+    # Place the order
+    order_response = api.place_order(
+        buy_or_sell=buy_or_sell,
+        product_type='I',  # Intraday
+        exchange=EXCHANGE,
+        tradingsymbol=tsym,
+        quantity=int(quantity),
+        discloseqty=0,
+        price_type='MKT',  # Market order
+        price=0,
+        trigger_price=None,
+        retention='DAY',
+        remarks=f'Auto_Entry_{buy_or_sell}'
+    )
+    
+    if order_response and order_response.get('stat') == 'Ok':
+        # Store trade info with potential loss for trailing SL
+        trade_info = {
+            'tsym': tsym,
+            'buy_or_sell': buy_or_sell,
+            'quantity': quantity,
+            'entry_price': entry_price,
+            'sl_price': sl_price,
+            'target_price': target_price,
+            'potential_loss': potential_loss,  # NEW: Store for trailing SL calculation
+            'sl_points': sl_points,
+            'status': 'OPEN',
+            'order_id': order_response.get('norenordno'),
+            'current_ltp': entry_price
+        }
+        
+        # Initialize highest/lowest price seen for trailing
+        if buy_or_sell == 'B':
+            trade_info['highest_price_seen'] = entry_price
+        else:
+            trade_info['lowest_price_seen'] = entry_price
+        
+        # Store in session state and database
+        st.session_state.open_tracked_trades[tsym] = trade_info
+        upsert_trade_to_supabase(trade_info)
+        
+        st.success(f"Order placed successfully: {order_response}")
+        return order_response
+    else:
+        st.error(f"Order failed: {order_response.get('emsg', 'Unknown error')}")
+        return None
+
+# Fix for the pending entry cleanup issue in trade_app.py
+
+def monitor_pending_entries(api, all_symbols_map):
+    """
+    Monitors pending entries for their entry conditions (crossing signal candle high/low).
+    Uses Tradetron API for live quotes and places initial orders if conditions are met.
+    """
+    entries_to_execute = []
+    
+    pending_tsyms_for_quotes = []
+    for tsym, entry_info in st.session_state.pending_entries.items():
+        if entry_info['status'] == 'PENDING':
+            pending_tsyms_for_quotes.append(tsym)
+
+    if not pending_tsyms_for_quotes:
+        logging.debug("No pending entries to monitor.")
+        return # No pending entries to monitor
+
+    # Get Tradetron credentials
+    tradetron_cookie = st.session_state.get('tradetron_cookie')
+    tradetron_user_agent = st.session_state.get('tradetron_user_agent')
+
+    if not tradetron_cookie or not tradetron_user_agent:
+        st.warning("Tradetron credentials missing. Cannot fetch live prices for pending entries.")
+        return
+
+    for tsym in pending_tsyms_for_quotes:
+        entry_info = st.session_state.pending_entries[tsym]
+        token = all_symbols_map.get(tsym) # Get token from the map for order placement
+        
+        if not token:
+            logging.warning(f"Token not found for {tsym}. Skipping monitoring for this pending entry.")
+            entry_info['current_ltp'] = "Token Missing"
+            continue
+
+        logging.debug(f"Fetching Tradetron LTP for pending entry {tsym}")
+        try:
+            # Clean up symbol format for Tradetron
+            clean_symbol = tsym.replace('-EQ', '').strip()
+            
+            # Fetch LTP using Tradetron API
+            current_ltp = get_tradetron_ltp(clean_symbol, tradetron_cookie, tradetron_user_agent)
+            
+            # Check if we got a valid numeric LTP
+            if isinstance(current_ltp, (int, float)):
+                entry_info['current_ltp'] = current_ltp # Store LTP for display
+                
+                signal_candle_high = entry_info['signal_candle_high']
+                signal_candle_low = entry_info['signal_candle_low']
+                buy_or_sell = entry_info['buy_or_sell']
+                quantity = entry_info['calculated_quantity']
+                
+                # --- Determine effective SL and TP (manual override or calculated) for pending entry ---
+                manual_sl_override = st.session_state.manual_overrides.get(tsym, {}).get('sl_price')
+                manual_tp_override = st.session_state.manual_overrides.get(tsym, {}).get('target_price')
+
+                effective_sl_price = manual_sl_override if manual_sl_override is not None and manual_sl_override > 0 else entry_info['initial_sl_price']
+                effective_target_price = manual_tp_override if manual_tp_override is not None and manual_tp_override > 0 else entry_info['initial_tp_price']
+
+                st.markdown(f"**Pending {tsym} ({buy_or_sell}):** LTP={current_ltp:.2f}, Signal High={signal_candle_high:.2f}, Signal Low={signal_candle_low:.2f}")
+
+                if buy_or_sell == 'B': # BUY entry
+                    trigger_price = round(signal_candle_high * (1 + ENTRY_BUFFER_PERCENT), 2)
+                    if current_ltp >= trigger_price:
+                        st.success(f"BUY Entry Triggered for {tsym}! LTP {current_ltp} >= Trigger {trigger_price}")
+                        entries_to_execute.append({
+                            'tsym': tsym,
+                            'quantity': quantity,
+                            'action': 'B',
+                            'entry_price': current_ltp, # Use current LTP as actual entry price
+                            'sl_price': effective_sl_price, # Use effective SL for execution
+                            'target_price': effective_target_price, # Use effective TP for execution
+                            'token': token,
+                            'signal_candle_high': signal_candle_high,  # Preserve signal data
+                            'signal_candle_low': signal_candle_low     # Preserve signal data
+                        })
+                        entry_info['status'] = 'EXECUTING_BUY' # Mark for execution
+                elif buy_or_sell == 'S': # SELL entry
+                    trigger_price = round(signal_candle_low * (1 - ENTRY_BUFFER_PERCENT), 2)
+                    if current_ltp <= trigger_price:
+                        st.success(f"SELL Entry Triggered for {tsym}! LTP {current_ltp} <= Trigger {trigger_price}")
+                        entries_to_execute.append({
+                            'tsym': tsym,
+                            'quantity': quantity,
+                            'action': 'S',
+                            'entry_price': current_ltp, # Use current LTP as actual entry price
+                            'sl_price': effective_sl_price, # Use effective SL for execution
+                            'target_price': effective_target_price, # Use effective TP for execution
+                            'token': token,
+                            'signal_candle_high': signal_candle_high,  # Preserve signal data
+                            'signal_candle_low': signal_candle_low     # Preserve signal data
+                        })
+                        entry_info['status'] = 'EXECUTING_SELL' # Mark for execution
+            else:
+                entry_info['current_ltp'] = current_ltp  # Store the error message
+                logging.warning(f"Failed to get Tradetron LTP for {tsym}: {current_ltp}")
+
+        except Exception as e:
+            entry_info['current_ltp'] = "Error"
+            logging.error(f"Error monitoring pending entry {tsym}: {e}", exc_info=True)
+
+    # Execute pending entry orders using Flattrade API
+    for entry in entries_to_execute:
+        tsym = entry['tsym']
+        action = entry['action']
+        quantity = entry['quantity']
+        entry_price = entry['entry_price']
+        sl_price = entry['sl_price']
+        target_price = entry['target_price']
+        token = entry['token']
+        signal_candle_high = entry.get('signal_candle_high')
+        signal_candle_low = entry.get('signal_candle_low')
+
+        st.info(f"Placing initial {action} order for {tsym} (Qty: {quantity}) at LTP {entry_price:.2f}...")
+        order_response = place_intraday_order(
+            buy_or_sell=action,
+            tradingsymbol=tsym,
+            quantity=quantity,
+            entry_price=entry_price, 
+            api=api,
             token=token
         )
         
         if order_response and order_response.get('stat') == 'Ok':
-            st.success(f"Successfully placed exit order for {tradingsymbol}. Order No: {order_response['norenordno']}")
-            logging.info(f"Successfully placed exit order for {tradingsymbol}. Order No: {order_response['norenordno']}")
-            return True
-        else:
-            error_msg = order_response.get('emsg', 'Unknown error')
-            st.error(f"Failed to place exit order for {tradingsymbol}: {error_msg}")
-            logging.error(f"Failed to place exit order for {tradingsymbol}: {error_msg}")
-            return False
+            # CRITICAL FIX: Remove from pending_entries BEFORE adding to open_tracked_trades
+            # This prevents duplicate entries
+            pending_entry_data = st.session_state.pending_entries.get(tsym, {})
+            if tsym in st.session_state.pending_entries:
+                del st.session_state.pending_entries[tsym]
+                logging.info(f"Successfully removed {tsym} from pending_entries after order placement")
             
-    except Exception as e:
-        st.error(f"An exception occurred while exiting position for {tradingsymbol}: {e}")
-        logging.error(f"Exception during exit for {tradingsymbol}: {e}", exc_info=True)
-        return False
-        
-def fetch_daily_data(api, token, tsym):
-    """
-    Fetches the previous day's data using get_daily_price_series.
-    """
-    today = datetime.datetime.now()
-    yesterday = today - datetime.timedelta(days=1)
-    # The API takes dates in milliseconds
-    yesterday_ms = int(yesterday.timestamp() * 1000)
-    
-    try:
-        daily_data = api.get_daily_price_series(exchange=EXCHANGE, token=token, startdate=yesterday_ms)
-        if daily_data and daily_data.get('stat') == 'Ok' and 'values' in daily_data:
-            # The last element should be the previous day's data
-            prev_day_data = daily_data['values'][-1]
-            return prev_day_data
+            # Add to open_tracked_trades with initial TSL tracking values
+            new_tracked_trade = {
+                'order_no': order_response.get('norenordno'),
+                'entry_price': entry_price,
+                'quantity': quantity,
+                'sl_price': sl_price,
+                'target_price': target_price,
+                'buy_or_sell': action,
+                'status': 'OPEN',
+                'token': token,
+                'highest_price_seen': entry_price if action == 'B' else None,
+                'lowest_price_seen': entry_price if action == 'S' else None,
+                'current_ltp': entry_price # Initial LTP is entry price
+            }
+            st.session_state.open_tracked_trades[tsym] = new_tracked_trade
+            logging.info(f"Successfully moved pending entry {tsym} to open tracked trades with SL: {sl_price:.2f}, TP: {target_price:.2f}")
+            
+            # Update Supabase: First delete the PENDING entry, then create OPEN entry
+            try:
+                # Delete the pending entry from Supabase
+                delete_trade_from_supabase(tsym)
+                logging.info(f"Deleted PENDING entry for {tsym} from Supabase")
+                
+                # Insert new OPEN trade to Supabase
+                supabase_payload = {
+                    'tsym': tsym,
+                    'exchange': EXCHANGE,
+                    'token': token,
+                    'buy_or_sell': action,
+                    'quantity': quantity,
+                    'entry_price': entry_price,
+                    'sl_price': sl_price,
+                    'target_price': target_price,
+                    'status': 'OPEN',
+                    'order_no': order_response.get('norenordno'),
+                    'highest_price_seen': new_tracked_trade['highest_price_seen'],
+                    'lowest_price_seen': new_tracked_trade['lowest_price_seen'],
+                    'signal_candle_high': signal_candle_high,
+                    'signal_candle_low': signal_candle_low,
+                    'manual_sl_price': st.session_state.manual_overrides.get(tsym, {}).get('sl_price'),
+                    'manual_target_price': st.session_state.manual_overrides.get(tsym, {}).get('target_price')
+                }
+                
+                if upsert_trade_to_supabase(supabase_payload):
+                    logging.info(f"Successfully saved OPEN trade {tsym} to Supabase")
+                else:
+                    logging.error(f"Failed to save OPEN trade {tsym} to Supabase")
+                    
+            except Exception as db_error:
+                logging.error(f"Database operation error for {tsym}: {db_error}")
+                st.error(f"Database error for {tsym}: {db_error}")
+
+            # Clear manual overrides once trade is open (they'll be re-applied or trailed from here)
+            if tsym in st.session_state.manual_overrides:
+                del st.session_state.manual_overrides[tsym]
+                logging.info(f"Cleared manual overrides for {tsym} after trade execution")
+                
         else:
-            logging.warning(f"Could not fetch daily data for {tsym}: {daily_data}")
-            return None
-    except Exception as e:
-        logging.error(f"Error fetching daily data for {tsym}: {e}")
-        return None
-
-# Updated check_indicator_conditions function
-def check_indicator_conditions(historical_data, tsym, required_candles):
-    """
-    Validates historical candle data and checks if indicator conditions are met.
-    
-    Args:
-        historical_data (list or dict): The data returned from the API call.
-        tsym (str): The trading symbol.
-        required_candles (int): The number of candles needed for calculations.
-        
-    Returns:
-        bool: True if indicator conditions are met, False otherwise.
-    """
-    try:
-        # Step 1: Handle API error responses (which are dictionaries)
-        if isinstance(historical_data, dict) and historical_data.get('stat') == 'Not_Ok':
-            error_msg = historical_data.get('emsg', 'Unknown API error')
-            logging.warning(f"Flattrade API returned an error for {tsym}: {error_msg}")
-            return False
-
-        # Step 2: Check for insufficient candle data (now we know it's a list or None)
-        if not isinstance(historical_data, list) or len(historical_data) < required_candles:
-            logging.warning(f"Insufficient candle data for {tsym}: Expected {required_candles}, got {len(historical_data) if historical_data else 0}")
-            return False
-
-        # Step 3: Perform indicator calculations on the list
-        latest_candle = historical_data[-1]
-        latest_close = float(latest_candle.get('c'))
-        
-        previous_close = float(historical_data[-2].get('c'))
-        
-        if latest_close > previous_close:
-            logging.info(f"Price is trending up for {tsym}. Conditions met.")
-            return True
-        else:
-            logging.info(f"Price is not trending up for {tsym}. Conditions not met.")
-            return False
-
-    except Exception as e:
-        logging.error(f"Error processing candle data for {tsym}: {e}", exc_info=True)
-        return False
-
-def screen_stock(stock_info_dict, api_instance, all_symbols_map):
-    """
-    Modified screening function with new conditions:
-    1. Check if symbol already traded today
-    2. Open-close range instead of high-low range
-    3. New traded value condition
-    
-    Args:
-        stock_info_dict (dict): A dictionary containing 'tsym', 'token', 'exchange'.
-        api_instance (NorenApiPy): The initialized NorenApiPy instance.
-        all_symbols_map (dict): A map of all tradingsymbols to their tokens.
-
-    Returns:
-        tuple: (tradingsymbol, signal_type, reason, signal_high, signal_low, signal, signal_time)
-               or (tradingsymbol, 'NEUTRAL', error_message, None, None, None, None) on error
-    """
-    tradingsymbol = stock_info_dict['tsym']
-    token = stock_info_dict['token']
-    exchange = stock_info_dict['exchange'] # Assuming 'exchange' is always 'NSE' in your context
+            # Order failed - revert status back to PENDING
+            st.error(f"Failed to place entry order for {tsym}. Reverting status to PENDING.")
+            if tsym in st.session_state.pending_entries:
+                st.session_state.pending_entries[tsym]['status'] = 'PENDING' # Keep as pending if order fails
+            logging.error(f"Failed to place entry order for {tsym}. Order Response: {order_response}")
 
 
-    # Check if already traded today
-    if tradingsymbol in st.session_state.daily_traded_symbols:
-        return tradingsymbol, 'NEUTRAL', 'Already traded today', None, None, None, None
-
-    try:
-        # Fetch minute-level candle data - REMOVED 'count' ARGUMENT
-        candles_data = api_instance.get_time_price_series(
-            exchange=exchange,
-            token=token,
-            interval=CANDLE_INTERVAL,
-            # Removed: count=REQUIRED_CANDLES # This caused the AttributeError
-        )
-
-        # Handle API error responses (which are dictionaries)
-        if isinstance(candles_data, dict) and candles_data.get('stat') == 'Not_Ok':
-            error_msg = candles_data.get('emsg', 'Unknown API error')
-            logging.warning(f"Flattrade API returned an error for {tradingsymbol}: {error_msg}")
-            return tradingsymbol, 'NEUTRAL', f'API Error: {error_msg}', None, None, None, None
-        
-        # Check for insufficient candle data (now we know it's a list or None)
-        if not isinstance(candles_data, list) or len(candles_data) < REQUIRED_CANDLES:
-            logging.warning(f"Insufficient candle data for {tradingsymbol}: Expected {REQUIRED_CANDLES}, got {len(candles_data) if candles_data else 0}")
-            return tradingsymbol, 'NEUTRAL', 'Insufficient candle data', None, None, None, None
-
-        # Sort candles by time (just in case)
-        # Note: 'ssboe' for start of candle epoch, 'time' is end of candle epoch
-        candles_data.sort(key=lambda x: float(x.get('ssboe', 0))) 
-
-        # Get the latest candle and previous candles for calculations
-        latest_candle = candles_data[-1]
-        previous_candles_for_avg = candles_data[-REQUIRED_CANDLES:-1] # Get 'REQUIRED_CANDLES - 1' candles before the latest
-        
-        # Extract current candle data
-        current_open_price = float(latest_candle.get('into', 0))
-        current_high_price = float(latest_candle.get('inth', 0))
-        current_low_price = float(latest_candle.get('intl', 0))
-        current_close_price = float(latest_candle.get('intc', 0))
-        current_volume = float(latest_candle.get('intv', 0))
-        current_traded_value = current_volume * current_close_price # Calculate current_traded_value
-
-        # Check for invalid prices
-        if any(p <= 0 for p in [current_open_price, current_high_price, current_low_price, current_close_price]):
-             return tradingsymbol, 'NEUTRAL', 'Invalid current candle data', None, None, None, None
-
-        # Get signal candle timestamp for display (using IST)
-        # Assuming 'ssboe' is epoch in seconds
-        candle_timestamp_s = float(latest_candle.get('ssboe', 0)) 
-        signal_candle_time_obj_utc = datetime.datetime.fromtimestamp(candle_timestamp_s, tz=datetime.timezone.utc)
-        
-        # Convert to IST for display
-        ist_timezone = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
-        signal_candle_time_display = signal_candle_time_obj_utc.astimezone(ist_timezone).strftime('%H:%M:%S')
-
-        # --- Candle forming check (simplified) ---
-        current_time_ist = datetime.datetime.now(ist_timezone)
-        # If the latest candle's end time is in the future, it's still forming.
-        # Assuming CANDLE_INTERVAL is in minutes, ssboe + interval gives candle end time.
-        candle_end_time_ist = signal_candle_time_obj_utc + datetime.timedelta(minutes=int(CANDLE_INTERVAL))
-        candle_end_time_ist = candle_end_time_ist.astimezone(ist_timezone) # Convert to IST for comparison
-
-        if current_time_ist < candle_end_time_ist:
-            logging.debug(f"DEBUG: {tradingsymbol} - Latest candle still forming. Skipping. Current IST: {current_time_ist.strftime('%H:%M:%S')}, Candle End IST: {candle_end_time_ist.strftime('%H:%M:%S')}")
-            return tradingsymbol, 'NEUTRAL', 'Latest candle still forming', None, None, None, signal_candle_time_display
-
-        # --- 1. Average Volume Check ---
-        previous_volumes = [float(c.get('intv', 0)) for c in previous_candles_for_avg if float(c.get('intv', 0)) > 0]
-        average_volume = sum(previous_volumes) / len(previous_volumes) if previous_volumes else 0
-
-        if not (current_volume > (average_volume * st.session_state.volume_multiplier)):
-            return tradingsymbol, 'NEUTRAL', 'Volume condition not met', None, None, None, signal_candle_time_display
-
-        # --- 2. Traded Value Check ---
-        prev_day_data = fetch_daily_data(api_instance, token, tradingsymbol) # Use api_instance
-        if not prev_day_data:
-            return tradingsymbol, 'NEUTRAL', 'Could not get previous day data', None, None, None, signal_candle_time_display
-        
-        prev_day_close = float(prev_day_data.get('intc', 0))
-        prev_day_volume = float(prev_day_data.get('intv', 0))
-
-        if prev_day_close <= 0 or prev_day_volume <= 0:
-            return tradingsymbol, 'NEUTRAL', 'Invalid previous day data', None, None, None, signal_candle_time_display
-
-        previous_day_traded_value = prev_day_close * prev_day_volume
-        
-        if not (current_traded_value > (previous_day_traded_value / st.session_state.traded_value_divisor)):
-            return tradingsymbol, 'NEUTRAL', 'Traded value condition not met', None, None, None, signal_candle_time_display
-
-        # --- 3. Open-Close Range Check ---
-        current_open_close_diff = abs(current_close_price - current_open_price)
-        if current_open_close_diff <= 0:
-            return tradingsymbol, 'NEUTRAL', 'Current open-close difference invalid', None, None, None, signal_candle_time_display
-
-        previous_open_close_diffs = []
-        for c in previous_candles_for_avg:
-            open_price = float(c.get('into', 0))
-            close_price = float(c.get('intc', 0))
-            if open_price > 0 and close_price > 0:
-                diff = abs(close_price - open_price)
-                if diff > 0:
-                    previous_open_close_diffs.append(diff)
-        
-        if not previous_open_close_diffs:
-            return tradingsymbol, 'NEUTRAL', 'No valid open-close diff data in previous 20 candles', None, None, None, signal_candle_time_display
-
-        average_open_close_diff_last_20 = sum(previous_open_close_diffs) / len(previous_open_close_diffs)
-
-        if not (current_open_close_diff > (average_open_close_diff_last_20 * st.session_state.high_low_diff_multiplier)):
-            return tradingsymbol, 'NEUTRAL', 'Open-close range not met', None, None, None, signal_candle_time_display
-
-        # --- 4. Identify Signal Type (BUY or SELL) ---
-        signal_type = 'NEUTRAL'
-        signal_reason = 'No signal'
-
-        if current_close_price > current_open_price: # Green candle
-            signal_type = 'BUY'
-            signal_reason = 'Green candle signal'
-            # You can add more complex BUY conditions here if needed
-        elif current_close_price < current_open_price: # Red candle
-            signal_type = 'SELL'
-            signal_reason = 'Red candle signal'
-            # You can add more complex SELL conditions here if needed
-        else:
-            signal_reason = 'Current candle is Doji (Open == Close)'
-
-
-        if signal_type != 'NEUTRAL':
-            return tradingsymbol, signal_type, signal_reason, current_high_price, current_low_price, signal_type, signal_candle_time_display
-        else:
-            return tradingsymbol, 'NEUTRAL', signal_reason, None, None, None, signal_candle_time_display
-
-    except Exception as e:
-        logging.error(f"Error screening {tradingsymbol}: {e}", exc_info=True)
-        return tradingsymbol, 'NEUTRAL', f'Error during screening: {e}', None, None, None, None
-
-
+# Additional fix: Add this function to prevent duplicate screening of already tracked positions
 def is_symbol_already_tracked(tsym):
     """
-    Checks if a symbol is already in the pending or open trades list.
+    Check if a symbol is already being tracked by the app (either PENDING or OPEN)
+    Returns True if already tracked, False if available for new signals
     """
+    # Check if it's in pending entries with PENDING status
     if tsym in st.session_state.pending_entries:
-        return True
+        if st.session_state.pending_entries[tsym]['status'] == 'PENDING':
+            return True
+    
+    # Check if it's in open tracked trades with OPEN status
     if tsym in st.session_state.open_tracked_trades:
-        # A symbol can be 'OPEN' but its status can be 'CLOSING'
-        # We only want to screen if it's not currently being tracked for an active trade
         if st.session_state.open_tracked_trades[tsym]['status'] == 'OPEN':
             return True
+    
     return False
+
 
 # Updated screening logic - use this in your main screening loop
 def get_eligible_symbols_for_screening(all_symbols_map):
     """
-    Returns only symbols that are not already being tracked by the app or traded today
+    Returns only symbols that are not already being tracked by the app
     """
     eligible_for_screening = []
+    
     for tsym, token in all_symbols_map.items():
-        if not is_symbol_already_tracked(tsym) and tsym not in st.session_state.daily_traded_symbols:
+        if not is_symbol_already_tracked(tsym):
             eligible_for_screening.append({'tsym': tsym, 'token': token, 'exchange': EXCHANGE})
+    
     return eligible_for_screening
 
 
@@ -1228,12 +1992,15 @@ def cleanup_stale_database_entries():
     try:
         # Get all entries from database
         response = supabase.from_('app_tracked_trades').select('*').execute()
+        
         if response.data:
             for db_entry in response.data:
                 tsym = db_entry['tsym']
                 db_status = db_entry['status']
+                
                 # Check if this entry exists in current session state
                 exists_in_session = False
+                
                 if db_status == 'PENDING' and tsym in st.session_state.pending_entries:
                     exists_in_session = True
                 elif db_status == 'OPEN' and tsym in st.session_state.open_tracked_trades:
@@ -1244,87 +2011,87 @@ def cleanup_stale_database_entries():
                     logging.warning(f"Found potentially stale database entry for {tsym} with status {db_status}")
                     # You can choose to delete it or leave it for manual review
                     # delete_trade_from_supabase(tsym)
+                    
     except Exception as e:
-        logging.error(f"Error during database cleanup: {e}", exc_info=True)
+        logging.error(f"Error during database cleanup: {e}")
 
-# Main app layout
-st.set_page_config(layout="wide", page_title="Intraday Screener & Trading Bot")
 
-# Global placeholders for dynamic updates
-status_placeholder = st.empty()
-screener_placeholder = st.empty()
-tracked_trades_placeholder = st.empty()
-order_response_placeholder = st.empty()
+# Call this in your app initialization (after loading from Supabase)
+# cleanup_stale_database_entries()
+# --- Streamlit App Layout ---
+st.set_page_config(layout="wide", page_title="Flattrade Algo Screener")
 
-# Sidebar for controls and configuration
-st.sidebar.title("Configuration")
+st.title("📈 Flattrade Algo Screener & Trader")
+st.markdown("Automated stock screening and position management for Nifty500.")
 
-# General Controls
-screen_interval = st.sidebar.number_input(
-    "Screener Run Interval (seconds)", min_value=1, max_value=300, value=60
+# Sidebar for controls
+st.sidebar.header("Settings")
+screen_interval = st.sidebar.slider("Screening Interval (seconds)", min_value=5, max_value=60, value=10)
+run_screener = st.sidebar.checkbox("Run Screener Continuously", value=False)
+
+st.sidebar.subheader("Screening Conditions")
+st.session_state.volume_multiplier = st.sidebar.number_input(
+    "Volume Multiplier (Current vs Avg 20)",
+    min_value=1, value=int(st.session_state.volume_multiplier), step=1
 )
-screen_limit = st.sidebar.number_input(
-    "Symbols to Screen per Run", min_value=1, max_value=500, value=25
+st.session_state.traded_value_threshold = st.sidebar.number_input(
+    "Min Traded Value (INR)",
+    min_value=100000, value=int(st.session_state.traded_value_threshold), step=100000, format="%d"
 )
-run_screener = st.sidebar.checkbox("Start Live Screener", value=False)
-enable_trading = st.sidebar.checkbox("Enable Automated Trading", value=False)
-st.sidebar.markdown("---")
-
-
-# Strategy Parameters
-st.sidebar.subheader("Strategy Parameters")
-st.session_state.volume_multiplier = st.sidebar.slider(
-    "Volume Multiplier", min_value=1, max_value=50, value=10, help="Signal candle volume must be > avg volume of last 20 candles * this multiplier."
+st.session_state.high_low_diff_multiplier = st.sidebar.number_input(
+    "High-Low Difference Multiplier (Current vs Avg 20)",
+    min_value=1, value=int(st.session_state.high_low_diff_multiplier), step=1
 )
 
-st.session_state.traded_value_divisor = st.sidebar.slider(
-    "Traded Value Divisor", min_value=10, max_value=1000, value=100, help="Signal candle traded value must be > previous day's total traded value / this divisor."
-)
-
-st.session_state.high_low_diff_multiplier = st.sidebar.slider(
-    "Open-Close Range Multiplier", min_value=1, max_value=10, value=4, help="Signal candle open-close range must be > avg open-close range of last 20 candles * this multiplier."
-)
-
-st.session_state.target_multiplier = st.sidebar.slider(
-    "Target Multiplier", min_value=1, max_value=10, value=4, help="Target price is set at a multiple of the potential loss (SL points)."
-)
-st.session_state.sl_buffer_points = st.sidebar.number_input(
-    "SL Buffer (points)", min_value=0.01, format="%.2f", value=0.25, help="Points buffer for calculating the stop loss."
-)
-st.session_state.trailing_step_points = st.sidebar.number_input(
-    "Trailing SL Step (points)", min_value=0.01, format="%.2f", value=1.00, help="The step size in points for trailing the stop loss."
-)
-st.session_state.entry_buffer_percent = st.sidebar.number_input(
-    "Entry Buffer (%)", min_value=0.0, max_value=1.0, format="%.4f", value=0.0005, help="Percentage buffer for entry price calculation based on signal candle high/low."
-)
-
-st.sidebar.markdown("---")
-
-# Capital and Risk Management
-st.sidebar.subheader("Capital & Risk Management")
+st.sidebar.subheader("Trading Parameters")
 st.session_state.capital = st.sidebar.number_input(
-    "Trading Capital (₹)", min_value=1000, value=10000
+    "Available Capital (INR) for Qty Calc",
+    min_value=1000,
+    max_value=10000,
+    value=int(st.session_state.capital),
+    step=1000
 )
+
+st.sidebar.markdown(f"**Risk Percentage per Trade:** {RISK_PERCENTAGE_OF_CAPITAL * 100:.2f}%")
+
+st.session_state.sl_buffer_points = st.sidebar.number_input(
+    "SL Buffer Points (below signal low for BUY / above signal high for SELL)",
+    min_value=0.01, value=st.session_state.sl_buffer_points, step=0.01, format="%.2f"
+)
+
+st.session_state.trailing_step_points = st.sidebar.number_input(
+    "Trailing Stop Step Points",
+    min_value=0.01, value=st.session_state.trailing_step_points, step=0.01, format="%.2f"
+)
+
+st.session_state.target_multiplier = st.sidebar.number_input(
+    "Target Multiplier (Potential Loss * Multiplier = Target Profit)",
+    min_value=1, value=int(st.session_state.target_multiplier), step=1
+)
+
 calculated_risk_amount = st.session_state.capital * RISK_PERCENTAGE_OF_CAPITAL
 st.sidebar.markdown(f"**Risk Amount per Trade:** ₹{calculated_risk_amount:,.2f}")
+
 st.sidebar.markdown("---")
-
-
 st.sidebar.subheader("Tradetron API Settings (Experimental)")
 st.sidebar.info("Paste your active browser cookie and user-agent here. This will expire and needs manual updates for continued use.")
 st.session_state.tradetron_cookie = st.sidebar.text_area(
-    "Tradetron Cookie String", value=st.session_state.tradetron_cookie, height=150
+    "Tradetron Cookie String", 
+    value=st.session_state.tradetron_cookie, 
+    height=150
 )
 st.session_state.tradetron_user_agent = st.sidebar.text_input(
-    "Tradetron User-Agent Header", value=st.session_state.tradetron_user_agent
+    "Tradetron User-Agent Header", 
+    value=st.session_state.tradetron_user_agent
 )
 
 # Main content area setup for fixed and dynamic sections
 st.header("Account Information")
 account_info_col, refresh_btn_col = st.columns([0.7, 0.3])
+
 with account_info_col:
     st.info("Fetching account limits...")
-    cash_margin = None
+    cash_margin = None 
     try:
         limits = api.get_limits()
         if limits and isinstance(limits, dict) and limits.get('stat') == 'Ok':
@@ -1339,657 +2106,715 @@ with account_info_col:
                     if isinstance(item, dict) and 'cash' in item and item['cash'] is not None:
                         try:
                             cash_margin = float(item['cash'])
-                            break
+                            break 
                         except ValueError:
-                            continue
-            
-            if cash_margin is not None:
-                st.session_state.current_account_balance = cash_margin  # Store in session state
-                
-                # Calculate current exposure and show leverage info
-                current_exposure = calculate_current_exposure(api)
-                max_allowed_exposure = cash_margin * 4.5
-                current_utilization = (current_exposure / max_allowed_exposure) if max_allowed_exposure > 0 else 0
-                
-                st.success(f"**Available Cash:** ₹{cash_margin:,.2f}")
-                
-                # Show leverage information
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Current Exposure", f"₹{current_exposure:,.0f}")
-                with col2:
-                    st.metric("Max Allowed (4.5x)", f"₹{max_allowed_exposure:,.0f}")
-                with col3:
-                    utilization_color = "red" if current_utilization > 0.8 else "orange" if current_utilization > 0.6 else "green"
-                    st.metric("Leverage Used", f"{current_utilization:.1%}")
-                    
-                if current_utilization > 0.9:
-                    st.warning("⚠️ High leverage utilization! New orders may be rejected.")
-                elif current_utilization > 0.8:
-                    st.info("🔶 Moderate leverage utilization. Monitor closely.")
-                    
-            else:
-                st.error(f"Could not retrieve cash margin from API. Full response: {limits}")
-                logging.error(f"Could not retrieve cash margin from API. Full response: {limits}")
+                            logging.error(f"Could not convert 'prange' item 'cash' to float: {item['cash']}")
+        
+        if cash_margin is not None:
+            st.success(f"**Available Cash Margin:** ₹{cash_margin:,.2f}")
         else:
-            error_msg = limits.get('emsg', 'Unknown error') if isinstance(limits, dict) else str(limits)
-            st.error(f"Failed to fetch account limits: {error_msg}")
-            logging.error(f"Failed to fetch account limits: {error_msg}. Full response: {limits}")
+            st.warning("Could not fetch account limits: 'cash' data not found in expected locations or invalid format.")
+            logging.warning(f"Account limits response (final check failed): {limits}") 
     except Exception as e:
-        st.error(f"An exception occurred while fetching account limits: {e}")
-        logging.error(f"An exception occurred while fetching account limits: {e}", exc_info=True)
+        st.error(f"Error fetching account limits: {e}")
+        logging.error(f"Error fetching account limits: {e}", exc_info=True)
 
-
-if refresh_btn_col.button("Refresh Account Info", type="primary"):
-    st.rerun()
-
-# --- Market Watch Section (New) ---
-st.subheader("Market Watch (Live Data)")
-st.session_state.market_watch_source = st.selectbox(
-    "Select Live Data Source", 
-    ["Flattrade (NorenApiPy)", "Tradetron (Experimental)"],
-    index=0
-)
-all_symbols_map = get_nifty500_symbols()
-selected_symbols_for_mw = st.multiselect(
-    "Add Symbols to Market Watch",
-    options=list(all_symbols_map.keys()),
-    default=st.session_state.market_watch_symbols,
-    placeholder="Select symbols..."
-)
-st.session_state.market_watch_symbols = selected_symbols_for_mw
-if st.sidebar.button("🔄 Refresh LTP (Tradetron)", type="secondary"):
-    fetch_and_update_ltp()
-    st.success("LTP data refreshed from Tradetron API!")
-
-market_watch_data = []
-for mw_tsym in st.session_state.market_watch_symbols:
-    try:
-        if st.session_state.market_watch_source == "Flattrade (NorenApiPy)":
-            mw_token = all_symbols_map.get(mw_tsym)
-            if mw_token:
-                quote_resp = api.get_quotes(exchange=EXCHANGE, token=mw_token)
-                if quote_resp and quote_resp.get('stat') == 'Ok' and quote_resp.get('values'):
-                    ltp_value = float(quote_resp['values'][0]['lp'])
-                else:
-                    ltp_value = 'No Data'
-            else:
-                ltp_value = 'Token Missing'
-        elif st.session_state.market_watch_source == "Tradetron (Experimental)":
-            ltp_from_tradetron = get_tradetron_ltp(
-                mw_tsym, st.session_state.tradetron_cookie, st.session_state.tradetron_user_agent
-            )
-            ltp_value = ltp_from_tradetron
-            if isinstance(ltp_value, float):
-                ltp_value = f"{ltp_value:.2f}"
-            
-        market_watch_data.append({
-            'Symbol': mw_tsym,
-            'LTP': ltp_value
-        })
-    except Exception as e:
-        logging.error(f"Error fetching LTP for {mw_tsym}: {e}", exc_info=True)
-        ltp_value = 'Error'
-        market_watch_data.append({
-            'Symbol': mw_tsym,
-            'LTP': ltp_value
-        })
-
-if market_watch_data:
-    st.dataframe(pd.DataFrame(market_watch_data))
-else:
-    st.info("Select symbols to view live data.")
-
-# --- Live Screener Section ---
-st.subheader("Live Screener Results")
-screened_data = []
-
-# This loop runs only if the checkbox is checked
-if run_screener:
-    # First, check if we should continue screening based on current leverage
-    should_stop, stop_reason = should_stop_screening(api, st.session_state.current_account_balance)
-    
-    if should_stop:
-        status_placeholder.warning(f"🛑 Screening stopped: {stop_reason}")
-        st.error(f"Automatic screening has been paused due to leverage limits. Current exposure is too high relative to available balance.")
-    else:
-        status_placeholder.info(f"Screener is running... {stop_reason}")
-        
-        # Get only symbols not currently being tracked
-        eligible_symbols = get_eligible_symbols_for_screening(all_symbols_map)
-        
-        # Randomize symbols to avoid API rate limiting issues on same symbols
-        import random
-        random.shuffle(eligible_symbols)
-
-        for i, stock_info in enumerate(eligible_symbols):
-            if i >= screen_limit:
-                break # Stop after screening the defined limit
-                
-            tsym = stock_info['tsym']
-            logging.info(f"Screening {tsym}...")
-            
-            # CORRECTED CALL: Pass the NorenApiPy instance 'api' explicitly
-            tradingsymbol, signal_type, reason, signal_high, signal_low, signal, signal_time = screen_stock(stock_info, api, all_symbols_map)
-            
-            # Display the screening result
-            screened_data.append({
-                'Symbol': tradingsymbol,
-                'Signal': signal,
-                'Signal Reason': reason,
-                'Signal Time': signal_time if signal_time else 'N/A' # signal_time is already formatted string
-            })
-            
-            if signal_type == 'BUY' or signal_type == 'SELL':
-                if enable_trading:
-                    # Calculate required quantity and SL/TP
-                    capital_to_use = st.session_state.capital
-                    calculated_quantity, sl_price, target_price, trailing_step = calculate_quantity_sl_tp(
-                        signal_high, signal_low, signal_type, capital_to_use
-                    )
-                    
-                    if calculated_quantity > 0:
-                        # Get current LTP for balance check
-                        current_ltp_for_check = None
-                        try:
-                            quote_resp = api.get_quotes(exchange=EXCHANGE, token=stock_info['token'])
-                            if quote_resp and quote_resp.get('stat') == 'Ok' and quote_resp.get('values'):
-                                current_ltp_for_check = float(quote_resp['values'][0]['lp'])
-                        except Exception as e:
-                            logging.error(f"Error getting LTP for balance check {tsym}: {e}")
-                            
-                        if current_ltp_for_check:
-                            # BALANCE CHECK BEFORE ADDING TO PENDING
-                            can_place, balance_reason, current_exp, new_order_val, total_exp, max_allowed = check_balance_before_order(
-                                api, calculated_quantity, current_ltp_for_check, st.session_state.current_account_balance
-                            )
-                            
-                            if can_place:
-                                logging.info(f"Balance check passed for {tsym}: {balance_reason}")
-                                
-                                # Prepare pending entry for tracking
-                                st.session_state.pending_entries[tsym] = {
-                                    'buy_or_sell': signal_type,
-                                    'signal_candle_high': signal_high,
-                                    'signal_candle_low': signal_low,
-                                    'calculated_quantity': calculated_quantity,
-                                    'initial_sl_price': sl_price,
-                                    'initial_tp_price': target_price,
-                                    'status': 'PENDING',
-                                    'token': stock_info['token'],
-                                    'current_ltp': None # Will be updated by fetch_and_update_ltp
-                                }
-                                
-                                # Add to daily traded list to avoid re-screening
-                                st.session_state.daily_traded_symbols.add(tsym)
-                                
-                                # Store in Supabase
-                                supabase_payload = {
-                                    'tsym': tsym,
-                                    'exchange': EXCHANGE,
-                                    'token': stock_info['token'],
-                                    'buy_or_sell': signal_type,
-                                    'quantity': calculated_quantity,
-                                    'entry_price': None,
-                                    'sl_price': sl_price,
-                                    'target_price': target_price,
-                                    'status': 'PENDING',
-                                    'highest_price_seen': None,
-                                    'lowest_price_seen': None,
-                                    'signal_candle_high': signal_high,
-                                    'signal_candle_low': signal_low
-                                }
-                                upsert_trade_to_supabase(supabase_payload)
-                                
-                                st.success(f"✅ Signal detected for {tsym}! Balance check passed. Added to pending entries.")
-                                st.info(f"📊 Balance Check Details: Current Exp: ₹{current_exp:,.0f}, New Order: ₹{new_order_val:,.0f}, Total: ₹{total_exp:,.0f}/₹{max_allowed:,.0f}")
-                                
-                            else:
-                                # Balance check failed - log and display warning
-                                logging.warning(f"Balance check failed for {tsym}: {balance_reason}")
-                                st.warning(f"⚠️ Signal detected for {tsym} but BALANCE CHECK FAILED: {balance_reason}")
-                                st.info(f"📊 Exposure Details: Current: ₹{current_exp:,.0f}, New Order: ₹{new_order_val:,.0f}, Would be: ₹{total_exp:,.0f}, Max Allowed: ₹{max_allowed:,.0f}")
-                                
-                                # If balance check fails, we might want to stop screening entirely
-                                # to avoid generating more signals that can't be traded
-                                if total_exp > max_allowed * 0.95:  # If very close to limit
-                                    st.error("🛑 Stopping further screening due to leverage limits being reached.")
-                                    break  # Exit the screening loop
-                        else:
-                            st.warning(f"Could not get LTP for balance check on {tsym}. Skipping signal.")
-                    else:
-                        st.warning(f"Skipping signal for {tsym} due to low calculated quantity ({calculated_quantity}).")
-
-    if screened_data:
-        screener_placeholder.dataframe(pd.DataFrame(screened_data))
-    else:
-        screener_placeholder.info("No screener results to display.")
-
-    # --- Check pending entries and execute orders if conditions met ---
-    entries_to_execute = []
-    trades_to_close = []
-    
-    # First, get the latest prices for all tracked trades using Tradetron
-    fetch_and_update_ltp()
-
-    # Process Pending Entries
-    for tsym, entry_info in list(st.session_state.pending_entries.items()):
-        current_ltp = entry_info.get('current_ltp')
-        if not current_ltp or not isinstance(current_ltp, (float, int)):
-            logging.warning(f"Skipping pending entry check for {tsym}: LTP not available or invalid.")
-            continue
-            
-        signal_candle_high = entry_info['signal_candle_high']
-        signal_candle_low = entry_info['signal_candle_low']
-        buy_or_sell = entry_info['buy_or_sell']
-        quantity = entry_info['calculated_quantity']
-
-        # Determine effective SL and TP (manual override or calculated) for pending entry
-        manual_sl_override = st.session_state.manual_overrides.get(tsym, {}).get('sl_price')
-        manual_tp_override = st.session_state.manual_overrides.get(tsym, {}).get('target_price')
-        effective_sl_price = manual_sl_override if manual_sl_override is not None and manual_sl_override > 0 else entry_info['initial_sl_price']
-        effective_target_price = manual_tp_override if manual_tp_override is not None and manual_tp_override > 0 else entry_info['initial_tp_price']
-        
-        st.markdown(f"**Pending {tsym} ({buy_or_sell}):** LTP={current_ltp:.2f}, Signal High={signal_candle_high:.2f}, Signal Low={signal_candle_low:.2f}")
-
-        if buy_or_sell == 'B': # BUY entry
-            trigger_price = round(signal_candle_high * (1 + st.session_state.entry_buffer_percent), 2)
-            if current_ltp >= trigger_price:
-                st.success(f"BUY Entry Triggered for {tsym}! LTP {current_ltp} >= Trigger {trigger_price}")
-                entries_to_execute.append({
-                    'tsym': tsym,
-                    'quantity': quantity,
-                    'action': 'B',
-                    'entry_price': current_ltp,
-                    'token': entry_info['token'],
-                    'sl_price': effective_sl_price,
-                    'target_price': effective_target_price,
-                    'signal_high': signal_candle_high,
-                    'signal_low': signal_candle_low
-                })
-        elif buy_or_sell == 'S': # SELL entry
-            trigger_price = round(signal_candle_low * (1 - st.session_state.entry_buffer_percent), 2)
-            if current_ltp <= trigger_price:
-                st.success(f"SELL Entry Triggered for {tsym}! LTP {current_ltp} <= Trigger {trigger_price}")
-                entries_to_execute.append({
-                    'tsym': tsym,
-                    'quantity': quantity,
-                    'action': 'S',
-                    'entry_price': current_ltp,
-                    'token': entry_info['token'],
-                    'sl_price': effective_sl_price,
-                    'target_price': effective_target_price,
-                    'signal_high': signal_candle_high,
-                    'signal_low': signal_candle_low
-                })
-
-    # Execute and manage entries
-    for entry in entries_to_execute:
-        tsym = entry['tsym']
-        if tsym in st.session_state.pending_entries:
-            # FINAL BALANCE CHECK BEFORE ACTUAL ORDER PLACEMENT
-            final_check_passed, final_reason, curr_exp, order_val, tot_exp, max_exp = check_balance_before_order(
-                api, entry['quantity'], entry['entry_price'], st.session_state.current_account_balance
-            )
-            
-            if not final_check_passed:
-                st.error(f"🚫 Final balance check failed for {tsym}: {final_reason}")
-                st.info(f"Order cancelled due to insufficient balance/leverage limits.")
-                # Keep the entry in pending state rather than executing
-                continue
-                
-            st.session_state.pending_entries[tsym]['status'] = 'EXECUTING'
-            
-            st.info(f"✅ Final balance check passed for {tsym}. Placing order...")
-            st.info(f"📊 Final Check: Current: ₹{curr_exp:,.0f}, Order: ₹{order_val:,.0f}, Total: ₹{tot_exp:,.0f}/₹{max_exp:,.0f}")
-            
-            order_response = place_intraday_order(
-                buy_or_sell=entry['action'],
-                tradingsymbol=tsym,
-                quantity=entry['quantity'],
-                entry_price=entry['entry_price'],
-                api=api,
-                token=entry['token']
-            )
-            
-            if order_response and order_response.get('stat') == 'Ok':
-                # Remove from pending, add to open tracked trades
-                del st.session_state.pending_entries[tsym]
-                
-                # Check for manual overrides
-                manual_sl_price = st.session_state.manual_overrides.get(tsym, {}).get('sl_price')
-                manual_target_price = st.session_state.manual_overrides.get(tsym, {}).get('target_price')
-                
-                trade_info = {
-                    'tsym': tsym,
-                    'exchange': EXCHANGE,
-                    'token': entry['token'],
-                    'buy_or_sell': entry['action'],
-                    'entry_price': entry['entry_price'],
-                    'quantity': entry['quantity'],
-                    'sl_price': manual_sl_price if manual_sl_price is not None and manual_sl_price > 0 else entry['sl_price'],
-                    'target_price': manual_target_price if manual_target_price is not None and manual_target_price > 0 else entry['target_price'],
-                    'signal_candle_high': entry['signal_high'],
-                    'signal_candle_low': entry['signal_low'],
-                    'highest_price_seen': entry['entry_price'],
-                    'lowest_price_seen': entry['entry_price'],
-                    'status': 'OPEN',
-                    'order_no': order_response.get('norenordno'),
-                    'current_ltp': entry['entry_price']
-                }
-                st.session_state.open_tracked_trades[tsym] = trade_info
-                
-                # Update Supabase with the new OPEN trade
-                upsert_trade_to_supabase(trade_info)
-                
-                # Update account balance in session state (approximate)
-                if st.session_state.current_account_balance:
-                    # This is an approximation - the actual balance might be different
-                    # due to margins, but gives a rough idea for immediate checks
-                    order_value = entry['quantity'] * entry['entry_price']
-                    # For intraday, we typically need only margin, but this is conservative
-                    st.session_state.current_account_balance -= (order_value / 4.5)  # Assuming 4.5x leverage
-                    
-            else:
-                st.error(f"Failed to place entry order for {tsym}. Reverting status to PENDING.")
-                if tsym in st.session_state.pending_entries:
-                    st.session_state.pending_entries[tsym]['status'] = 'PENDING'
-                logging.error(f"Failed to place entry order for {tsym}. Order Response: {order_response}")
-
-
-    # Process Open Trades for SL/TP hits
-    for tsym, trade_info in list(st.session_state.open_tracked_trades.items()):
-        current_ltp = trade_info.get('current_ltp')
-        if trade_info['status'] != 'OPEN' or not current_ltp or not isinstance(current_ltp, (float, int)):
-            continue
-
-        # Check for manual overrides first
-        manual_sl_override = st.session_state.manual_overrides.get(tsym, {}).get('sl_price')
-        manual_tp_override = st.session_state.manual_overrides.get(tsym, {}).get('target_price')
-
-        effective_sl_price = manual_sl_override if manual_sl_override is not None else trade_info['sl_price']
-        effective_target_price = manual_tp_override if manual_tp_override is not None else trade_info['target_price']
-        
-        buy_or_sell = trade_info['buy_or_sell']
-        quantity = trade_info['quantity']
-        token = trade_info['token']
-        entry_price = trade_info['entry_price']
-
-        # --- Trailing SL Logic ---
-        # NOTE: Trailing SL is based on a fixed trailing step, not dynamic based on PVI.
-        # This simplifies the logic. Trailing step is defined in sidebar.
-        trailing_step = st.session_state.trailing_step_points
-        new_sl = effective_sl_price
-
-        if buy_or_sell == 'B': # BUY position
-            if current_ltp > trade_info['highest_price_seen']:
-                trade_info['highest_price_seen'] = current_ltp
-                
-            # If LTP has moved up by a step since last SL adjustment, raise the SL
-            if current_ltp - effective_sl_price > trailing_step:
-                new_sl = current_ltp - trailing_step
-                # Make sure the new SL is higher than the current SL
-                if new_sl > effective_sl_price:
-                    trade_info['sl_price'] = new_sl
-                    logging.info(f"Trailing SL for {tsym} (BUY) updated from {effective_sl_price:.2f} to {new_sl:.2f}")
-                    # Update Supabase
-                    upsert_trade_to_supabase(trade_info)
-        
-        elif buy_or_sell == 'S': # SELL position
-            if current_ltp < trade_info['lowest_price_seen']:
-                trade_info['lowest_price_seen'] = current_ltp
-                
-            # If LTP has moved down by a step since last SL adjustment, lower the SL
-            if effective_sl_price - current_ltp > trailing_step:
-                new_sl = current_ltp + trailing_step
-                # Make sure the new SL is lower than the current SL
-                if new_sl < effective_sl_price:
-                    trade_info['sl_price'] = new_sl
-                    logging.info(f"Trailing SL for {tsym} (SELL) updated from {effective_sl_price:.2f} to {new_sl:.2f}")
-                    # Update Supabase
-                    upsert_trade_to_supabase(trade_info)
-        
-        # Re-get effective SL price after potential trailing update
-        effective_sl_price = trade_info['sl_price']
-
-        # Now, check for stop loss or target hit with effective prices
-        if buy_or_sell == 'B': # Long position
-            if effective_sl_price is not None and current_ltp <= effective_sl_price:
-                st.warning(f"Stoploss HIT for BUY {tsym}! LTP {current_ltp} <= SL {effective_sl_price}")
-                trades_to_close.append({'tsym': tsym, 'quantity': quantity, 'action': 'SELL', 'token': token, 'status_reason': 'CLOSING_SL'})
-                trade_info['status'] = 'CLOSING_SL'
-            elif effective_target_price is not None and current_ltp >= effective_target_price:
-                st.success(f"Target HIT for BUY {tsym}! LTP {current_ltp} >= Target {effective_target_price}")
-                trades_to_close.append({'tsym': tsym, 'quantity': quantity, 'action': 'SELL', 'token': token, 'status_reason': 'CLOSING_TP'})
-                trade_info['status'] = 'CLOSING_TP'
-        elif buy_or_sell == 'S': # Short position
-            if effective_sl_price is not None and current_ltp >= effective_sl_price:
-                st.warning(f"Stoploss HIT for SELL {tsym}! LTP {current_ltp} >= SL {effective_sl_price}")
-                trades_to_close.append({'tsym': tsym, 'quantity': quantity, 'action': 'BUY', 'token': token, 'status_reason': 'CLOSING_SL'})
-                trade_info['status'] = 'CLOSING_SL'
-            elif effective_target_price is not None and current_ltp <= effective_target_price:
-                st.success(f"Target HIT for SELL {tsym}! LTP {current_ltp} >= Target {effective_target_price}")
-                trades_to_close.append({'tsym': tsym, 'quantity': quantity, 'action': 'BUY', 'token': token, 'status_reason': 'CLOSING_TP'})
-                trade_info['status'] = 'CLOSING_TP'
-        
-        # Update Supabase with the new status
-        if trade_info['status'].startswith('CLOSING'):
-            upsert_trade_to_supabase({'tsym': tsym, 'status': trade_info['status']})
-
-    # Execute market close orders
-    for trade in trades_to_close:
-        tsym = trade['tsym']
-        if enable_trading:
-            st.info(f"Placing market exit order for {tsym} due to {trade['status_reason']}...")
-            order_response = place_intraday_order(
-                buy_or_sell=trade['action'],
-                tradingsymbol=tsym,
-                quantity=trade['quantity'],
-                entry_price=None, # Not needed for MKT order
-                api=api,
-                token=trade['token']
-            )
-
-            if order_response and order_response.get('stat') == 'Ok':
-                # Remove from session state and database after successful exit
-                if tsym in st.session_state.open_tracked_trades:
-                    del st.session_state.open_tracked_trades[tsym]
-                delete_trade_from_supabase(tsym)
-            else:
-                # If exit order fails, log it and keep the trade in a 'CLOSING' state for re-attempt
-                st.error(f"Failed to place exit order for {tsym}. Please close manually.")
-                logging.error(f"Failed to place exit order for {tsym}. Keeping in 'CLOSING' state.")
-                
-    # EOD (End of Day) Exit Logic
-    now_ist = datetime.datetime.now() # Assume server runs in IST
-    market_close_time = now_ist.replace(hour=15, minute=15, second=0, microsecond=0) # 3:15 PM IST
-    if now_ist >= market_close_time and enable_trading:
-        # Get positions from the broker API, as they might not be tracked in our app
-        try:
-            broker_positions = api.get_positions()
-            if broker_positions and isinstance(broker_positions, list):
-                for position in broker_positions:
-                    net_qty = int(position.get('netqty', 0))
-                    if net_qty != 0:
-                        tsym = position.get('tsym')
-                        product_type = position.get('prdtype')
-                        if tsym and product_type:
-                            st.info(f"Auto-exiting open position for {tsym} ({net_qty}) due to EOD rule...")
-                            current_token = all_symbols_map.get(tsym)
-                            if current_token:
-                                exit_position(
-                                    exchange=position.get('exch'),
-                                    tradingsymbol=tsym,
-                                    product_type=product_type,
-                                    netqty=net_qty,
-                                    api=api,
-                                    token=current_token
-                                )
-        except Exception as e:
-            st.error(f"Error fetching broker positions for EOD exit: {e}")
-            logging.error(f"Error fetching broker positions for EOD exit: {e}", exc_info=True)
-
-    # Balance and Exposure Summary
-    st.subheader("💰 Balance & Exposure Summary")
-    if st.session_state.current_account_balance:
-        current_exposure = calculate_current_exposure(api)
-        max_allowed = st.session_state.current_account_balance * 4.5
-        utilization = (current_exposure / max_allowed) if max_allowed > 0 else 0
-        remaining_capacity = max_allowed - current_exposure
-        
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Available Cash", f"₹{st.session_state.current_account_balance:,.0f}")
-        with col2:
-            st.metric("Current Exposure", f"₹{current_exposure:,.0f}")
-        with col3:
-            st.metric("Remaining Capacity", f"₹{remaining_capacity:,.0f}")
-        with col4:
-            st.metric("Leverage Utilization", f"{utilization:.1%}")
-            
-        # Progress bar for leverage utilization
-        progress_color = "red" if utilization > 0.8 else "orange" if utilization > 0.6 else "normal"
-        st.progress(min(utilization, 1.0))
-        
-        if utilization > 0.9:
-            st.error("🚨 High leverage alert! Consider reducing exposure or stopping new trades.")
-        elif utilization > 0.8:
-            st.warning("⚠️ Moderate leverage usage. Monitor positions closely.")
-    else:
-        st.warning("Balance information not available. Please refresh account info.")
-
-    # Add manual refresh button for balance
-    if st.button("🔄 Refresh Balance & Exposure", type="secondary"):
-        # Force refresh of account balance
-        try:
-            limits = api.get_limits()
-            if limits and isinstance(limits, dict) and limits.get('stat') == 'Ok':
-                cash_margin = None
-                if 'cash' in limits and limits['cash'] is not None:
-                    try:
-                        cash_margin = float(limits['cash'])
-                    except ValueError:
-                        pass
-
-                if cash_margin is None and 'prange' in limits and isinstance(limits['prange'], list):
-                    for item in limits['prange']:
-                        if isinstance(item, dict) and 'cash' in item and item['cash'] is not None:
-                            try:
-                                cash_margin = float(item['cash'])
-                                break
-                            except ValueError:
-                                continue
-                
-                if cash_margin is not None:
-                    st.session_state.current_account_balance = cash_margin
-                    st.success("Balance refreshed successfully!")
-                else:
-                    st.error("Could not refresh balance.")
-            else:
-                st.error("Failed to refresh account limits.")
-        except Exception as e:
-            st.error(f"Error refreshing balance: {e}")
+with refresh_btn_col:
+    if st.button("Refresh Data", key="refresh_all_data"):
         st.rerun()
 
-# --- Monitor and Display Tracked Trades (new section) ---
-with tracked_trades_placeholder.container():
-    st.subheader("App-Tracked Trades (Pending & Open) 🚀")
-    tracked_data = []
-    
-    # Adjusted columns for LTP and new manual SL/TP columns
-    cols_header = st.columns([0.15, 0.04, 0.04, 0.08, 0.09, 0.09, 0.09, 0.09, 0.09, 0.09, 0.05, 0.05, 0.08])
-    cols_header[0].write("**Symbol**")
-    cols_header[1].write("**Dir**")
-    cols_header[2].write("**Qty**")
-    cols_header[3].write("**Status**")
-    cols_header[4].write("**LTP**")
-    cols_header[5].write("**Entry**")
-    cols_header[6].write("**SL**")
-    cols_header[7].write("**Target**")
-    cols_header[8].write("**Sig. High**")
-    cols_header[9].write("**Sig. Low**")
-    cols_header[10].write("**M. SL**")
-    cols_header[11].write("**M. TP**")
-    cols_header[12].write("**Actions**")
-    
-    all_tracked_tsyms_ordered = sorted(
-        list(st.session_state.pending_entries.keys()) + list(st.session_state.open_tracked_trades.keys())
-    )
-    
-    for tsym in all_tracked_tsyms_ordered:
-        cols = st.columns([0.15, 0.04, 0.04, 0.08, 0.09, 0.09, 0.09, 0.09, 0.09, 0.09, 0.05, 0.05, 0.08])
+st.markdown("---") # Separator
 
-        if tsym in st.session_state.pending_entries:
-            entry_info = st.session_state.pending_entries[tsym]
-            cols[0].write(tsym)
-            cols[1].write(entry_info['buy_or_sell'])
-            cols[2].write(entry_info['calculated_quantity'])
-            cols[3].write("PENDING")
-            cols[4].write(f"{entry_info['current_ltp']:.2f}" if isinstance(entry_info['current_ltp'], float) else 'N/A')
-            cols[5].write('N/A')
-            cols[6].write(f"{entry_info['initial_sl_price']:.2f}")
-            cols[7].write(f"{entry_info['initial_tp_price']:.2f}")
-            cols[8].write(f"{entry_info['signal_candle_high']:.2f}")
-            cols[9].write(f"{entry_info['signal_candle_low']:.2f}")
-            # Manual SL/TP columns for display
-            manual_sl_val = st.session_state.manual_overrides.get(tsym, {}).get('sl_price')
-            manual_tp_val = st.session_state.manual_overrides.get(tsym, {}).get('target_price')
-            cols[10].write(f"{manual_sl_val:.2f}" if manual_sl_val else 'N/A')
-            cols[11].write(f"{manual_tp_val:.2f}" if manual_tp_val else 'N/A')
+st.header("Broker Open Positions 💼 (For manual management or verification)")
+with st.container():
+    st.info("Fetching broker open positions...")
+    try:
+        positions = api.get_positions()
+        if isinstance(positions, list) and len(positions) > 0:
+            positions_data = []
+            for pos in positions:
+                if pos.get('netqty', 0) != 0: 
+                    positions_data.append({
+                        'Symbol': pos.get('tsym'),
+                        'Exchange': pos.get('exch'),
+                        'Product Type': pos.get('prd'),
+                        'Net Qty': int(pos.get('netqty', 0)),
+                        'Buy Avg': float(pos.get('daybuyavgprc', 0)),
+                        'Sell Avg': float(pos.get('daysellavgprc', 0)),
+                        'LTP': float(pos.get('lp', 0)),
+                        'PNL': float(pos.get('rpnl', 0)) + float(pos.get('urmtm', 0))
+                    })
             
-            with cols[12]:
-                if st.button("Cancel", key=f"cancel_pending_{tsym}"):
-                    del st.session_state.pending_entries[tsym]
-                    delete_trade_from_supabase(tsym)
+            df_positions = pd.DataFrame(positions_data)
+            if not df_positions.empty:
+                st.dataframe(df_positions)
+                st.markdown("---")
+                st.markdown("### Manage / Adopt Broker Positions")
+
+                for _, row in df_positions.iterrows():
+                    tsym = row['Symbol']
+                    net_qty = row['Net Qty']
+                    product_type = row['Product Type']
+
+                    # Check if this position is already tracked by the app
+                    is_tracked = tsym in st.session_state.open_tracked_trades or tsym in st.session_state.pending_entries
+
+                    if is_tracked:
+                        st.info(f"**{tsym}** (Qty: {net_qty}, Product: {product_type}) - *Already managed by the app.*")
+                    else:
+                        st.warning(f"**{tsym}** (Qty: {net_qty}, Product: {product_type}) - Not currently managed by the app.")
+                        
+                        expand_adopt = st.expander(f"Adopt {tsym} into App Management", expanded=False)
+                        with expand_adopt:
+                            st.markdown(
+                                """
+                                **Warning:** By adopting this position, the app will start actively monitoring and managing its Stop Loss and Target Profit.
+                                It might place exit orders on your behalf when conditions are met. Ensure you understand this before proceeding.
+                                """
+                            )
+                            with st.form(key=f"adopt_form_{tsym}"):
+                                # Infer buy_or_sell from net_qty
+                                adopted_buy_or_sell = 'B' if net_qty > 0 else 'S'
+                                st.write(f"Inferred Action: **{adopted_buy_or_sell}**")
+                                
+                                adopted_entry_price = st.number_input(
+                                    f"Original Entry Price for {tsym}", 
+                                    min_value=0.01, format="%.2f", key=f"adopt_entry_price_{tsym}"
+                                )
+                                adopted_signal_high = st.number_input(
+                                    f"Signal Candle High for {tsym} (Optional, for auto SL/TP)",
+                                    min_value=0.0, format="%.2f", key=f"adopt_signal_high_{tsym}"
+                                )
+                                adopted_signal_low = st.number_input(
+                                    f"Signal Candle Low for {tsym} (Optional, for auto SL/TP)",
+                                    min_value=0.0, format="%.2f", key=f"adopt_signal_low_{tsym}"
+                                )
+                                
+                                adopt_submitted = st.form_submit_button(f"Confirm Adopt {tsym}")
+
+                                if adopt_submitted:
+                                    if adopted_entry_price <= 0:
+                                        st.error("Please provide a valid original entry price to adopt this position.")
+                                    else:
+                                        current_token = None
+                                        # Use the all_symbols_map to get the token
+                                        current_token = get_nifty500_symbols().get(tsym) 
+
+                                        if not current_token:
+                                            st.error(f"Cannot adopt {tsym}: Token not found in loaded symbols. Please ensure it's in NSE_Equity.csv.")
+                                        else:
+                                            # Calculate initial SL/TP and quantity based on strategy, or use manual if provided
+                                            calculated_sl = None
+                                            calculated_tp = None
+                                            calculated_qty = abs(net_qty) # Use broker's quantity
+
+                                            if adopted_signal_high > 0 and adopted_signal_low > 0:
+                                                # Use strategy to calculate SL/TP if signal candle info provided
+                                                if adopted_buy_or_sell == 'B':
+                                                    initial_sl_price = round(adopted_signal_low - st.session_state.sl_buffer_points, 2)
+                                                    potential_loss_per_share = adopted_entry_price - initial_sl_price
+                                                    if potential_loss_per_share <= 0.01: potential_loss_per_share = 0.01 # Prevent zero/negative loss
+                                                    initial_tp_price = round(adopted_entry_price + (potential_loss_per_share * st.session_state.target_multiplier), 2)
+                                                else: # SELL
+                                                    initial_sl_price = round(adopted_signal_high + st.session_state.sl_buffer_points, 2)
+                                                    potential_loss_per_share = initial_sl_price - adopted_entry_price
+                                                    if potential_loss_per_share <= 0.01: potential_loss_per_share = 0.01
+                                                    initial_tp_price = round(adopted_entry_price - (potential_loss_per_share * st.session_state.target_multiplier), 2)
+                                                calculated_sl = initial_sl_price
+                                                calculated_tp = initial_tp_price
+                                            else:
+                                                st.info("Signal Candle High/Low not provided. Please set Manual SL/Target in 'App-Tracked Trades' after adoption.")
+
+                                            # Add to open_tracked_trades and Supabase
+                                            new_tracked_trade = {
+                                                'order_no': None, # No order_no for adopted positions
+                                                'entry_price': adopted_entry_price,
+                                                'quantity': calculated_qty,
+                                                'sl_price': calculated_sl,
+                                                'target_price': calculated_tp,
+                                                'buy_or_sell': adopted_buy_or_sell,
+                                                'status': 'OPEN',
+                                                'token': current_token,
+                                                'highest_price_seen': adopted_entry_price if adopted_buy_or_sell == 'B' else None,
+                                                'lowest_price_seen': adopted_entry_price if adopted_buy_or_sell == 'S' else None,
+                                                'signal_candle_high': adopted_signal_high if adopted_signal_high > 0 else None,
+                                                'signal_candle_low': adopted_signal_low if adopted_signal_low > 0 else None,
+                                                'current_ltp': None # Initialize current_ltp for adopted trades
+                                            }
+                                            st.session_state.open_tracked_trades[tsym] = new_tracked_trade
+                                            
+                                            supabase_payload = {
+                                                'tsym': tsym,
+                                                'exchange': EXCHANGE,
+                                                'token': current_token,
+                                                'buy_or_sell': adopted_buy_or_sell,
+                                                'quantity': calculated_qty,
+                                                'entry_price': adopted_entry_price,
+                                                'sl_price': calculated_sl,
+                                                'target_price': calculated_tp,
+                                                'status': 'OPEN',
+                                                'highest_price_seen': new_tracked_trade['highest_price_seen'],
+                                                'lowest_price_seen': new_tracked_trade['lowest_price_seen'],
+                                                'signal_candle_high': new_tracked_trade['signal_candle_high'],
+                                                'signal_candle_low': new_tracked_trade['signal_candle_low']
+                                            }
+                                            if upsert_trade_to_supabase(supabase_payload):
+                                                st.success(f"Position {tsym} successfully adopted and added to app tracking!")
+                                                st.rerun() # Refresh to update tracked trades display
+                                            else:
+                                                st.error(f"Failed to save adopted position {tsym} to database.")
+                                    
+                    col1_pos, col2_pos = st.columns([0.7, 0.3])
+                    # Always show manual exit for broker positions, even if adopted, for quick manual closure
+                    col1_pos.write(f"**{row['Symbol']}** (Qty: {row['Net Qty']}, Product: {row['Product Type']})")
+                    if col2_pos.button(f"Exit {row['Symbol']}", key=f"exit_broker_{row['Symbol']}_{row['Product Type']}_{row['Net Qty']}"):
+                        current_token = get_nifty500_symbols().get(row['Symbol'])
+
+                        if current_token:
+                            exit_response = exit_position(
+                                exchange=row['Exchange'],
+                                tradingsymbol=row['Symbol'],
+                                product_type=row['Product Type'],
+                                netqty=row['Net Qty'],
+                                api=api,
+                                token=current_token
+                            )
+                            if exit_response and exit_response.get('stat') == 'Ok':
+                                st.success(f"Exit order sent for {row['Symbol']}. Refreshing positions...")
+                                time.sleep(1)
+                                st.rerun()
+                            else:
+                                st.error(f"Failed to send exit order for {row['Symbol']}.")
+                        else:
+                            st.error(f"Cannot exit {row['Symbol']}: Token not found in loaded symbols.")
+            else:
+                st.info("No open positions found in broker account.")
+        else:
+            st.info("No open positions found in broker account or failed to retrieve positions.")
+    except Exception as e:
+        st.error(f"Error fetching positions from broker: {e}")
+        logging.error(f"Error fetching positions from broker: {e}", exc_info=True)
+
+st.markdown("---") # Separator
+
+# --- Market Watch Section ---
+st.header("Market Watch 📊")
+
+all_symbols_map = get_nifty500_symbols() # Get the map of tsym to token
+nifty500_symbols_names = sorted(list(all_symbols_map.keys()))
+
+selected_market_watch_symbols = st.multiselect(
+    "Select symbols for Market Watch",
+    options=nifty500_symbols_names,
+    default=st.session_state.market_watch_symbols
+)
+
+# Debug: Confirm selected symbols
+st.info(f"**Market Watch Symbols Selected:** {selected_market_watch_symbols}")
+
+if st.session_state.market_watch_symbols != selected_market_watch_symbols:
+    st.session_state.market_watch_symbols = selected_market_watch_symbols
+    st.rerun() # Rerun to update the market watch immediately
+
+# NEW: Choose data source for Market Watch
+market_watch_source_selection = st.radio(
+    "Choose Market Watch Data Source:",
+    ("Flattrade (NorenApiPy)", "Tradetron (Experimental)"),
+    index=0 if st.session_state.market_watch_source == "Flattrade (NorenApiPy)" else 1,
+    key="market_watch_source_radio"
+)
+if st.session_state.market_watch_source != market_watch_source_selection:
+    st.session_state.market_watch_source = market_watch_source_selection
+    st.rerun()
+
+
+market_watch_placeholder = st.empty()
+
+st.markdown("---") # Separator
+
+
+st.header("Signals & App-Tracked Trades")
+
+signal_placeholder = st.empty()
+tracked_trades_placeholder = st.empty()
+status_placeholder = st.empty() # For continuous screening status messages
+
+# No need to call get_nifty500_symbols() here again, use all_symbols_map
+
+if not all_symbols_map:
+    st.warning("No equity symbols loaded from CSV. Please ensure 'NSE_Equity.csv' is correct and accessible.")
+    st.stop()
+
+# Main continuous screening loop
+while run_screener:
+    with status_placeholder.container():
+        st.info(f"Running screening cycle at {datetime.datetime.now().strftime('%H:%M:%S')}...")
+    
+    # End-of-day exit condition (3:10 PM IST)
+    now = datetime.datetime.now()
+    market_close_time = now.replace(hour=15, minute=10, second=0, microsecond=0) # 3:10 PM IST
+
+    # Reset the flag at the beginning of a new trading day (e.g., after midnight or before market open)
+    # This also handles cases where the app runs across midnight
+    if st.session_state.last_run_date != now.date():
+        st.session_state.exit_all_triggered_today = False
+        st.session_state.last_run_date = now.date()
+
+    if now >= market_close_time and not st.session_state.exit_all_triggered_today:
+        st.warning("Market close time (3:10 PM) reached. Initiating exit for all open positions.")
+        positions_to_exit = list(st.session_state.open_tracked_trades.items()) # Make a copy to iterate
+        for tsym, trade_info in positions_to_exit:
+            if trade_info['status'] == 'OPEN':
+                st.info(f"Auto-exiting {tsym} due to EOD rule...")
+                
+                current_lp = 0
+                token_for_eod = all_symbols_map.get(tsym)
+                if token_for_eod:
+                    try:
+                        quote_resp = api.get_quotes(exchange=EXCHANGE, token=token_for_eod) # Individual quote fetch
+                        if quote_resp and quote_resp.get('stat') == 'Ok' and quote_resp.get('values'):
+                            current_lp = float(quote_resp['values'][0]['lp'])
+                        else:
+                            logging.warning(f"Could not fetch live quote for {tsym} during EOD exit: {quote_resp.get('emsg', 'No error message')}. Using 0.")
+                    except Exception as e:
+                        logging.error(f"Error fetching quote for {tsym} during EOD exit: {e}")
+                        current_lp = 0 # Default to 0 if quote fails
+                else:
+                    logging.warning(f"Token not found for {tsym} during EOD exit. Using 0.")
+
+                exit_response = place_intraday_order(
+                    buy_or_sell=('S' if trade_info['buy_or_sell'] == 'B' else 'B'), # Opposite action
+                    tradingsymbol=tsym,
+                    quantity=trade_info['quantity'],
+                    entry_price=current_lp, # Use current_lp as reference, MKT will take actual
+                    api=api,
+                    token=trade_info['token']
+                )
+
+                if exit_response and exit_response.get('stat') == 'Ok':
+                    st.success(f"EOD Exit order placed for {tsym}. Marking as CLOSED.")
+                    st.session_state.open_tracked_trades[tsym]['status'] = 'CLOSED'
+                    delete_trade_from_supabase(tsym=tsym)
+                    if tsym in st.session_state.manual_overrides:
+                        del st.session_state.manual_overrides[tsym]
+                else:
+                    st.error(f"Failed to place EOD exit order for {tsym}: {exit_response.get('emsg', 'Unknown error')}. Please close manually.")
+        st.session_state.exit_all_triggered_today = True
+        st.rerun() # Rerun to update the UI with closed positions
+    
+    # --- Update Market Watch ---
+    with market_watch_placeholder.container():
+        st.subheader("Live Market Watch")
+        if st.session_state.market_watch_symbols:
+            market_watch_data = []
+            
+            for mw_tsym in st.session_state.market_watch_symbols:
+                ltp_value = "N/A" # Default
+                
+                if st.session_state.market_watch_source == "Flattrade (NorenApiPy)":
+                    token = all_symbols_map.get(mw_tsym)
+                    if not token:
+                        logging.warning(f"Token not found for Market Watch symbol {mw_tsym}. Skipping.")
+                        ltp_value = 'Token Missing'
+                    else:
+                        logging.debug(f"Fetching Flattrade MW quote for {mw_tsym} with token: {token}")
+                        try:
+                            mw_quotes = api.get_quotes(exchange=EXCHANGE, token=token)
+                            if mw_quotes and mw_quotes.get('stat') == 'Ok' and mw_quotes.get('values'):
+                                ltp_value = float(mw_quotes['values'][0]['lp'])
+                            else:
+                                logging.warning(f"Could not fetch live quote for Flattrade MW symbol {mw_tsym}: {mw_quotes.get('emsg', 'No error message')}")
+                                ltp_value = 'API Error'
+                        except Exception as e:
+                            logging.error(f"Error fetching Flattrade MW quotes for {mw_tsym}: {e}", exc_info=True)
+                            ltp_value = 'Error'
+                
+                elif st.session_state.market_watch_source == "Tradetron (Experimental)":
+                    ltp_from_tradetron = get_tradetron_ltp(
+                        mw_tsym, 
+                        st.session_state.tradetron_cookie, 
+                        st.session_state.tradetron_user_agent
+                    )
+                    # Now ltp_from_tradetron will be a string (JSON or error)
+                    ltp_value = ltp_from_tradetron 
+
+                market_watch_data.append({
+                    'Symbol': mw_tsym,
+                    # Display the full JSON string or the error message
+                    'LTP': ltp_value
+                })
+            
+            if market_watch_data:
+                st.dataframe(pd.DataFrame(market_watch_data))
+            else:
+                st.info("No live data available for selected Market Watch symbols.")
+        else:
+            st.info("Select symbols in the multiselect above to add them to your Market Watch.")
+
+
+    # --- Phase 1: Monitor OPEN trades for SL/TP ---
+    st.markdown("---")
+    st.subheader("Monitoring Open Trades...")
+    monitor_open_trades(api, all_symbols_map) # Pass all_symbols_map
+
+    # --- Phase 2: Monitor PENDING entries for trigger ---
+    st.markdown("---")
+    st.subheader("Monitoring Pending Entries...")
+    monitor_pending_entries(api, all_symbols_map) # Pass all_symbols_map
+
+    # --- Phase 3: Screen for new signals (only non-tracked/non-pending stocks) ---
+    st.markdown("---")
+    st.subheader("Screening for New Signals...")
+    buy_signals_data = []
+    sell_signals_data = []
+
+    eligible_for_screening = get_eligible_symbols_for_screening(all_symbols_map)
+
+    if not eligible_for_screening:
+        status_placeholder.info("All eligible symbols are either being tracked, pending entry, or no new symbols to screen.")
+        st.empty() # Clear progress bar if any
+    else:
+        progress_bar = st.progress(0, text="Screening eligible stocks for new signals...")
+        for i, stock in enumerate(eligible_for_screening):
+            symbol_info, signal, reason, current_ltp_for_signal, signal_high, signal_low, signal_candle_time = screen_stock(stock, api, all_symbols_map)
+            
+            if signal in ['BUY', 'SELL'] and current_ltp_for_signal is not None and signal_high is not None and signal_low is not None:
+                current_stock_token = stock.get('token')
+                if not current_stock_token:
+                    logging.warning(f"Cannot process signal for {symbol_info}: Missing valid API Token.")
+                    continue
+                
+                if signal == 'BUY':
+                    expected_entry_price = round(signal_high * (1 + ENTRY_BUFFER_PERCENT), 2)
+                    initial_sl_price = round(signal_low - st.session_state.sl_buffer_points, 2)
+                    
+                    potential_loss_per_share = expected_entry_price - initial_sl_price
+                    
+                    if potential_loss_per_share <= 0.01:
+                        logging.warning(f"Invalid or too small potential loss ({potential_loss_per_share}) for BUY {symbol_info}. Skipping.")
+                        continue
+                    
+                    calculated_quantity = int( (st.session_state.capital * RISK_PERCENTAGE_OF_CAPITAL) / potential_loss_per_share )
+                    initial_tp_price = round(expected_entry_price + (potential_loss_per_share * st.session_state.target_multiplier), 2)
+
+                    buy_signals_data.append({
+                        'Symbol': symbol_info,
+                        'Signal': 'BUY',
+                        'Reason': reason,
+                        'Price': f"{current_ltp_for_signal:,.2f}",
+                        'Signal High': f"{signal_high:,.2f}",
+                        'Signal Low': f"{signal_low:,.2f}",
+                        'Est. Qty': calculated_quantity,
+                        'Est. SL': f"{initial_sl_price:,.2f}",
+                        'Est. TP': f"{initial_tp_price:,.2f}"
+                    })
+                    
+                    if calculated_quantity > 0:
+                        st.session_state.pending_entries[symbol_info] = {
+                            'buy_or_sell': 'B',
+                            'signal_candle_high': signal_high,
+                            'signal_candle_low': signal_low,
+                            'calculated_quantity': calculated_quantity,
+                            'initial_sl_price': initial_sl_price,
+                            'initial_tp_price': initial_tp_price,
+                            'status': 'PENDING',
+                            'token': current_stock_token
+                        }
+                        # Save pending entry to Supabase
+                        supabase_payload = {
+                            'tsym': symbol_info,
+                            'exchange': EXCHANGE,
+                            'token': current_stock_token,
+                            'buy_or_sell': 'B',
+                            'quantity': calculated_quantity,
+                            'entry_price': None, # No entry price yet for pending
+                            'sl_price': initial_sl_price,
+                            'target_price': initial_tp_price,
+                            'status': 'PENDING',
+                            'highest_price_seen': None,
+                            'lowest_price_seen': None,
+                            'signal_candle_high': signal_high,
+                            'signal_candle_low': signal_low,
+                            'manual_sl_price': st.session_state.manual_overrides.get(symbol_info, {}).get('sl_price'),
+                            'manual_target_price': st.session_state.manual_overrides.get(symbol_info, {}).get('target_price')
+                        }
+                        upsert_trade_to_supabase(supabase_payload)
+                        status_placeholder.info(f"Added BUY signal for {symbol_info} to pending entries. Qty: {calculated_quantity}, SL: {initial_sl_price:.2f}, TP: {initial_tp_price:.2f}")
+                    else:
+                        status_placeholder.warning(f"Calculated quantity for BUY {symbol_info} is zero. Not adding to pending entries.")
+
+
+                elif signal == 'SELL':
+                    expected_entry_price = round(signal_low * (1 - ENTRY_BUFFER_PERCENT), 2)
+                    initial_sl_price = round(signal_high + st.session_state.sl_buffer_points, 2)
+                    
+                    potential_loss_per_share = initial_sl_price - expected_entry_price
+
+                    if potential_loss_per_share <= 0.01:
+                        logging.warning(f"Invalid or too small potential loss ({potential_loss_per_share}) for SELL {symbol_info}. Skipping.")
+                        continue
+
+                    calculated_quantity = int( (st.session_state.capital * RISK_PERCENTAGE_OF_CAPITAL) / potential_loss_per_share )
+                    initial_tp_price = round(expected_entry_price - (potential_loss_per_share * st.session_state.target_multiplier), 2)
+
+                    sell_signals_data.append({
+                        'Symbol': symbol_info,
+                        'Signal': 'SELL',
+                        'Reason': reason,
+                        'Price': f"{current_ltp_for_signal:,.2f}",
+                        'Signal High': f"{signal_high:,.2f}",
+                        'Signal Low': f"{signal_low:,.2f}",
+                        'Est. Qty': calculated_quantity,
+                        'Est. SL': f"{initial_sl_price:,.2f}",
+                        'Est. TP': f"{initial_tp_price:,.2f}"
+                    })
+
+                    if calculated_quantity > 0:
+                        st.session_state.pending_entries[symbol_info] = {
+                            'buy_or_sell': 'S',
+                            'signal_candle_high': signal_high,
+                            'signal_candle_low': signal_low,
+                            'calculated_quantity': calculated_quantity,
+                            'initial_sl_price': initial_sl_price,
+                            'initial_tp_price': initial_tp_price,
+                            'status': 'PENDING',
+                            'token': current_stock_token
+                        }
+                        # Save pending entry to Supabase
+                        supabase_payload = {
+                            'tsym': symbol_info,
+                            'exchange': EXCHANGE,
+                            'token': current_stock_token,
+                            'buy_or_sell': 'S',
+                            'quantity': calculated_quantity,
+                            'entry_price': None, # No entry price yet for pending
+                            'sl_price': initial_sl_price,
+                            'target_price': initial_tp_price,
+                            'status': 'PENDING',
+                            'highest_price_seen': None,
+                            'lowest_price_seen': None,
+                            'signal_candle_high': signal_high,
+                            'signal_candle_low': signal_low,
+                            'manual_sl_price': st.session_state.manual_overrides.get(symbol_info, {}).get('sl_price'),
+                            'manual_target_price': st.session_state.manual_overrides.get(symbol_info, {}).get('target_price')
+                        }
+                        upsert_trade_to_supabase(supabase_payload)
+                        status_placeholder.info(f"Added SELL signal for {symbol_info} to pending entries. Qty: {calculated_quantity}, SL: {initial_sl_price:.2f}, TP: {initial_tp_price:.2f}")
+                    else:
+                        status_placeholder.warning(f"Calculated quantity for SELL {symbol_info} is zero. Not adding to pending entries.")
+            
+            progress_bar.progress((i + 1) / len(eligible_for_screening), text=f"Screening {stock['tsym']}...")
+        progress_bar.empty() # Clear progress bar
+
+    # Display Signals in their placeholder
+    with signal_placeholder.container():
+        st.subheader("Current Buy Signals 🟢")
+        if buy_signals_data:
+            st.dataframe(pd.DataFrame(buy_signals_data))
+        else:
+            st.info("No BUY signals currently.")
+
+        st.subheader("Current Sell Signals 🔴")
+        if sell_signals_data:
+            st.dataframe(pd.DataFrame(sell_signals_data))
+        else:
+            st.info("No SELL signals currently.")
+
+    # --- Monitor and Display Tracked Trades (new section) ---
+    with tracked_trades_placeholder.container():
+        st.subheader("App-Tracked Trades (Pending & Open) 🚀")
+        tracked_data = []
+
+        # Adjusted columns for LTP
+        cols_header = st.columns([0.15, 0.04, 0.04, 0.08, 0.09, 0.09, 0.09, 0.09, 0.09, 0.09, 0.05])
+        cols_header[0].write("**Symbol**")
+        cols_header[1].write("**Act**")
+        cols_header[2].write("**Qty**")
+        cols_header[3].write("**LTP**") # New LTP column header
+        cols_header[4].write("**Entry Ref Price**")
+        cols_header[5].write("**SL Price**")
+        cols_header[6].write("**Target Price**")
+        cols_header[7].write("**Status**")
+        cols_header[8].write("**Manual SL**")
+        cols_header[9].write("**Manual Target**")
+        cols_header[10].write("**Clear**")
+
+        # Explicitly build and prioritize the list of tracked symbols for rendering
+        all_tracked_tsyms_ordered = []
+        
+        # Add pending entries first
+        for tsym in st.session_state.pending_entries.keys():
+            if st.session_state.pending_entries[tsym]['status'] == 'PENDING':
+                all_tracked_tsyms_ordered.append(tsym)
+        
+        # Add open trades that are NOT already in pending
+        for tsym in st.session_state.open_tracked_trades.keys():
+            if tsym not in all_tracked_tsyms_ordered and \
+               (st.session_state.open_tracked_trades[tsym]['status'] == 'OPEN' or \
+                st.session_state.open_tracked_trades[tsym]['status'].startswith('CLOSING')):
+                all_tracked_tsyms_ordered.append(tsym)
+        
+        # Now iterate over the strictly ordered and unique list
+        for tsym in all_tracked_tsyms_ordered:
+            # Strictly prioritize pending entries for rendering
+            if tsym in st.session_state.pending_entries and st.session_state.pending_entries[tsym]['status'] == 'PENDING':
+                trade = st.session_state.pending_entries[tsym]
+                
+                current_sl_display = st.session_state.manual_overrides.get(tsym, {}).get('sl_price')
+                if current_sl_display is None or current_sl_display <= 0:
+                    current_sl_display = trade['initial_sl_price']
+                current_sl_display = f"{current_sl_display:,.2f}" if current_sl_display is not None else 'N/A'
+
+                current_tp_display = st.session_state.manual_overrides.get(tsym, {}).get('target_price')
+                if current_tp_display is None or current_tp_display <= 0:
+                    current_tp_display = trade['initial_tp_price']
+                current_tp_display = f"{current_tp_display:,.2f}" if current_tp_display is not None else 'N/A'
+                
+                manual_sl_val = st.session_state.manual_overrides.get(tsym, {}).get('sl_price', None)
+                manual_tp_val = st.session_state.manual_overrides.get(tsym, {}).get('target_price', None)
+
+                cols = st.columns([0.15, 0.04, 0.04, 0.08, 0.09, 0.09, 0.09, 0.09, 0.09, 0.09, 0.05])
+                cols[0].write(tsym)
+                cols[1].write(trade['buy_or_sell'])
+                cols[2].write(trade['calculated_quantity'])
+                # Use .get() for current_ltp and check if it's numeric before formatting
+                ltp_value = trade.get('current_ltp')
+                if isinstance(ltp_value, (float, int)):
+                    cols[3].write(f"{ltp_value:,.2f}")
+                else:
+                    cols[3].write("Fetching...")
+                cols[4].write(f"{trade['signal_candle_high'] if trade['buy_or_sell'] == 'B' else trade['signal_candle_low']:,.2f}")
+                cols[5].write(current_sl_display)
+                cols[6].write(current_tp_display)
+                cols[7].write('PENDING ENTRY')
+                
+                # AFTER (fixed):
+                
+                
+                # Define current_manual_sl before using it
+                current_manual_sl = st.session_state.manual_overrides.get(tsym, {}).get('sl_price', 0.0)
+                if current_manual_sl is None or current_manual_sl < 0:
+                    current_manual_sl = 0.0
+
+                
+                # Initialize manual_overrides if not exists
+                if 'manual_overrides' not in st.session_state:
+                    st.session_state.manual_overrides = {}
+
+                # OPTION 1: Simple fix - define current_manual_sl before using
+                current_manual_sl = st.session_state.manual_overrides.get(tsym, {}).get('sl_price', 0.0)
+                if current_manual_sl is None or current_manual_sl < 0:
+                    current_manual_sl = 0.0
+
+                unique_timestamp = int(time.time() * 1000000)
+                new_manual_sl = cols[8].number_input(
+                    "Manual SL", 
+                    value=current_manual_sl,
+                    step=0.01,
+                    format="%.2f",
+                    key=f'manual_sl_{tsym}_pending_{unique_timestamp}_{hash(tsym) % 1000}'
+                )
+
+                
+                unique_timestamp = int(time.time() * 1000000)  # Microsecond precision
+                new_manual_sl = cols[8].number_input(
+                    "Manual SL", 
+                    value=current_manual_sl if current_manual_sl and current_manual_sl > 0 else 0.0,
+                    step=0.01,
+                    format="%.2f",
+                    key=f'manual_sl_{tsym}_pending_{unique_timestamp}_{hash(tsym) % 1000}'
+                )
+                new_manual_tp = cols[9].number_input(
+                    label="Manual TP", # Simplified label
+                    value=manual_tp_val if manual_tp_val is not None else None,
+                    step=0.01, format="%.2f", key=f"manual_tp_{tsym}_pending_input", label_visibility="collapsed"
+                )
+                
+                if new_manual_sl is not None and (manual_sl_val is None or new_manual_sl != manual_sl_val):
+                    st.session_state.manual_overrides.setdefault(tsym, {})['sl_price'] = new_manual_sl
+                    upsert_trade_to_supabase({'tsym': tsym, 'manual_sl_price': new_manual_sl})
+                    st.rerun()
+                if new_manual_tp is not None and (manual_tp_val is None or new_manual_tp != manual_tp_val):
+                    st.session_state.manual_overrides.setdefault(tsym, {})['target_price'] = new_manual_tp
+                    upsert_trade_to_supabase({'tsym': tsym, 'manual_target_price': new_manual_tp})
                     st.rerun()
 
-        elif tsym in st.session_state.open_tracked_trades:
-            trade_info = st.session_state.open_tracked_trades[tsym]
-            cols[0].write(tsym)
-            cols[1].write(trade_info['buy_or_sell'])
-            cols[2].write(trade_info['quantity'])
-            cols[3].write(trade_info['status'])
-            
-            pnl = (trade_info['current_ltp'] - trade_info['entry_price']) * trade_info['quantity'] if trade_info['buy_or_sell'] == 'B' else (trade_info['entry_price'] - trade_info['current_ltp']) * trade_info['quantity']
-            
-            cols[4].write(f"{trade_info['current_ltp']:.2f}" if isinstance(trade_info['current_ltp'], float) else 'N/A')
-            cols[5].write(f"{trade_info['entry_price']:.2f}")
-            
-            # Use effective SL and TP for display
-            manual_sl_override = st.session_state.manual_overrides.get(tsym, {}).get('sl_price')
-            manual_tp_override = st.session_state.manual_overrides.get(tsym, {}).get('target_price')
-            
-            effective_sl = manual_sl_override if manual_sl_override is not None else trade_info['sl_price']
-            effective_tp = manual_tp_override if manual_tp_override is not None else trade_info['target_price']
-            
-            cols[6].write(f"{effective_sl:.2f}")
-            cols[7].write(f"{effective_tp:.2f}")
-            cols[8].write(f"{trade_info['signal_candle_high']:.2f}")
-            cols[9].write(f"{trade_info['signal_candle_low']:.2f}")
-            
-            # Manual SL/TP columns
-            manual_sl_val = st.session_state.manual_overrides.get(tsym, {}).get('sl_price')
-            manual_tp_val = st.session_state.manual_overrides.get(tsym, {}).get('target_price')
-            cols[10].write(f"{manual_sl_val:.2f}" if manual_sl_val else 'N/A')
-            cols[11].write(f"{manual_tp_val:.2f}" if manual_tp_val else 'N/A')
+                if cols[10].button("Clear", key=f"clear_manual_{tsym}_pending_button"):
+                    if tsym in st.session_state.manual_overrides:
+                        if 'sl_price' in st.session_state.manual_overrides[tsym]:
+                            del st.session_state.manual_overrides[tsym]['sl_price']
+                        if 'target_price' in st.session_state.manual_overrides[tsym]:
+                            del st.session_state.manual_overrides[tsym]['target_price']
+                        if not st.session_state.manual_overrides[tsym]:
+                            del st.session_state.manual_overrides[tsym]
+                        upsert_trade_to_supabase({'tsym': tsym, 'manual_sl_price': None, 'manual_target_price': None})
+                        st.rerun()
 
-            with cols[12]:
-                if st.button("Exit", key=f"exit_open_{tsym}"):
-                    exit_response = exit_position(
-                        exchange=trade_info['exchange'],
-                        tradingsymbol=tsym,
-                        product_type='I',
-                        netqty=trade_info['quantity'] if trade_info['buy_or_sell'] == 'B' else -trade_info['quantity'],
-                        api=api,
-                        token=trade_info['token']
-                    )
-                    if exit_response:
-                        del st.session_state.open_tracked_trades[tsym]
-                        delete_trade_from_supabase(tsym)
+            # Else, if it's an OPEN or CLOSING tracked trade
+            elif tsym in st.session_state.open_tracked_trades and (st.session_state.open_tracked_trades[tsym]['status'] == 'OPEN' or st.session_state.open_tracked_trades[tsym]['status'].startswith('CLOSING')):
+                trade = st.session_state.open_tracked_trades[tsym]
+                
+                current_sl_display = st.session_state.manual_overrides.get(tsym, {}).get('sl_price')
+                if current_sl_display is None or current_sl_display <= 0:
+                    current_sl_display = trade['sl_price']
+                current_sl_display = f"{current_sl_display:,.2f}" if current_sl_display is not None else 'N/A'
+
+                current_tp_display = st.session_state.manual_overrides.get(tsym, {}).get('target_price')
+                if current_tp_display is None or current_tp_display <= 0:
+                    current_tp_display = trade['target_price']
+                current_tp_display = f"{current_tp_display:,.2f}" if current_tp_display is not None else 'N/A'
+
+                manual_sl_val = st.session_state.manual_overrides.get(tsym, {}).get('sl_price', None)
+                manual_tp_val = st.session_state.manual_overrides.get(tsym, {}).get('target_price', None)
+                
+                cols = st.columns([0.15, 0.04, 0.04, 0.08, 0.09, 0.09, 0.09, 0.09, 0.09, 0.09, 0.05])
+                cols[0].write(tsym)
+                cols[1].write(trade['buy_or_sell'])
+                cols[2].write(trade['quantity'])
+                # Use .get() for current_ltp and check if it's numeric before formatting
+                ltp_value = trade.get('current_ltp')
+                if isinstance(ltp_value, (float, int)):
+                    cols[3].write(f"{ltp_value:,.2f}")
+                else:
+                    cols[3].write("Fetching...")
+                cols[4].write(f"{trade['entry_price']:,.2f}")
+                cols[5].write(current_sl_display)
+                cols[6].write(current_tp_display)
+                cols[7].write(trade['status'])
+
+                new_manual_sl = cols[8].number_input(
+                    label="Manual SL", # Simplified label
+                    value=manual_sl_val if manual_sl_val is not None else None,
+                    step=0.01, format="%.2f", key=f"manual_sl_{tsym}_open_input", label_visibility="collapsed"
+                )
+                new_manual_tp = cols[9].number_input(
+                    label="Manual TP", # Simplified label
+                    value=manual_tp_val if manual_tp_val is not None else None,
+                    step=0.01, format="%.2f", key=f"manual_tp_{tsym}_open_input", label_visibility="collapsed"
+                )
+
+                if new_manual_sl is not None and (manual_sl_val is None or new_manual_sl != manual_sl_val): # Corrected comparison
+                    st.session_state.manual_overrides.setdefault(tsym, {})['sl_price'] = new_manual_sl
+                    upsert_trade_to_supabase({'tsym': tsym, 'manual_sl_price': new_manual_sl})
+                    st.rerun()
+                if new_manual_tp is not None and (manual_tp_val is None or new_manual_tp != manual_tp_val):
+                    st.session_state.manual_overrides.setdefault(tsym, {})['target_price'] = new_manual_tp
+                    upsert_trade_to_supabase({'tsym': tsym, 'manual_target_price': new_manual_tp})
+                    st.rerun()
+                
+                if cols[10].button("Clear", key=f"clear_manual_{tsym}_open_button"):
+                    if tsym in st.session_state.manual_overrides:
+                        if 'sl_price' in st.session_state.manual_overrides[tsym]:
+                            del st.session_state.manual_overrides[tsym]['sl_price']
+                        if 'target_price' in st.session_state.manual_overrides[tsym]:
+                            del st.session_state.manual_overrides[tsym]['target_price']
+                        if not st.session_state.manual_overrides[tsym]:
+                            del st.session_state.manual_overrides[tsym]
+                        upsert_trade_to_supabase({'tsym': tsym, 'manual_sl_price': None, 'manual_target_price': None})
                         st.rerun()
         
-    if not all_tracked_tsyms_ordered:
-        st.info("No active or pending trades being tracked by the app.")
+        if not all_tracked_tsyms_ordered:
+            st.info("No active or pending trades being tracked by the app.")
 
     
     # Wait for the specified interval before the next screening cycle
@@ -1998,4 +2823,4 @@ with tracked_trades_placeholder.container():
         time.sleep(screen_interval)
 
 if not run_screener:
-    status_placeholder.info("Screener is not running. Check the 'Start Live Screener' box in the sidebar to begin.")
+    status_placeholder.info("Screener is paused. Check 'Run Screener Continuously' in sidebar to start.")
