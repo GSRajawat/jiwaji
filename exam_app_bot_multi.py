@@ -6,8 +6,6 @@ import datetime
 import time
 import pandas as pd
 from supabase import create_client, Client
-import requests # New import for Tradetron API
-import json # New import for JSON string formatting
 
 # Add the parent directory to the sys.path to import api_helper
 # This assumes api_helper.py is in the parent directory of this script.
@@ -76,10 +74,6 @@ if 'exit_all_triggered_today' not in st.session_state:
     st.session_state.exit_all_triggered_today = False
 if 'last_run_date' not in st.session_state:
     st.session_state.last_run_date = datetime.date.today()
-if 'tradetron_cookie' not in st.session_state:
-    st.session_state.tradetron_cookie = ""
-if 'tradetron_user_agent' not in st.session_state:
-    st.session_state.tradetron_user_agent = ""
 if 'market_watch_source' not in st.session_state:
     st.session_state.market_watch_source = "Flattrade (NorenApiPy)"
 if 'daily_traded_symbols' not in st.session_state:
@@ -352,136 +346,14 @@ def load_symbols_from_csv(file_path="NSE_Equity.csv"):
 
 def fetch_and_update_ltp():
     """Fetches the live LTP for all pending and open trades and updates the session state."""
-    all_tracked_symbols = set(list(st.session_state.pending_entries.keys()) + list(st.session_state.open_tracked_trades.keys()))
-    if not all_tracked_symbols:
-        logging.info("No tracked symbols to update LTP.")
-        return
-    logging.info(f"Fetching LTP for {len(all_tracked_symbols)} symbols: {all_tracked_symbols}")
-    for tsym in all_tracked_symbols:
-        if tsym in st.session_state.pending_entries:
-            trade_data = st.session_state.pending_entries[tsym]
-            current_ltp = get_tradetron_ltp_simple(
-                tsym.replace('-EQ', ''),
-                st.session_state.tradetron_cookie,
-                st.session_state.tradetron_user_agent
-            )
-            if isinstance(current_ltp, (int, float)):
-                trade_data['current_ltp'] = current_ltp
-                logging.info(f"Updated LTP for PENDING trade {tsym} to {current_ltp}")
-            else:
-                logging.warning(f"Failed to get LTP for PENDING trade {tsym}: {current_ltp}")
-        elif tsym in st.session_state.open_tracked_trades:
-            trade_data = st.session_state.open_tracked_trades[tsym]
-            current_ltp = get_tradetron_ltp_simple(
-                tsym.replace('-EQ', ''),
-                st.session_state.tradetron_cookie,
-                st.session_state.tradetron_user_agent
-            )
-            if isinstance(current_ltp, (int, float)):
-                trade_data['current_ltp'] = current_ltp
-                logging.info(f"Updated LTP for OPEN trade {tsym} to {current_ltp}")
-            else:
-                logging.warning(f"Failed to get LTP for OPEN trade {tsym}: {current_ltp}")
+    # This function is no longer needed after removing Tradetron API.
+    # It is kept as a placeholder in case another API is integrated later.
+    st.warning("LTP fetching is currently disabled as the Tradetron API has been removed.")
+
 
 def get_nifty500_symbols():
     """Uses the load_symbols_from_csv function to get the actual symbols."""
     return load_symbols_from_csv()
-
-def get_tradetron_ltp(symbol, tradetron_cookie, tradetron_user_agent):
-    """Fetches the Last Traded Price (LTP) for a given symbol using the Tradetron API."""
-    if not tradetron_cookie or not tradetron_user_agent:
-        logging.warning(f"Tradetron cookie or user-agent not provided for {symbol}. Cannot fetch LTP.")
-        return "Auth Missing"
-    clean_symbol = symbol.replace('-EQ', '').strip()
-    current_time = datetime.datetime.now()
-    etime_ms = int(current_time.timestamp() * 1000)
-    stime_ms = int((current_time - datetime.timedelta(minutes=5)).timestamp() * 1000)
-    url = f"https://tradetron.tech/tv/api/v3?symbol={clean_symbol}&stime={stime_ms}&etime={etime_ms}&candle=1m"
-    headers = {
-        "authority": "tradetron.tech",
-        "method": "GET",
-        "path": "/tv/api/v3",
-        "scheme": "https",
-        "accept": "*/*",
-        "accept-encoding": "gzip, deflate, br, zstd",
-        "accept-language": "en-US,en;q=0.9",
-        "referer": "https://tradetron.tech/user/dashboard",
-        "sec-ch-ua": '"Not;A=Brand";v="99", "Google Chrome";v="139", "Chromium";v="139"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
-        "user-agent": tradetron_user_agent,
-        "cookie": tradetron_cookie
-    }
-    logging.debug(f"Fetching Tradetron LTP for {symbol} (cleaned: {clean_symbol}) from: {url}")
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        logging.info(f"Full Tradetron response for {symbol}: {data}")
-        print(f"DEBUG - Symbol: {symbol}, Clean Symbol: {clean_symbol}")
-        print(f"DEBUG - Full API Response: {data}")
-        print(f"DEBUG - Response Type: {type(data)}")
-        if data and data.get('success') is True:
-            print(f"DEBUG - Success is True")
-            if 'Data' in data:
-                print(f"DEBUG - Data key found: {data['Data']}")
-                print(f"DEBUG - Data type: {type(data['Data'])}")
-                print(f"DEBUG - Data length: {len(data['Data']) if isinstance(data['Data'], list) else 'Not a list'}")
-                if isinstance(data['Data'], list) and len(data['Data']) > 0:
-                    latest_candle = data['Data'][0]
-                    print(f"DEBUG - Latest candle: {latest_candle}")
-                    print(f"DEBUG - Latest candle type: {type(latest_candle)}")
-                    if isinstance(latest_candle, dict) and 'close' in latest_candle:
-                        ltp = float(latest_candle['close'])
-                        print(f"DEBUG - Successfully extracted LTP: {ltp}")
-                        logging.info(f"Successfully fetched Tradetron LTP for {symbol}: {ltp}")
-                        return ltp
-                    else:
-                        print(f"DEBUG - Latest candle format issue or missing close: {latest_candle}")
-                        logging.warning(f"Tradetron API latest candle for {symbol} is not in expected format: {latest_candle}")
-                        return "Parse Error"
-                else:
-                    print(f"DEBUG - Data is not a list or is empty")
-                    logging.warning(f"Tradetron API Data is not a list or empty for {symbol}: {data['Data']}")
-                    return "No Data"
-            else:
-                print(f"DEBUG - No 'Data' key in response")
-                logging.warning(f"Tradetron API response missing 'Data' key for {symbol}: {data}")
-                return "No Data"
-        else:
-            print(f"DEBUG - Success is not True or data is None")
-            print(f"DEBUG - Success value: {data.get('success') if data else 'No data'}")
-            logging.warning(f"Tradetron API returned success=False or no data for {symbol}: {data}")
-            return "No Data"
-    except requests.exceptions.HTTPError as e:
-        print(f"DEBUG - HTTP Error: {e}")
-        logging.error(f"Tradetron HTTP error for {symbol}: {e}. Response: {response.text if 'response' in locals() else 'No response'}")
-        if 'response' in locals() and (response.status_code == 401 or response.status_code == 403):
-            return "Auth Error (401/403)"
-        return "HTTP Error"
-    except requests.exceptions.ConnectionError as e:
-        print(f"DEBUG - Connection Error: {e}")
-        logging.error(f"Tradetron Connection Error for {symbol}: {e}")
-        return "Conn Error"
-    except requests.exceptions.Timeout as e:
-        print(f"DEBUG - Timeout Error: {e}")
-        logging.error(f"Tradetron Timeout Error for {symbol}: {e}")
-        return "Timeout"
-    except requests.exceptions.RequestException as e:
-        print(f"DEBUG - Request Error: {e}")
-        logging.error(f"Tradetron Request Error for {symbol}: {e}")
-        return "Req Error"
-    except ValueError as e:
-        print(f"DEBUG - Value/JSON Error: {e}")
-        logging.error(f"Tradetron data parsing error for {symbol}: {e}")
-        return "Parse Error"
-    except Exception as e:
-        print(f"DEBUG - Unexpected Error: {e}")
-        logging.error(f"Unexpected error fetching Tradetron LTP for {symbol}: {e}", exc_info=True)
-        return "Unknown Error"
 
 def get_current_manual_sl(tsym, trade_info=None):
     """Safely get current manual SL with fallbacks"""
@@ -497,44 +369,13 @@ def get_current_manual_sl(tsym, trade_info=None):
     except (ValueError, TypeError, AttributeError):
         return 0.0
 
-def get_tradetron_ltp_simple(symbol, tradetron_cookie, tradetron_user_agent):
-    """ Simplified version for production use after debugging """
-    if not tradetron_cookie or not tradetron_user_agent:
-        return "Auth Missing"
-    current_time = datetime.datetime.now()
-    time_ranges = [15, 30, 60, 120]
-    for minutes in time_ranges:
-        etime_ms = int(current_time.timestamp() * 1000)
-        stime_ms = int((current_time - datetime.timedelta(minutes=minutes)).timestamp() * 1000)
-        url = f"https://tradetron.tech/tv/api/v3?symbol={symbol}&stime={stime_ms}&etime={etime_ms}&candle=1m"
-        headers = {
-            "authority": "tradetron.tech",
-            "accept": "*/*",
-            "accept-language": "en-US,en;q=0.9",
-            "referer": "https://tradetron.tech/user/dashboard",
-            "user-agent": tradetron_user_agent,
-            "cookie": tradetron_cookie
-        }
-        try:
-            response = requests.get(url, headers=headers, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                if (data and data.get('success') is True and 'Data' in data and isinstance(data['Data'], list) and len(data['Data']) > 0 and isinstance(data['Data'][0], dict) and 'close' in data['Data'][0]):
-                    return float(data['Data'][0]['close'])
-        except Exception as e:
-            logging.error(f"Error fetching Tradetron data for {symbol} with {minutes}min range: {e}")
-            continue
-    return "No Data"
-
 if __name__ == "__main__":
     st.title("Trade Monitor Dashboard")
     with st.sidebar:
         st.header("Tradetron API Credentials")
-        st.session_state.tradetron_cookie = st.text_input("Tradetron Cookie", type="password")
-        st.session_state.tradetron_user_agent = st.text_input("User-Agent", type="password")
-        if st.button("🔄 Refresh LTP (Tradetron)", type="secondary"):
-            fetch_and_update_ltp()
-            st.success("LTP data refreshed from Tradetron API!")
+        st.text("Tradetron API has been removed.")
+        if st.button("🔄 Refresh LTP (Disabled)", type="secondary"):
+            st.info("LTP refresh is currently disabled.")
 
     # Main dashboard view
     st.subheader("📊 Live Positions & P&L")
@@ -546,7 +387,6 @@ if __name__ == "__main__":
         st.session_state.strategy.reset_daily_flags(datetime.date.today())
 
         # Placeholder for data fetching - replace with your actual data fetching function
-        # Example: Fetch 1-minute candle data for a set of symbols
         # For demonstration, we will use mock data
         symbol_token_map = get_nifty500_symbols()
         symbols_to_screen = list(symbol_token_map.keys())[:10] # Screen first 10 for demo
