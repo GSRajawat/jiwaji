@@ -8,6 +8,7 @@ supabase
 requests
 python-dotenv
 plotly
+yfinance
 
 
 
