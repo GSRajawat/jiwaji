@@ -1,427 +1,518 @@
 import streamlit as st
+import pandas as pd
+import numpy as np
 import os
 import sys
 import logging
-import datetime
-import time
-import pandas as pd
+from datetime import datetime, time, timedelta
+import time as time_module
 from supabase import create_client, Client
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import json
 
-# Add the parent directory to the sys.path to import api_helper
-# This assumes api_helper.py is in the parent directory of this script.
+# Add the parent directory to the path to import api_helper
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from api_helper import NorenApiPy
-
-# Import the OLAELECStrategy class from ola.py
-try:
-    from ola import OLAELECStrategy
-except ImportError:
-    st.error("Error: Could not import OLAELECStrategy. Please ensure ola.py is in the same directory.")
-    st.stop()
 
 # --- Configuration ---
 # Set logging level to DEBUG to see all detailed messages
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Flattrade API Credentials ---
-USER_SESSION = st.secrets.get("FLATTRADE_USER_SESSION", "a36fe10399fcc8d580ae35c795d8593b7676a1fde2ce2a80073dfa23d6430bbb")
-USER_ID = st.secrets.get("FLATTRADE_USER_ID", "FZ03508")
+USER_SESSION = "f4ef64a7f58a248c6611b3bfc027cbbb8ae2fcf86ae6f7b57d1fabbf74878f1a"
+USER_ID = "FZ03508"
+FLATTRADE_PASSWORD = "Shubhi@2"  # Replace with actual password
 
 # --- Supabase Credentials ---
-SUPABASE_URL = st.secrets.get("SUPABASE_URL","https://zybakxpyibubzjhzdcwl.supabase.co")
-SUPABASE_KEY = st.secrets.get("SUPABASE_KEY","eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp5YmFreHB5aWJ1YnpqaHpkY3dsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQ4OTQyMDgsImV4cCI6MjA3MDQ3MDIwOH0.8ZqreKy5zg_M-B1uH79T6lQXn62eRvvouo_OiMjwqGU")
-
-EXCHANGE = 'NSE'
-CANDLE_INTERVAL = '1'  # 1-minute candles
-REQUIRED_CANDLES = 21 # Latest candle + previous 20 for calculations
-
-# --- Entry/Exit Buffers and Risk Parameters (Constants) ---
-ENTRY_BUFFER_PERCENT = 0.0005 # 0.05% buffer for crossing high/low for entry
-RISK_PERCENTAGE_OF_CAPITAL = 0.01 # 1% of capital risked per trade
-
-
-# --- Initialize ALL session state variables first and foremost ---
-if 'simple_counter' not in st.session_state:
-    st.session_state.simple_counter = 0
-if 'widget_key_tracker' not in st.session_state:
-    st.session_state.widget_key_tracker = {}
-if 'volume_multiplier' not in st.session_state:
-    st.session_state.volume_multiplier = 10
-if 'traded_value_threshold' not in st.session_state:
-    st.session_state.traded_value_threshold = 10000000
-if 'high_low_diff_multiplier' not in st.session_state:
-    st.session_state.high_low_diff_multiplier = 4
-if 'capital' not in st.session_state:
-    st.session_state.capital = 1000
-if 'target_multiplier' not in st.session_state:
-    st.session_state.target_multiplier = 4
-if 'sl_buffer_points' not in st.session_state:
-    st.session_state.sl_buffer_points = 0.25
-if 'trailing_step_points' not in st.session_state:
-    st.session_state.trailing_step_points = 1.00
-
-if 'pending_entries' not in st.session_state:
-    st.session_state.pending_entries = {}
-if 'open_tracked_trades' not in st.session_state:
-    st.session_state.open_tracked_trades = {}
-if 'manual_overrides' not in st.session_state:
-    st.session_state.manual_overrides = {}
-if 'market_watch_symbols' not in st.session_state:
-    st.session_state.market_watch_symbols = []
-if 'supabase_loaded' not in st.session_state:
-    st.session_state.supabase_loaded = False
-if 'exit_all_triggered_today' not in st.session_state:
-    st.session_state.exit_all_triggered_today = False
-if 'last_run_date' not in st.session_state:
-    st.session_state.last_run_date = datetime.date.today()
-if 'market_watch_source' not in st.session_state:
-    st.session_state.market_watch_source = "Flattrade (NorenApiPy)"
-if 'daily_traded_symbols' not in st.session_state:
-    st.session_state.daily_traded_symbols = set()
-if 'last_reset_date' not in st.session_state:
-    st.session_state.last_reset_date = datetime.date.today()
-if 'strategy' not in st.session_state:
-    st.session_state.strategy = OLAELECStrategy()
-
-# Reset daily traded symbols at start of new day
-current_date = datetime.date.today()
-if st.session_state.last_reset_date != current_date:
-    st.session_state.daily_traded_symbols = set()
-    st.session_state.last_reset_date = current_date
-    st.session_state.strategy.reset_daily_flags(current_date)
-
-# --- End of session state initialization ---
-
-# Global for Supabase client
-supabase: 'Client' = None
-
-@st.cache_resource
-def get_supabase_client(url, key):
-    """Initializes and caches the Supabase client."""
-    if not url or not key:
-        st.error("Supabase URL or Key is not set in Streamlit secrets. Please configure them.")
-        return None
-    try:
-        return create_client(url, key)
-    except Exception as e:
-        st.error(f"Error connecting to Supabase: {e}. Please check your credentials.")
-        return None
+SUPABASE_URL = "https://zybakxpyibubzjhzdcwl.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp5YmFreHB5aWJ1YnpqaHpkY3dsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQ4OTQyMDgsImV4cCI6MjA3MDQ3MDIwOH0.8ZqreKy5zg_M-B1uH79T6lQXn62eRvvouo_OiMjwqGU"
 
 # Initialize Supabase client
-supabase = get_supabase_client(SUPABASE_URL, SUPABASE_KEY)
-
-if supabase is None:
-    st.stop() # Stop the app if Supabase connection fails
-
-# SOLUTION 1: Define current_manual_sl before using it
-def fix_manual_sl_input_v1(cols, tsym):
-    """
-    Fix by defining current_manual_sl from session state
-    """
-    current_manual_sl = st.session_state.manual_overrides.get(tsym, {}).get('sl_price')
-    if current_manual_sl is None or current_manual_sl <= 0:
-        current_manual_sl = 0.0
-
-    unique_timestamp = int(time.time() * 1000000)
-
-    new_manual_sl = cols[8].number_input(
-        "Manual SL",
-        value=current_manual_sl,
-        step=0.01,
-        format="%.2f",
-        key=f'manual_sl_{tsym}_pending_{unique_timestamp}_{hash(tsym) % 1000}'
-    )
-    return new_manual_sl
-
-def display_trades_with_unique_keys():
-    """
-    Display trades with guaranteed unique keys
-    """
-    if hasattr(st.session_state, 'pending_trades'):
-        display_trades_safely(st.session_state.pending_trades, "pending")
-        st.subheader("📋 Pending Trades")
-        for tsym, trade_data in st.session_state.pending_trades.items():
-            cols = st.columns([1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
-            cols[0].write(tsym)
-            cols[1].write(trade_data.get('buy_or_sell', 'N/A'))
-            cols[2].write(str(trade_data.get('quantity', 0)))
-            current_manual_sl = st.session_state.manual_overrides.get(tsym, {}).get('sl_price', 0.0)
-            if current_manual_sl is None or current_manual_sl < 0:
-                current_manual_sl = 0.0
-            st.session_state.simple_counter += 1
-            unique_key = f"manual_sl_{tsym}_pending_{st.session_state.simple_counter}"
-            new_manual_sl = cols[8].number_input(
-                "Manual SL",
-                value=current_manual_sl,
-                step=0.01,
-                format="%.2f",
-                key=unique_key
-            )
-    if hasattr(st.session_state, 'open_tracked_trades'):
-        display_trades_safely(st.session_state.open_tracked_trades, "open")
-        st.subheader("🔄 Open Trades")
-        for tsym, trade_info in st.session_state.open_tracked_trades.items():
-            cols = st.columns([1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
-            cols[0].write(tsym)
-            cols[1].write(trade_info.get('buy_or_sell', 'N/A'))
-            cols[2].write(str(trade_info.get('quantity', 0)))
-            current_manual_sl = st.session_state.manual_overrides.get(tsym, {}).get('sl_price', 0.0)
-            if current_manual_sl is None or current_manual_sl < 0:
-                current_manual_sl = trade_info.get('sl_price', 0.0)
-            st.session_state.simple_counter += 1
-            unique_key = f"manual_sl_{tsym}_open_{st.session_state.simple_counter}"
-            new_manual_sl = cols[8].number_input(
-                "Manual SL",
-                value=current_manual_sl,
-                step=0.01,
-                format="%.2f",
-                key=unique_key
-            )
-            if new_manual_sl != current_manual_sl:
-                if tsym not in st.session_state.manual_overrides:
-                    st.session_state.manual_overrides[tsym] = {}
-                st.session_state.manual_overrides[tsym]['sl_price'] = new_manual_sl
-
-# --- Supabase Database Operations ---
-def upsert_trade_to_supabase(trade_data):
-    """Inserts or updates a trade record in Supabase."""
-    tsym = trade_data['tsym']
-    for key, value in trade_data.items():
-        if value is None:
-            trade_data[key] = None
-        elif isinstance(value, float) and (value == float('inf') or value == float('-inf') or pd.isna(value)):
-             trade_data[key] = None
-    try:
-        response = supabase.from_('app_tracked_trades').select('id').eq('tsym', tsym).limit(1).execute()
-        if response.data:
-            trade_id = response.data[0]['id']
-            data_to_update = {k: v for k, v in trade_data.items() if k not in ['id', 'created_at']}
-            updated_response = supabase.from_('app_tracked_trades').update(data_to_update).eq('id', trade_id).execute()
-            if updated_response.data:
-                logging.info(f"Updated trade {tsym} in Supabase: {updated_response.data}")
-                return True
-            else:
-                logging.error(f"Failed to update trade {tsym} in Supabase: {updated_response.status_code} - {updated_response.get('error', 'No error message')}")
-                return False
-        else:
-            data_to_insert = {k: v for k, v in trade_data.items() if k != 'id'}
-            inserted_response = supabase.from_('app_tracked_trades').insert(data_to_insert).execute()
-            if inserted_response.data:
-                logging.info(f"Inserted new trade {tsym} into Supabase: {inserted_response.data}")
-                return True
-            else:
-                logging.error(f"Failed to insert trade {tsym} into Supabase: {inserted_response.status_code} - {inserted_response.get('error', 'No error message')}")
-                return False
-    except Exception as e:
-        logging.error(f"Supabase upsert error for {tsym}: {e}", exc_info=True)
-        return False
-
-def delete_trade_from_supabase(tsym):
-    """Deletes a trade record from Supabase."""
-    try:
-        response = supabase.from_('app_tracked_trades').delete().eq('tsym', tsym).execute()
-        if response.data:
-            logging.info(f"Deleted trade {tsym} from Supabase: {response.data}")
-            return True
-        else:
-            logging.error(f"Failed to delete trade {tsym} from Supabase: {response.status_code} - {response.get('error', 'No error message')}")
-            return False
-    except Exception as e:
-        logging.error(f"Supabase delete error for {tsym}: {e}", exc_info=True)
-        return False
-
-def load_tracked_trades_from_supabase():
-    """Loads today's tracked trades from Supabase into session state."""
-    try:
-        today_start = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-        response = supabase.from_('app_tracked_trades').select('*').gt('created_at', today_start).execute()
-        if response.data:
-            logging.info(f"Loaded {len(response.data)} trades from Supabase for today.")
-            for trade_record in response.data:
-                tsym = trade_record['tsym']
-                status = trade_record['status']
-                for key in ['entry_price', 'sl_price', 'target_price', 'highest_price_seen',
-                            'lowest_price_seen', 'signal_candle_high', 'signal_candle_low',
-                            'manual_sl_price', 'manual_target_price']:
-                    if key in trade_record and trade_record[key] is not None:
-                        try:
-                            trade_record[key] = float(trade_record[key])
-                        except (ValueError, TypeError):
-                            trade_record[key] = None
-                if status == 'PENDING':
-                    st.session_state.pending_entries[tsym] = {
-                        'buy_or_sell': trade_record['buy_or_sell'],
-                        'signal_candle_high': trade_record['signal_candle_high'],
-                        'signal_candle_low': trade_record['signal_candle_low'],
-                        'calculated_quantity': trade_record['quantity'],
-                        'initial_sl_price': trade_record['sl_price'],
-                        'initial_tp_price': trade_record['target_price'],
-                        'status': 'PENDING',
-                        'token': trade_record['token'],
-                        'current_ltp': None
-                    }
-                    if trade_record['manual_sl_price'] is not None or trade_record['manual_target_price'] is not None:
-                         st.session_state.manual_overrides.setdefault(tsym, {})['sl_price'] = trade_record['manual_sl_price']
-                         st.session_state.manual_overrides.setdefault(tsym, {})['target_price'] = trade_record['manual_target_price']
-                elif status == 'OPEN':
-                    st.session_state.open_tracked_trades[tsym] = {
-                        'order_no': trade_record.get('order_no'),
-                        'entry_price': trade_record['entry_price'],
-                        'quantity': trade_record['quantity'],
-                        'sl_price': trade_record['sl_price'],
-                        'target_price': trade_record['target_price'],
-                        'buy_or_sell': trade_record['buy_or_sell'],
-                        'status': 'OPEN',
-                        'token': trade_record['token'],
-                        'highest_price_seen': trade_record['highest_price_seen'],
-                        'lowest_price_seen': trade_record['lowest_price_seen'],
-                        'current_ltp': None
-                    }
-                    if trade_record['manual_sl_price'] is not None or trade_record['manual_target_price'] is not None:
-                         st.session_state.manual_overrides.setdefault(tsym, {})['sl_price'] = trade_record['manual_sl_price']
-                         st.session_state.manual_overrides.setdefault(tsym, {})['target_price'] = trade_record['manual_target_price']
-            return True
-        else:
-            logging.info("No trades found in Supabase for today.")
-            return False
-    except Exception as e:
-        logging.error(f"Supabase load error: {e}", exc_info=True)
-        return False
-
-if not st.session_state.supabase_loaded:
-    if load_tracked_trades_from_supabase():
-        st.session_state.supabase_loaded = True
-    else:
-        st.session_state.supabase_loaded = True
-
-# --- Initialize Flattrade API (cached for Streamlit efficiency) ---
 @st.cache_resource
-def get_api_instance(user_id, user_session):
-    """Initializes and caches the NorenApiPy instance."""
+def init_supabase():
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Initialize Flattrade API
+@st.cache_resource
+def init_flattrade_api():
     api = NorenApiPy()
-    logging.info("Attempting to set API session...")
+    # Set session with userid, usertoken, and password
+    api.set_session(userid=USER_ID, usertoken=USER_SESSION, password=FLATTRADE_PASSWORD)
+    return api
+
+class OLAELECStrategy:
+    def __init__(self):
+        self.profit_target = 0.04  # 4% profit target
+        self.entry_price = None
+        self.current_position = None
+        self.position_size = 0
+        self.last_exit_date = None
+        self.last_exit_direction = None
+        self.target_hit_today = False
+        self.current_date = None
+        
+    def reset_daily_flags(self, current_date):
+        """Reset daily flags for new trading day"""
+        if self.current_date != current_date:
+            self.current_date = current_date
+            self.target_hit_today = False
+            self.last_exit_date = None
+            self.last_exit_direction = None
+    
+    def check_time_constraints(self, current_time):
+        """Check if current time is within trading hours"""
+        if current_time <= time(9, 30) or current_time >= time(15, 20):
+            return False
+        return True
+    
+    def check_exit_conditions(self, current_price):
+        """Check if position should be exited based on profit target"""
+        if not self.current_position or not self.entry_price:
+            return False
+            
+        if self.current_position == 'long':
+            profit_pct = (current_price - self.entry_price) / self.entry_price
+            return profit_pct >= self.profit_target
+        elif self.current_position == 'short':
+            profit_pct = (self.entry_price - current_price) / self.entry_price
+            return profit_pct >= self.profit_target
+        return False
+    
+    def get_signals(self, df):
+        """Generate buy/sell signals based on VWAP strategy"""
+        if len(df) < 2:
+            return None, None
+            
+        # Get last two candles
+        candle_1 = df.iloc[-1]  # Current candle
+        candle_2 = df.iloc[-2]  # Previous candle
+        
+        # Check sell conditions (short entry)
+        sell_condition_1 = (candle_2['Close'] < candle_2['Open'] and 
+                           candle_2['Close'] < candle_2['SDVWAP1_minus'])
+        sell_condition_2 = (candle_1['Close'] < candle_1['Open'] and 
+                           candle_1['Close'] < candle_1['SDVWAP1_minus'])
+        
+        # Check buy conditions (long entry)
+        buy_condition_1 = (candle_2['Close'] > candle_2['Open'] and 
+                          candle_2['Close'] > candle_2['SDVWAP1_plus'])
+        buy_condition_2 = (candle_1['Close'] > candle_1['Open'] and 
+                          candle_1['Close'] > candle_1['SDVWAP1_plus'])
+        
+        sell_signal = sell_condition_1 and sell_condition_2
+        buy_signal = buy_condition_1 and buy_condition_2
+        
+        return buy_signal, sell_signal
+
+def calculate_vwap_bands(df, period=20, multiplier=1.0):
+    """Calculate VWAP and standard deviation bands"""
+    # Calculate VWAP
+    df['TypicalPrice'] = (df['High'] + df['Low'] + df['Close']) / 3
+    df['PV'] = df['TypicalPrice'] * df['Volume']
+    df['VWAP'] = df['PV'].rolling(window=period).sum() / df['Volume'].rolling(window=period).sum()
+    
+    # Calculate standard deviation
+    df['VWAP_STD'] = df['TypicalPrice'].rolling(window=period).std()
+    
+    # Calculate bands
+    df['SDVWAP1_plus'] = df['VWAP'] + (df['VWAP_STD'] * multiplier)
+    df['SDVWAP1_minus'] = df['VWAP'] - (df['VWAP_STD'] * multiplier)
+    
+    return df
+
+def get_token(api, symbol="OLAELEC", exchange="NSE"):
+    """Get token for the symbol"""
     try:
-        ret = api.set_session(userid=user_id, password='', usertoken=user_session)
-        if ret is True or (isinstance(ret, dict) and ret.get('stat') == 'Ok'):
-            logging.info(f"API session set successfully for user: {user_id}")
-            st.success(f"API session connected for user: {user_id}")
-            return api
-        else:
-            error_msg = ret.get('emsg', 'Unknown error') if isinstance(ret, dict) else str(ret)
-            st.error(f"Failed to set API session: {error_msg}. Please check your credentials.")
-            logging.critical(f"Failed to set API session: {error_msg}")
-            return None
+        # Search for the symbol
+        result = api.searchscrip(exchange=exchange, searchtext=symbol)
+        if result and 'values' in result and len(result['values']) > 0:
+            # Find the exact match
+            for item in result['values']:
+                if item.get('tsym') == f"{symbol}-EQ":
+                    return item.get('token')
+        return None
     except Exception as e:
-        st.error(f"An exception occurred during API session setup: {e}")
-        logging.critical(f"An exception occurred during API session setup: {e}", exc_info=True)
+        st.error(f"Error getting token: {e}")
         return None
 
-api = get_api_instance(USER_ID, USER_SESSION)
-
-if api is None:
-    st.stop()
-
-@st.cache_data
-def load_symbols_from_csv(file_path="NSE_Equity.csv"):
-    """Loads stock symbols and tokens from the provided CSV file."""
+def load_market_data(api, symbol="OLAELEC", exchange="NSE"):
+    """Load real market data from Flattrade API"""
     try:
-        df = pd.read_csv(file_path)
-        if all(col in df.columns for col in ['Exchange', 'Token', 'Tradingsymbol', 'Instrument']):
-            equity_symbols = df[df['Instrument'] == 'EQ'][['Exchange', 'Token', 'Tradingsymbol']].copy()
-            symbols_map = {row['Tradingsymbol']: str(row['Token']) for index, row in equity_symbols.iterrows()}
-            st.success(f"Loaded {len(symbols_map)} equity symbols from {file_path}.")
-            return symbols_map
-        else:
-            st.error(f"CSV file '{file_path}' must contain 'Exchange', 'Token', 'Tradingsymbol', and 'Instrument' columns. Found: {', '.join(df.columns)}")
-            logging.error(f"CSV file '{file_path}' missing required columns. Found: {', '.join(df.columns)}")
-            return {}
-    except FileNotFoundError:
-        st.error(f"Error: '{file_path}' not found. Please ensure the CSV file is in the same directory as the Streamlit app.")
-        logging.error(f"Error: '{file_path}' not found.", exc_info=True)
-        return {}
+        # Get token for the symbol
+        token = get_token(api, symbol, exchange)
+        if not token:
+            st.error(f"Could not find token for {symbol}")
+            return None
+        
+        # Get historical data - last 100 minutes
+        end_date = datetime.now()
+        start_date = end_date - timedelta(minutes=200)  # Get more data to ensure we have enough
+        
+        # Convert dates to required format
+        start_time = start_date.strftime("%d-%m-%Y") + " 09:15:00"
+        end_time = end_date.strftime("%d-%m-%Y") + " " + end_date.strftime("%H:%M:%S")
+        
+        # Get historical data
+        hist_data = api.get_time_price_series(
+            exchange=exchange,
+            token=token,
+            starttime=start_time,
+            endtime=end_time,
+            interval='1'  # 1-minute interval
+        )
+        
+        if not hist_data:
+            st.error("No historical data received")
+            return None
+        
+        # Convert to DataFrame
+        data_list = []
+        for item in hist_data:
+            data_list.append({
+                'Date': pd.to_datetime(item['time'], format='%d-%m-%Y %H:%M:%S'),
+                'Open': float(item['into']),
+                'High': float(item['inth']),
+                'Low': float(item['intl']),
+                'Close': float(item['intc']),
+                'Volume': int(item.get('intv', 0))
+            })
+        
+        if not data_list:
+            st.error("No valid data points found")
+            return None
+        
+        df = pd.DataFrame(data_list)
+        df.set_index('Date', inplace=True)
+        df = df.sort_index()
+        
+        # Calculate VWAP bands
+        df = calculate_vwap_bands(df)
+        
+        # Remove any rows with NaN values
+        df = df.dropna()
+        
+        return df.tail(100)  # Return last 100 minutes
+        
     except Exception as e:
-        st.error(f"Error loading symbols from CSV: {e}")
-        logging.error(f"Error loading symbols from CSV: {e}", exc_info=True)
-        return {}
+        st.error(f"Error loading market data: {e}")
+        logging.error(f"Error details: {str(e)}")
+        return None
 
-def fetch_and_update_ltp():
-    """Fetches the live LTP for all pending and open trades and updates the session state."""
-    # This function is no longer needed after removing Tradetron API.
-    # It is kept as a placeholder in case another API is integrated later.
-    st.warning("LTP fetching is currently disabled as the Tradetron API has been removed.")
-
-
-def get_nifty500_symbols():
-    """Uses the load_symbols_from_csv function to get the actual symbols."""
-    return load_symbols_from_csv()
-
-def get_current_manual_sl(tsym, trade_info=None):
-    """Safely get current manual SL with fallbacks"""
+def get_live_price(api, symbol="OLAELEC", exchange="NSE"):
+    """Get current live price"""
     try:
-        manual_sl = st.session_state.manual_overrides.get(tsym, {}).get('sl_price')
-        if manual_sl is not None and manual_sl > 0:
-            return float(manual_sl)
-        if trade_info and 'sl_price' in trade_info:
-            trade_sl = trade_info.get('sl_price')
-            if trade_sl is not None and trade_sl > 0:
-                return float(trade_sl)
-        return 0.0
-    except (ValueError, TypeError, AttributeError):
-        return 0.0
+        token = get_token(api, symbol, exchange)
+        if not token:
+            return None
+        
+        # Get live feed
+        live_data = api.get_quotes(exchange=exchange, token=token)
+        if live_data and live_data.get('stat') == 'Ok':
+            return float(live_data.get('lp', 0))
+        
+        return None
+    except Exception as e:
+        st.error(f"Error getting live price: {e}")
+        return None
+
+def create_chart(df, signals_df=None):
+    """Create candlestick chart with VWAP bands and signals"""
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                        vertical_spacing=0.1,
+                        subplot_titles=('Price & VWAP Bands', 'Volume'),
+                        row_heights=[0.8, 0.2])
+    
+    # Candlestick chart
+    fig.add_trace(go.Candlestick(x=df.index,
+                                open=df['Open'],
+                                high=df['High'],
+                                low=df['Low'],
+                                close=df['Close'],
+                                name='OLAELEC'), row=1, col=1)
+    
+    # VWAP
+    fig.add_trace(go.Scatter(x=df.index, y=df['VWAP'],
+                            mode='lines', name='VWAP',
+                            line=dict(color='blue', width=2)), row=1, col=1)
+    
+    # VWAP bands
+    fig.add_trace(go.Scatter(x=df.index, y=df['SDVWAP1_plus'],
+                            mode='lines', name='VWAP+',
+                            line=dict(color='green', dash='dash')), row=1, col=1)
+    
+    fig.add_trace(go.Scatter(x=df.index, y=df['SDVWAP1_minus'],
+                            mode='lines', name='VWAP-',
+                            line=dict(color='red', dash='dash')), row=1, col=1)
+    
+    # Volume
+    fig.add_trace(go.Bar(x=df.index, y=df['Volume'],
+                        name='Volume'), row=2, col=1)
+    
+    # Add buy/sell signals if provided
+    if signals_df is not None and len(signals_df) > 0:
+        buy_signals = signals_df[signals_df['Signal'] == 'BUY']
+        sell_signals = signals_df[signals_df['Signal'] == 'SELL']
+        
+        if len(buy_signals) > 0:
+            fig.add_trace(go.Scatter(x=buy_signals['Time'], y=buy_signals['Price'],
+                                   mode='markers', name='Buy Signal',
+                                   marker=dict(color='green', size=10, symbol='triangle-up')),
+                         row=1, col=1)
+        
+        if len(sell_signals) > 0:
+            fig.add_trace(go.Scatter(x=sell_signals['Time'], y=sell_signals['Price'],
+                                   mode='markers', name='Sell Signal',
+                                   marker=dict(color='red', size=10, symbol='triangle-down')),
+                         row=1, col=1)
+    
+    fig.update_layout(title='OLAELEC Trading Strategy - Live Data',
+                     xaxis_rangeslider_visible=False,
+                     height=800)
+    
+    return fig
+
+def execute_trade(api, signal_type, quantity, symbol="OLAELEC-EQ"):
+    """Execute trade through Flattrade API"""
+    try:
+        buy_or_sell = 'B' if signal_type == 'BUY' else 'S'
+        
+        result = api.place_order(
+            buy_or_sell=buy_or_sell,
+            product_type='C',  # Cash
+            exchange='NSE',
+            tradingsymbol=symbol,
+            quantity=quantity,
+            discloseqty=0,
+            price_type='MKT',  # Market order
+            retention='DAY'
+        )
+        
+        return result
+    except Exception as e:
+        st.error(f"Error executing trade: {e}")
+        return None
+
+def save_trade_to_db(supabase, trade_data):
+    """Save trade data to Supabase"""
+    try:
+        result = supabase.table('trades').insert(trade_data).execute()
+        return result
+    except Exception as e:
+        st.error(f"Error saving trade to database: {e}")
+        return None
+
+def main():
+    st.set_page_config(page_title="OLAELEC Trading App", layout="wide")
+    
+    st.title("OLAELEC Trading Strategy App - Live Data")
+    
+    # Initialize connections
+    try:
+        supabase = init_supabase()
+        api = init_flattrade_api()
+        strategy = OLAELECStrategy()
+        
+        # Test API connection
+        try:
+            api_status = api.get_limits()
+            if api_status and api_status.get('stat') != 'Ok':
+                st.error("Failed to connect to Flattrade API. Please check credentials.")
+                return
+        except Exception as e:
+            st.error(f"API connection failed: {e}")
+            return
+            
+    except Exception as e:
+        st.error(f"Error initializing APIs: {e}")
+        return
+    
+    # Sidebar for controls
+    with st.sidebar:
+        st.header("Trading Controls")
+        
+        # Trading parameters
+        st.subheader("Strategy Parameters")
+        profit_target = st.slider("Profit Target (%)", 1, 10, 4) / 100
+        strategy.profit_target = profit_target
+        
+        quantity = st.number_input("Quantity", min_value=1, value=1)
+        symbol = st.text_input("Trading Symbol", value="OLAELEC")
+        
+        # Auto-trading toggle
+        auto_trading = st.toggle("Enable Auto Trading", False)
+        
+        # Manual trade buttons
+        st.subheader("Manual Trading")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("🔴 Manual Sell", type="secondary"):
+                if auto_trading:
+                    result = execute_trade(api, 'SELL', quantity, f"{symbol}-EQ")
+                    if result and result.get('stat') == 'Ok':
+                        st.success(f"Sell order placed: {result.get('norenordno')}")
+                    else:
+                        st.error("Failed to place sell order")
+        
+        with col2:
+            if st.button("🟢 Manual Buy", type="primary"):
+                if auto_trading:
+                    result = execute_trade(api, 'BUY', quantity, f"{symbol}-EQ")
+                    if result and result.get('stat') == 'Ok':
+                        st.success(f"Buy order placed: {result.get('norenordno')}")
+                    else:
+                        st.error("Failed to place buy order")
+    
+    # Main content area
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.subheader("📈 Live Market Data & Signals")
+        
+        # Load and display market data
+        with st.spinner("Loading live market data..."):
+            df = load_market_data(api, symbol)
+        
+        if df is not None and len(df) > 0:
+            # Get current signals
+            current_time = datetime.now().time()
+            current_date = datetime.now().date()
+            
+            strategy.reset_daily_flags(current_date)
+            
+            # Get live price
+            live_price = get_live_price(api, symbol)
+            
+            if strategy.check_time_constraints(current_time):
+                buy_signal, sell_signal = strategy.get_signals(df)
+                
+                # Display current signals
+                signal_col1, signal_col2, signal_col3 = st.columns(3)
+                
+                with signal_col1:
+                    if buy_signal:
+                        st.success("🟢 BUY SIGNAL ACTIVE")
+                    else:
+                        st.info("⚪ No Buy Signal")
+                
+                with signal_col2:
+                    if sell_signal:
+                        st.error("🔴 SELL SIGNAL ACTIVE")
+                    else:
+                        st.info("⚪ No Sell Signal")
+                
+                with signal_col3:
+                    current_price = live_price if live_price else df['Close'].iloc[-1]
+                    st.metric("Live Price", f"₹{current_price:.2f}")
+                
+                # Auto-execute trades
+                if auto_trading:
+                    if buy_signal and not strategy.current_position:
+                        result = execute_trade(api, 'BUY', quantity, f"{symbol}-EQ")
+                        if result and result.get('stat') == 'Ok':
+                            strategy.current_position = 'long'
+                            strategy.position_size = quantity
+                            strategy.entry_price = current_price
+                            st.success("✅ Auto Buy Order Executed!")
+                    
+                    elif sell_signal and not strategy.current_position:
+                        result = execute_trade(api, 'SELL', quantity, f"{symbol}-EQ")
+                        if result and result.get('stat') == 'Ok':
+                            strategy.current_position = 'short'
+                            strategy.position_size = quantity
+                            strategy.entry_price = current_price
+                            st.success("✅ Auto Sell Order Executed!")
+                    
+                    # Check exit conditions
+                    if strategy.check_exit_conditions(current_price):
+                        exit_signal = 'SELL' if strategy.current_position == 'long' else 'BUY'
+                        result = execute_trade(api, exit_signal, strategy.position_size, f"{symbol}-EQ")
+                        if result and result.get('stat') == 'Ok':
+                            strategy.current_position = None
+                            strategy.position_size = 0
+                            strategy.entry_price = None
+                            strategy.target_hit_today = True
+                            st.success("✅ Position Closed at Target!")
+            
+            else:
+                st.warning("⏰ Outside Trading Hours (9:30 AM - 3:20 PM)")
+            
+            # Create and display chart
+            chart = create_chart(df)
+            st.plotly_chart(chart, use_container_width=True)
+            
+            # Display latest data
+            st.subheader("📊 Latest OHLC Data")
+            st.dataframe(df.tail(5), use_container_width=True)
+        
+        else:
+            st.error("Failed to load market data or no data available")
+    
+    with col2:
+        st.subheader("📊 Position & Status")
+        
+        # Current position status
+        if strategy.current_position:
+            st.info(f"Position: {strategy.current_position.upper()}")
+            st.info(f"Size: {strategy.position_size}")
+            st.info(f"Entry: ₹{strategy.entry_price:.2f}")
+            
+            if df is not None:
+                live_price = get_live_price(api, symbol)
+                current_price = live_price if live_price else df['Close'].iloc[-1]
+                
+                if strategy.current_position == 'long':
+                    pnl = (current_price - strategy.entry_price) * strategy.position_size
+                    pnl_pct = (current_price - strategy.entry_price) / strategy.entry_price * 100
+                else:
+                    pnl = (strategy.entry_price - current_price) * strategy.position_size
+                    pnl_pct = (strategy.entry_price - current_price) / strategy.entry_price * 100
+                
+                if pnl >= 0:
+                    st.success(f"P&L: +₹{pnl:.2f} ({pnl_pct:.2f}%)")
+                else:
+                    st.error(f"P&L: ₹{pnl:.2f} ({pnl_pct:.2f}%)")
+        else:
+            st.info("No Open Position")
+        
+        # Account status
+        st.subheader("💰 Account Status")
+        try:
+            account_details = api.get_limits()
+            if account_details and account_details.get('stat') == 'Ok':
+                cash = account_details.get('cash', 'N/A')
+                margin_used = account_details.get('marginused', 'N/A')
+                
+                st.info(f"Cash: ₹{cash}")
+                st.info(f"Margin Used: ₹{margin_used}")
+            else:
+                st.warning("Could not fetch account details")
+        except Exception as e:
+            st.warning(f"Could not fetch account details: {e}")
+        
+        # Recent trades
+        st.subheader("📋 Recent Orders")
+        try:
+            orders = api.get_order_book()
+            if orders and len(orders) > 0:
+                # Convert to DataFrame and show relevant columns
+                orders_df = pd.DataFrame(orders)
+                display_cols = ['tsym', 'trantype', 'qty', 'prc', 'status']
+                available_cols = [col for col in display_cols if col in orders_df.columns]
+                
+                if available_cols:
+                    st.dataframe(orders_df[available_cols].head(5), use_container_width=True)
+                else:
+                    st.dataframe(orders_df.head(5), use_container_width=True)
+            else:
+                st.info("No recent orders")
+        except Exception as e:
+            st.warning(f"Could not fetch orders: {e}")
+        
+        # Refresh button
+        if st.button("🔄 Refresh Data", type="secondary"):
+            st.rerun()
 
 if __name__ == "__main__":
-    st.title("Trade Monitor Dashboard")
-    with st.sidebar:
-        st.header("Tradetron API Credentials")
-        st.text("Tradetron API has been removed.")
-        if st.button("🔄 Refresh LTP (Disabled)", type="secondary"):
-            st.info("LTP refresh is currently disabled.")
-
-    # Main dashboard view
-    st.subheader("📊 Live Positions & P&L")
-    st.markdown("---")
-
-    # The main trade logic loop
-    if st.button("Run Trade Logic"):
-        # Reset daily flags for the strategy if a new day has started
-        st.session_state.strategy.reset_daily_flags(datetime.date.today())
-
-        # Placeholder for data fetching - replace with your actual data fetching function
-        # For demonstration, we will use mock data
-        symbol_token_map = get_nifty500_symbols()
-        symbols_to_screen = list(symbol_token_map.keys())[:10] # Screen first 10 for demo
-
-        for tsym in symbols_to_screen:
-            # Mock data fetch. In a real app, this would be a live API call
-            mock_data = {
-                'Open': [100, 105],
-                'High': [110, 112],
-                'Low': [98, 103],
-                'Close': [105, 108],
-                'Volume': [1000, 1200]
-            }
-            mock_df = pd.DataFrame(mock_data)
-
-            # Use the strategy to get signals
-            buy_signal, sell_signal = st.session_state.strategy.get_signals(mock_df)
-            
-            # Check for entry conditions
-            if buy_signal and st.session_state.strategy.current_position is None:
-                st.session_state.strategy.current_position = 'long'
-                st.session_state.strategy.entry_price = mock_df.iloc[-1]['Close']
-                st.info(f"Buy Signal for {tsym} at {st.session_state.strategy.entry_price}")
-            
-            if sell_signal and st.session_state.strategy.current_position is None:
-                st.session_state.strategy.current_position = 'short'
-                st.session_state.strategy.entry_price = mock_df.iloc[-1]['Close']
-                st.info(f"Sell Signal for {tsym} at {st.session_state.strategy.entry_price}")
-
-            # Check for exit conditions
-            if st.session_state.strategy.current_position:
-                current_ltp = mock_df.iloc[-1]['Close'] # Using mock data, replace with live LTP
-                if st.session_state.strategy.check_exit_conditions(current_ltp):
-                    st.success(f"Exit Signal for {tsym} at {current_ltp}")
-                    st.session_state.strategy.current_position = None
-                    st.session_state.strategy.entry_price = None
-
-    display_trades_with_unique_keys()
+    main()
