@@ -1,372 +1,427 @@
 import streamlit as st
-import pandas as pd
-import numpy as np
 import os
 import sys
 import logging
-from datetime import datetime, time, timedelta
-import time as time_module
+import datetime
+import time
+import pandas as pd
 from supabase import create_client, Client
-import json
-import requests
-import io
 
-# --- Configuration & Logging ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Add the parent directory to the sys.path to import api_helper
+# This assumes api_helper.py is in the parent directory of this script.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from api_helper import NorenApiPy
 
-# Assuming api_helper.py is in the parent directory
+# Import the OLAELECStrategy class from ola.py
 try:
-    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from api_helper import NorenApiPy
+    from ola import OLAELECStrategy
 except ImportError:
-    st.error("Could not import NorenApiPy. Please ensure api_helper.py is in the correct path.")
+    st.error("Error: Could not import OLAELECStrategy. Please ensure ola.py is in the same directory.")
     st.stop()
 
+# --- Configuration ---
+# Set logging level to DEBUG to see all detailed messages
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
 # --- Flattrade API Credentials ---
-# IMPORTANT: Replace these with your actual credentials or use Streamlit secrets.
-USER_SESSION = "YOUR_FLATTRADE_SESSION_TOKEN_HERE"
-USER_ID = "YOUR_FLATTRADE_USER_ID_HERE"
-FLATTRADE_PASSWORD = "YOUR_FLATTRADE_PASSWORD_HERE"
+USER_SESSION = st.secrets.get("FLATTRADE_USER_SESSION", "a36fe10399fcc8d580ae35c795d8593b7676a1fde2ce2a80073dfa23d6430bbb")
+USER_ID = st.secrets.get("FLATTRADE_USER_ID", "FZ03508")
 
 # --- Supabase Credentials ---
-# IMPORTANT: Replace these with your actual Supabase credentials.
-SUPABASE_URL = "YOUR_SUPABASE_URL_HERE"
-SUPABASE_KEY = "YOUR_SUPABASE_KEY_HERE"
+SUPABASE_URL = st.secrets.get("SUPABASE_URL","https://zybakxpyibubzjhzdcwl.supabase.co")
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY","eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp5YmFreHB5aWJ1YnpqaHpkY3dsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQ4OTQyMDgsImV4cCI6MjA3MDQ3MDIwOH0.8ZqreKy5zg_M-B1uH79T6lQXn62eRvvouo_OiMjwqGU")
 
-# Global variables for API and Supabase clients
-api = None
-supabase_client: Client = None
+EXCHANGE = 'NSE'
+CANDLE_INTERVAL = '1'  # 1-minute candles
+REQUIRED_CANDLES = 21 # Latest candle + previous 20 for calculations
 
-# --- API and DB Initialization Functions ---
-def initialize_flattrade_api():
-    global api
-    if api is None:
-        try:
-            api = NorenApiPy()
-            # Attempt a login to get session
-            login_result = api.login(userid=USER_ID, password=FLATTRADE_PASSWORD, twofa="YOUR_2FA_TOKEN_HERE", vendor_code="YOUR_VENDOR_CODE_HERE")
-            if login_result['stat'] == 'Ok':
-                api.set_session(USER_ID, USER_SESSION)
-                logging.info(f"Flattrade API initialized and session set for {USER_ID}")
-                return api
-            else:
-                st.error(f"Failed to log in to Flattrade API. Error: {login_result.get('emsg', 'Unknown')}")
-                return None
-        except Exception as e:
-            st.error(f"Failed to initialize Flattrade API: {e}")
-            return None
-    return api
+# --- Entry/Exit Buffers and Risk Parameters (Constants) ---
+ENTRY_BUFFER_PERCENT = 0.0005 # 0.05% buffer for crossing high/low for entry
+RISK_PERCENTAGE_OF_CAPITAL = 0.01 # 1% of capital risked per trade
 
-def initialize_supabase_client():
-    global supabase_client
-    if supabase_client is None:
-        try:
-            supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-            logging.info("Supabase client initialized successfully.")
-            return supabase_client
-        except Exception as e:
-            st.error(f"Failed to initialize Supabase client: {e}")
-            return None
-    return supabase_client
 
-# --- Data Loading and Processing ---
-def load_nse_equity_stocks():
-    """Simulates loading a list of stocks from nse_equity.csv."""
-    # In a real scenario, you would load this from a file.
-    # For demonstration, we'll use a small, hardcoded list.
-    data = """\
-symbol,token
-RELIANCE,2885
-TCS,11536
-HDFCBANK,1333
-INFY,1594
-HINDUNILVR,1394"""
-    df = pd.read_csv(io.StringIO(data))
-    return df
+# --- Initialize ALL session state variables first and foremost ---
+if 'simple_counter' not in st.session_state:
+    st.session_state.simple_counter = 0
+if 'widget_key_tracker' not in st.session_state:
+    st.session_state.widget_key_tracker = {}
+if 'volume_multiplier' not in st.session_state:
+    st.session_state.volume_multiplier = 10
+if 'traded_value_threshold' not in st.session_state:
+    st.session_state.traded_value_threshold = 10000000
+if 'high_low_diff_multiplier' not in st.session_state:
+    st.session_state.high_low_diff_multiplier = 4
+if 'capital' not in st.session_state:
+    st.session_state.capital = 1000
+if 'target_multiplier' not in st.session_state:
+    st.session_state.target_multiplier = 4
+if 'sl_buffer_points' not in st.session_state:
+    st.session_state.sl_buffer_points = 0.25
+if 'trailing_step_points' not in st.session_state:
+    st.session_state.trailing_step_points = 1.00
 
-def calculate_sdvwap(df, sd_multiplier=1):
-    """
-    Calculates VWAP and a standard deviation band around it.
-    Args:
-        df (pd.DataFrame): DataFrame with 'time', 'vwap', 'c' (close), 'v' (volume) columns.
-        sd_multiplier (float): Multiplier for the standard deviation band.
-    Returns:
-        tuple: (vwap_series, upper_band, lower_band)
-    """
-    df = df.copy()
-    if 'v' not in df.columns or 'c' not in df.columns:
-        return None, None, None
-    
-    # Calculate VWAP
-    df['cum_volume'] = df['v'].cumsum()
-    df['cum_price_volume'] = (df['c'] * df['v']).cumsum()
-    df['vwap'] = df['cum_price_volume'] / df['cum_volume']
+if 'pending_entries' not in st.session_state:
+    st.session_state.pending_entries = {}
+if 'open_tracked_trades' not in st.session_state:
+    st.session_state.open_tracked_trades = {}
+if 'manual_overrides' not in st.session_state:
+    st.session_state.manual_overrides = {}
+if 'market_watch_symbols' not in st.session_state:
+    st.session_state.market_watch_symbols = []
+if 'supabase_loaded' not in st.session_state:
+    st.session_state.supabase_loaded = False
+if 'exit_all_triggered_today' not in st.session_state:
+    st.session_state.exit_all_triggered_today = False
+if 'last_run_date' not in st.session_state:
+    st.session_state.last_run_date = datetime.date.today()
+if 'market_watch_source' not in st.session_state:
+    st.session_state.market_watch_source = "Flattrade (NorenApiPy)"
+if 'daily_traded_symbols' not in st.session_state:
+    st.session_state.daily_traded_symbols = set()
+if 'last_reset_date' not in st.session_state:
+    st.session_state.last_reset_date = datetime.date.today()
+if 'strategy' not in st.session_state:
+    st.session_state.strategy = OLAELECStrategy()
 
-    # Calculate Standard Deviation of price from VWAP
-    df['vwap_deviation'] = (df['c'] - df['vwap'])**2 * df['v']
-    df['vwap_variance'] = df['vwap_deviation'].cumsum() / df['cum_volume']
-    df['sd'] = np.sqrt(df['vwap_variance'])
+# Reset daily traded symbols at start of new day
+current_date = datetime.date.today()
+if st.session_state.last_reset_date != current_date:
+    st.session_state.daily_traded_symbols = set()
+    st.session_state.last_reset_date = current_date
+    st.session_state.strategy.reset_daily_flags(current_date)
 
-    upper_band = df['vwap'] + (df['sd'] * sd_multiplier)
-    lower_band = df['vwap'] - (df['sd'] * sd_multiplier)
-    
-    return df['vwap'], upper_band, lower_band
+# --- End of session state initialization ---
 
-# --- Supabase Functions ---
-def upsert_trade_to_supabase(trade_data):
-    """Inserts or updates a trade record in Supabase."""
+# Global for Supabase client
+supabase: 'Client' = None
+
+@st.cache_resource
+def get_supabase_client(url, key):
+    """Initializes and caches the Supabase client."""
+    if not url or not key:
+        st.error("Supabase URL or Key is not set in Streamlit secrets. Please configure them.")
+        return None
     try:
-        response = supabase_client.table('trades').upsert(trade_data).execute()
-        return response
+        return create_client(url, key)
     except Exception as e:
-        logging.error(f"Failed to upsert trade data to Supabase: {e}")
+        st.error(f"Error connecting to Supabase: {e}. Please check your credentials.")
         return None
 
-def get_tracked_trades_from_supabase():
-    """Fetches all tracked trades from Supabase."""
-    try:
-        response = supabase_client.table('trades').select('*').execute()
-        if response.data:
-            return pd.DataFrame(response.data)
-        return pd.DataFrame()
-    except Exception as e:
-        logging.error(f"Failed to fetch trades from Supabase: {e}")
-        return pd.DataFrame()
+# Initialize Supabase client
+supabase = get_supabase_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- Core Trading Logic ---
-def check_trading_conditions(symbol, token, api_client, supa_client, tracked_trades, sd_multiplier=1):
+if supabase is None:
+    st.stop() # Stop the app if Supabase connection fails
+
+# SOLUTION 1: Define current_manual_sl before using it
+def fix_manual_sl_input_v1(cols, tsym):
     """
-    Checks for the "two green or red candles" condition and manages trades.
+    Fix by defining current_manual_sl from session state
     """
-    st.info(f"Scanning {symbol}...")
-    try:
-        # Get historical data (1-minute candles)
-        end_time = datetime.now()
-        start_time = end_time - timedelta(minutes=15) # Fetch 15 minutes of data
-        history = api_client.get_history(exchange='NSE', token=token, starttime=start_time.timestamp(), interval='1')
-        
-        if not history or history['stat'] != 'Ok' or not history['values']:
-            logging.warning(f"No history data found for {symbol}")
-            return
-        
-        df = pd.DataFrame(history['values'])
-        
-        # Calculate SDVWAP bands
-        vwap, upper_band, lower_band = calculate_sdvwap(df, sd_multiplier)
-        if vwap is None:
-            logging.warning(f"Could not calculate SDVWAP for {symbol}")
-            return
-        
-        # Get the last two candles
-        last_two_candles = df.iloc[-2:]
-        if len(last_two_candles) < 2:
-            return
+    current_manual_sl = st.session_state.manual_overrides.get(tsym, {}).get('sl_price')
+    if current_manual_sl is None or current_manual_sl <= 0:
+        current_manual_sl = 0.0
 
-        last_candle = last_two_candles.iloc[1]
-        second_last_candle = last_two_candles.iloc[0]
+    unique_timestamp = int(time.time() * 1000000)
 
-        is_last_green = last_candle['c'] > last_candle['o']
-        is_second_last_green = second_last_candle['c'] > second_last_candle['o']
-        is_last_red = last_candle['c'] < last_candle['o']
-        is_second_last_red = second_last_candle['c'] < second_last_candle['o']
-
-        # Check conditions
-        is_above_band = last_candle['c'] > upper_band.iloc[-1] and second_last_candle['c'] > upper_band.iloc[-2]
-        is_below_band = last_candle['c'] < lower_band.iloc[-1] and second_last_candle['c'] < lower_band.iloc[-2]
-
-        is_two_green = is_last_green and is_second_last_green
-        is_two_red = is_last_red and is_second_last_red
-
-        current_price = last_candle['c']
-        
-        # Check if the stock is already being tracked
-        tracked_trade = tracked_trades[tracked_trades['tsym'] == symbol]
-        is_tracked = not tracked_trade.empty
-        
-        # --- Trading Logic ---
-        if is_two_red and is_below_band and not is_tracked:
-            # Condition met to initiate a long trade (two red candles below band)
-            logging.info(f"LONG signal found for {symbol} at {current_price}")
-            # Define trade details
-            trade_data = {
-                'tsym': symbol,
-                'token': token,
-                'status': 'Open',
-                'entry_price': current_price,
-                'quantity': 1, # Initial quantity
-                'side': 'BUY',
-                'entry_time': datetime.now().isoformat(),
-            }
-            upsert_trade_to_supabase(trade_data)
-            st.success(f"Trade opened for {symbol}. Side: LONG")
-            
-        elif is_two_green and is_above_band and not is_tracked:
-            # Condition met to initiate a short trade (two green candles above band)
-            logging.info(f"SHORT signal found for {symbol} at {current_price}")
-            trade_data = {
-                'tsym': symbol,
-                'token': token,
-                'status': 'Open',
-                'entry_price': current_price,
-                'quantity': 1,
-                'side': 'SELL',
-                'entry_time': datetime.now().isoformat(),
-            }
-            upsert_trade_to_supabase(trade_data)
-            st.success(f"Trade opened for {symbol}. Side: SHORT")
-
-        # --- Reversal & Increasing Quantity ---
-        elif is_tracked:
-            trade = tracked_trade.iloc[0]
-            current_side = trade['side']
-            
-            # Reversal check for open trades
-            if current_side == 'BUY' and is_two_green and is_above_band:
-                # Reversal from long to short, or increasing quantity
-                new_quantity = trade['quantity'] + 1
-                logging.info(f"Increasing quantity for {symbol} at {current_price}. New quantity: {new_quantity}")
-                upsert_trade_to_supabase({
-                    'tsym': symbol,
-                    'quantity': new_quantity
-                })
-                st.warning(f"Increasing quantity for {symbol}. New quantity: {new_quantity}")
-                
-            elif current_side == 'SELL' and is_two_red and is_below_band:
-                # Reversal from short to long, or increasing quantity
-                new_quantity = trade['quantity'] + 1
-                logging.info(f"Increasing quantity for {symbol} at {current_price}. New quantity: {new_quantity}")
-                upsert_trade_to_supabase({
-                    'tsym': symbol,
-                    'quantity': new_quantity
-                })
-                st.warning(f"Increasing quantity for {symbol}. New quantity: {new_quantity}")
-
-        # --- Close Trade at Target ---
-        if is_tracked:
-            trade = tracked_trade.iloc[0]
-            entry_price = trade['entry_price']
-            side = trade['side']
-            quantity = trade['quantity']
-            
-            # Simple target price: 1% from entry
-            target_price = entry_price * (1.01) if side == 'BUY' else entry_price * (0.99)
-            
-            if (side == 'BUY' and current_price >= target_price) or \
-               (side == 'SELL' and current_price <= target_price):
-                
-                logging.info(f"Target hit for {symbol}. Closing trade at {current_price}.")
-                # Here you would place a square-off order with the Flattrade API
-                # api_client.place_order(buy_or_sell="SELL" if side == "BUY" else "BUY", ...)
-                
-                # Update Supabase to close the trade
-                upsert_trade_to_supabase({
-                    'tsym': symbol,
-                    'status': 'Closed',
-                    'exit_price': current_price,
-                    'exit_time': datetime.now().isoformat()
-                })
-                st.success(f"Trade for {symbol} closed. Target hit.")
-    
-    except Exception as e:
-        logging.error(f"Error checking trading conditions for {symbol}: {e}")
-
-# --- Streamlit App UI ---
-def main():
-    st.set_page_config(
-        page_title="Flattrade SDVWAP Scanner",
-        page_icon="📊",
-        layout="wide"
+    new_manual_sl = cols[8].number_input(
+        "Manual SL",
+        value=current_manual_sl,
+        step=0.01,
+        format="%.2f",
+        key=f'manual_sl_{tsym}_pending_{unique_timestamp}_{hash(tsym) % 1000}'
     )
+    return new_manual_sl
 
-    st.title("📊 Flattrade Automated SDVWAP Scanner")
-    st.markdown("This app scans NSE stocks for trading signals and manages positions using the Flattrade API.")
+def display_trades_with_unique_keys():
+    """
+    Display trades with guaranteed unique keys
+    """
+    if hasattr(st.session_state, 'pending_trades'):
+        display_trades_safely(st.session_state.pending_trades, "pending")
+        st.subheader("📋 Pending Trades")
+        for tsym, trade_data in st.session_state.pending_trades.items():
+            cols = st.columns([1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+            cols[0].write(tsym)
+            cols[1].write(trade_data.get('buy_or_sell', 'N/A'))
+            cols[2].write(str(trade_data.get('quantity', 0)))
+            current_manual_sl = st.session_state.manual_overrides.get(tsym, {}).get('sl_price', 0.0)
+            if current_manual_sl is None or current_manual_sl < 0:
+                current_manual_sl = 0.0
+            st.session_state.simple_counter += 1
+            unique_key = f"manual_sl_{tsym}_pending_{st.session_state.simple_counter}"
+            new_manual_sl = cols[8].number_input(
+                "Manual SL",
+                value=current_manual_sl,
+                step=0.01,
+                format="%.2f",
+                key=unique_key
+            )
+    if hasattr(st.session_state, 'open_tracked_trades'):
+        display_trades_safely(st.session_state.open_tracked_trades, "open")
+        st.subheader("🔄 Open Trades")
+        for tsym, trade_info in st.session_state.open_tracked_trades.items():
+            cols = st.columns([1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+            cols[0].write(tsym)
+            cols[1].write(trade_info.get('buy_or_sell', 'N/A'))
+            cols[2].write(str(trade_info.get('quantity', 0)))
+            current_manual_sl = st.session_state.manual_overrides.get(tsym, {}).get('sl_price', 0.0)
+            if current_manual_sl is None or current_manual_sl < 0:
+                current_manual_sl = trade_info.get('sl_price', 0.0)
+            st.session_state.simple_counter += 1
+            unique_key = f"manual_sl_{tsym}_open_{st.session_state.simple_counter}"
+            new_manual_sl = cols[8].number_input(
+                "Manual SL",
+                value=current_manual_sl,
+                step=0.01,
+                format="%.2f",
+                key=unique_key
+            )
+            if new_manual_sl != current_manual_sl:
+                if tsym not in st.session_state.manual_overrides:
+                    st.session_state.manual_overrides[tsym] = {}
+                st.session_state.manual_overrides[tsym]['sl_price'] = new_manual_sl
 
-    # --- Sidebar Controls ---
-    with st.sidebar:
-        st.header("⚙️ Settings")
-        scan_interval = st.slider("Scan Interval (seconds)", 30, 300, 60, 30)
-        sd_multiplier_input = st.number_input("SDVWAP Band Multiplier", 0.5, 3.0, 1.0, 0.1)
-
-        st.markdown("---")
-        run_screener = st.button("▶️ Start Screener", type="primary")
-        stop_screener = st.button("⏹️ Stop Screener", type="secondary")
-        
-        st.markdown("---")
-        st.write("For this app to work, you must set up a `trades` table in your Supabase database with columns like `tsym`, `status`, `entry_price`, `quantity`, etc.")
-
-    # Initialize API and DB clients
-    flattrade_api = initialize_flattrade_api()
-    supabase_db = initialize_supabase_client()
-
-    if not flattrade_api or not supabase_db:
-        st.warning("API or Supabase initialization failed. Please check your credentials.")
-        st.stop()
-
-    # --- Main App Body ---
-    st.subheader("🔥 Live Screener Status")
-    status_placeholder = st.empty()
-    
-    if run_screener:
-        status_placeholder.info("Screener is running...")
-        
-        # Load stocks
-        stocks_df = load_nse_equity_stocks()
-        if stocks_df.empty:
-            st.error("No stocks found in nse_equity.csv. Please upload a valid file.")
-        else:
-            # Main screening loop
-            while run_screener:
-                start_time = time_module.time()
-                tracked_trades = get_tracked_trades_from_supabase()
-
-                for index, row in stocks_df.iterrows():
-                    symbol = row['symbol']
-                    token = str(row['token'])
-                    check_trading_conditions(symbol, token, flattrade_api, supabase_db, tracked_trades, sd_multiplier_input)
-
-                end_time = time_module.time()
-                time_taken = end_time - start_time
-                remaining_time = max(0, scan_interval - time_taken)
-                
-                status_placeholder.info(f"Scan cycle complete. Next scan in {int(remaining_time)} seconds...")
-                time_module.sleep(remaining_time)
-                
-    elif stop_screener:
-        status_placeholder.warning("Screener stopped.")
-        
-    # --- Display Tracked Trades ---
-    st.subheader("📋 Tracked Positions")
-    tracked_trades_df = get_tracked_trades_from_supabase()
-    
-    if not tracked_trades_df.empty:
-        # Filter for open trades
-        open_trades = tracked_trades_df[tracked_trades_df['status'] == 'Open']
-        if not open_trades.empty:
-            st.dataframe(open_trades, use_container_width=True)
-        else:
-            st.info("No open trades being tracked.")
-    else:
-        st.info("No trades in the database.")
-        
-    st.write("---")
-    st.subheader("🚀 Account Details")
+# --- Supabase Database Operations ---
+def upsert_trade_to_supabase(trade_data):
+    """Inserts or updates a trade record in Supabase."""
+    tsym = trade_data['tsym']
+    for key, value in trade_data.items():
+        if value is None:
+            trade_data[key] = None
+        elif isinstance(value, float) and (value == float('inf') or value == float('-inf') or pd.isna(value)):
+             trade_data[key] = None
     try:
-        limits = flattrade_api.get_limits()
-        if limits and limits.get('stat') == 'Ok':
-            cash = limits.get('cash', 'N/A')
-            margin_used = limits.get('marginused', 'N/A')
-            st.info(f"**Cash:** ₹{cash} | **Margin Used:** ₹{margin_used}")
+        response = supabase.from_('app_tracked_trades').select('id').eq('tsym', tsym).limit(1).execute()
+        if response.data:
+            trade_id = response.data[0]['id']
+            data_to_update = {k: v for k, v in trade_data.items() if k not in ['id', 'created_at']}
+            updated_response = supabase.from_('app_tracked_trades').update(data_to_update).eq('id', trade_id).execute()
+            if updated_response.data:
+                logging.info(f"Updated trade {tsym} in Supabase: {updated_response.data}")
+                return True
+            else:
+                logging.error(f"Failed to update trade {tsym} in Supabase: {updated_response.status_code} - {updated_response.get('error', 'No error message')}")
+                return False
         else:
-            st.warning("Could not fetch account details.")
+            data_to_insert = {k: v for k, v in trade_data.items() if k != 'id'}
+            inserted_response = supabase.from_('app_tracked_trades').insert(data_to_insert).execute()
+            if inserted_response.data:
+                logging.info(f"Inserted new trade {tsym} into Supabase: {inserted_response.data}")
+                return True
+            else:
+                logging.error(f"Failed to insert trade {tsym} into Supabase: {inserted_response.status_code} - {inserted_response.get('error', 'No error message')}")
+                return False
     except Exception as e:
-        st.warning(f"Could not fetch account details: {e}")
-        
-    if st.button("🔄 Refresh Data", type="secondary"):
-        st.rerun()
+        logging.error(f"Supabase upsert error for {tsym}: {e}", exc_info=True)
+        return False
+
+def delete_trade_from_supabase(tsym):
+    """Deletes a trade record from Supabase."""
+    try:
+        response = supabase.from_('app_tracked_trades').delete().eq('tsym', tsym).execute()
+        if response.data:
+            logging.info(f"Deleted trade {tsym} from Supabase: {response.data}")
+            return True
+        else:
+            logging.error(f"Failed to delete trade {tsym} from Supabase: {response.status_code} - {response.get('error', 'No error message')}")
+            return False
+    except Exception as e:
+        logging.error(f"Supabase delete error for {tsym}: {e}", exc_info=True)
+        return False
+
+def load_tracked_trades_from_supabase():
+    """Loads today's tracked trades from Supabase into session state."""
+    try:
+        today_start = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        response = supabase.from_('app_tracked_trades').select('*').gt('created_at', today_start).execute()
+        if response.data:
+            logging.info(f"Loaded {len(response.data)} trades from Supabase for today.")
+            for trade_record in response.data:
+                tsym = trade_record['tsym']
+                status = trade_record['status']
+                for key in ['entry_price', 'sl_price', 'target_price', 'highest_price_seen',
+                            'lowest_price_seen', 'signal_candle_high', 'signal_candle_low',
+                            'manual_sl_price', 'manual_target_price']:
+                    if key in trade_record and trade_record[key] is not None:
+                        try:
+                            trade_record[key] = float(trade_record[key])
+                        except (ValueError, TypeError):
+                            trade_record[key] = None
+                if status == 'PENDING':
+                    st.session_state.pending_entries[tsym] = {
+                        'buy_or_sell': trade_record['buy_or_sell'],
+                        'signal_candle_high': trade_record['signal_candle_high'],
+                        'signal_candle_low': trade_record['signal_candle_low'],
+                        'calculated_quantity': trade_record['quantity'],
+                        'initial_sl_price': trade_record['sl_price'],
+                        'initial_tp_price': trade_record['target_price'],
+                        'status': 'PENDING',
+                        'token': trade_record['token'],
+                        'current_ltp': None
+                    }
+                    if trade_record['manual_sl_price'] is not None or trade_record['manual_target_price'] is not None:
+                         st.session_state.manual_overrides.setdefault(tsym, {})['sl_price'] = trade_record['manual_sl_price']
+                         st.session_state.manual_overrides.setdefault(tsym, {})['target_price'] = trade_record['manual_target_price']
+                elif status == 'OPEN':
+                    st.session_state.open_tracked_trades[tsym] = {
+                        'order_no': trade_record.get('order_no'),
+                        'entry_price': trade_record['entry_price'],
+                        'quantity': trade_record['quantity'],
+                        'sl_price': trade_record['sl_price'],
+                        'target_price': trade_record['target_price'],
+                        'buy_or_sell': trade_record['buy_or_sell'],
+                        'status': 'OPEN',
+                        'token': trade_record['token'],
+                        'highest_price_seen': trade_record['highest_price_seen'],
+                        'lowest_price_seen': trade_record['lowest_price_seen'],
+                        'current_ltp': None
+                    }
+                    if trade_record['manual_sl_price'] is not None or trade_record['manual_target_price'] is not None:
+                         st.session_state.manual_overrides.setdefault(tsym, {})['sl_price'] = trade_record['manual_sl_price']
+                         st.session_state.manual_overrides.setdefault(tsym, {})['target_price'] = trade_record['manual_target_price']
+            return True
+        else:
+            logging.info("No trades found in Supabase for today.")
+            return False
+    except Exception as e:
+        logging.error(f"Supabase load error: {e}", exc_info=True)
+        return False
+
+if not st.session_state.supabase_loaded:
+    if load_tracked_trades_from_supabase():
+        st.session_state.supabase_loaded = True
+    else:
+        st.session_state.supabase_loaded = True
+
+# --- Initialize Flattrade API (cached for Streamlit efficiency) ---
+@st.cache_resource
+def get_api_instance(user_id, user_session):
+    """Initializes and caches the NorenApiPy instance."""
+    api = NorenApiPy()
+    logging.info("Attempting to set API session...")
+    try:
+        ret = api.set_session(userid=user_id, password='', usertoken=user_session)
+        if ret is True or (isinstance(ret, dict) and ret.get('stat') == 'Ok'):
+            logging.info(f"API session set successfully for user: {user_id}")
+            st.success(f"API session connected for user: {user_id}")
+            return api
+        else:
+            error_msg = ret.get('emsg', 'Unknown error') if isinstance(ret, dict) else str(ret)
+            st.error(f"Failed to set API session: {error_msg}. Please check your credentials.")
+            logging.critical(f"Failed to set API session: {error_msg}")
+            return None
+    except Exception as e:
+        st.error(f"An exception occurred during API session setup: {e}")
+        logging.critical(f"An exception occurred during API session setup: {e}", exc_info=True)
+        return None
+
+api = get_api_instance(USER_ID, USER_SESSION)
+
+if api is None:
+    st.stop()
+
+@st.cache_data
+def load_symbols_from_csv(file_path="NSE_Equity.csv"):
+    """Loads stock symbols and tokens from the provided CSV file."""
+    try:
+        df = pd.read_csv(file_path)
+        if all(col in df.columns for col in ['Exchange', 'Token', 'Tradingsymbol', 'Instrument']):
+            equity_symbols = df[df['Instrument'] == 'EQ'][['Exchange', 'Token', 'Tradingsymbol']].copy()
+            symbols_map = {row['Tradingsymbol']: str(row['Token']) for index, row in equity_symbols.iterrows()}
+            st.success(f"Loaded {len(symbols_map)} equity symbols from {file_path}.")
+            return symbols_map
+        else:
+            st.error(f"CSV file '{file_path}' must contain 'Exchange', 'Token', 'Tradingsymbol', and 'Instrument' columns. Found: {', '.join(df.columns)}")
+            logging.error(f"CSV file '{file_path}' missing required columns. Found: {', '.join(df.columns)}")
+            return {}
+    except FileNotFoundError:
+        st.error(f"Error: '{file_path}' not found. Please ensure the CSV file is in the same directory as the Streamlit app.")
+        logging.error(f"Error: '{file_path}' not found.", exc_info=True)
+        return {}
+    except Exception as e:
+        st.error(f"Error loading symbols from CSV: {e}")
+        logging.error(f"Error loading symbols from CSV: {e}", exc_info=True)
+        return {}
+
+def fetch_and_update_ltp():
+    """Fetches the live LTP for all pending and open trades and updates the session state."""
+    # This function is no longer needed after removing Tradetron API.
+    # It is kept as a placeholder in case another API is integrated later.
+    st.warning("LTP fetching is currently disabled as the Tradetron API has been removed.")
+
+
+def get_nifty500_symbols():
+    """Uses the load_symbols_from_csv function to get the actual symbols."""
+    return load_symbols_from_csv()
+
+def get_current_manual_sl(tsym, trade_info=None):
+    """Safely get current manual SL with fallbacks"""
+    try:
+        manual_sl = st.session_state.manual_overrides.get(tsym, {}).get('sl_price')
+        if manual_sl is not None and manual_sl > 0:
+            return float(manual_sl)
+        if trade_info and 'sl_price' in trade_info:
+            trade_sl = trade_info.get('sl_price')
+            if trade_sl is not None and trade_sl > 0:
+                return float(trade_sl)
+        return 0.0
+    except (ValueError, TypeError, AttributeError):
+        return 0.0
 
 if __name__ == "__main__":
-    # Check if the required API helper is available
-    if 'NorenApiPy' not in sys.modules:
-        st.error("Please ensure you have api_helper.py from the NorenApiPy library in the correct path.")
-    else:
-        main()
+    st.title("Trade Monitor Dashboard")
+    with st.sidebar:
+        st.header("Tradetron API Credentials")
+        st.text("Tradetron API has been removed.")
+        if st.button("🔄 Refresh LTP (Disabled)", type="secondary"):
+            st.info("LTP refresh is currently disabled.")
+
+    # Main dashboard view
+    st.subheader("📊 Live Positions & P&L")
+    st.markdown("---")
+
+    # The main trade logic loop
+    if st.button("Run Trade Logic"):
+        # Reset daily flags for the strategy if a new day has started
+        st.session_state.strategy.reset_daily_flags(datetime.date.today())
+
+        # Placeholder for data fetching - replace with your actual data fetching function
+        # For demonstration, we will use mock data
+        symbol_token_map = get_nifty500_symbols()
+        symbols_to_screen = list(symbol_token_map.keys())[:10] # Screen first 10 for demo
+
+        for tsym in symbols_to_screen:
+            # Mock data fetch. In a real app, this would be a live API call
+            mock_data = {
+                'Open': [100, 105],
+                'High': [110, 112],
+                'Low': [98, 103],
+                'Close': [105, 108],
+                'Volume': [1000, 1200]
+            }
+            mock_df = pd.DataFrame(mock_data)
+
+            # Use the strategy to get signals
+            buy_signal, sell_signal = st.session_state.strategy.get_signals(mock_df)
+            
+            # Check for entry conditions
+            if buy_signal and st.session_state.strategy.current_position is None:
+                st.session_state.strategy.current_position = 'long'
+                st.session_state.strategy.entry_price = mock_df.iloc[-1]['Close']
+                st.info(f"Buy Signal for {tsym} at {st.session_state.strategy.entry_price}")
+            
+            if sell_signal and st.session_state.strategy.current_position is None:
+                st.session_state.strategy.current_position = 'short'
+                st.session_state.strategy.entry_price = mock_df.iloc[-1]['Close']
+                st.info(f"Sell Signal for {tsym} at {st.session_state.strategy.entry_price}")
+
+            # Check for exit conditions
+            if st.session_state.strategy.current_position:
+                current_ltp = mock_df.iloc[-1]['Close'] # Using mock data, replace with live LTP
+                if st.session_state.strategy.check_exit_conditions(current_ltp):
+                    st.success(f"Exit Signal for {tsym} at {current_ltp}")
+                    st.session_state.strategy.current_position = None
+                    st.session_state.strategy.entry_price = None
+
+    display_trades_with_unique_keys()
