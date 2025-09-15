@@ -485,7 +485,7 @@ show_detailed_params = st.sidebar.checkbox("Show Detailed Parameters", value=Tru
 st.sidebar.subheader("Trading Parameters")
 st.session_state.predetermined_capital = st.sidebar.number_input(
     "Predetermined Capital per Trade (INR)",
-    min_value=1000,
+    min_value=100,
     max_value=10000000,
     value=int(st.session_state.predetermined_capital),
     step=1000
