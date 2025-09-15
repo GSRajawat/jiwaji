@@ -35,7 +35,7 @@ if 'trading_start_time' not in st.session_state:
 if 'trading_end_time' not in st.session_state:
     st.session_state.trading_end_time = datetime.time(10, 00)
 if 'exit_time' not in st.session_state:
-    st.session_state.exit_time = datetime.time(09, 45)
+    st.session_state.exit_time = datetime.time(9, 45)
 
 @st.cache_resource
 def get_api_instance(user_id, user_session):
