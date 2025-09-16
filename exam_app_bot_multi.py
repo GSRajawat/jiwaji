@@ -21,7 +21,7 @@ USER_ID = st.secrets.get("FLATTRADE_USER_ID", "FZ03508")
 EXCHANGE = 'NSE'
 CANDLE_INTERVAL = '1'  # 1-minute candles
 REQUIRED_CANDLES = 50  # Enough candles for SDVWAP calculation
-MARKET_START_TIME = datetime.time(9, 15)  # Market starts at 9:15 AM
+MARKET_START_TIME = datetime.time(3, 45)  # Market starts at 9:15 AM
 
 # Initialize session state variables
 if 'predetermined_capital' not in st.session_state:
@@ -31,9 +31,9 @@ if 'open_tracked_trades' not in st.session_state:
 if 'daily_profit_exits' not in st.session_state:
     st.session_state.daily_profit_exits = {}  # Track profit exits per stock per day
 if 'trading_start_time' not in st.session_state:
-    st.session_state.trading_start_time = datetime.time(9, 30)  # Updated to match bt2 logic
+    st.session_state.trading_start_time = datetime.time(4, 00)  # Updated to match bt2 logic
 if 'trading_end_time' not in st.session_state:
-    st.session_state.trading_end_time = datetime.time(15, 20)  # Updated to match bt2 logic
+    st.session_state.trading_end_time = datetime.time(9, 50)  # Updated to match bt2 logic
 if 'profit_target_pct' not in st.session_state:
     st.session_state.profit_target_pct = 5.0  # 5% profit target from bt2
 
