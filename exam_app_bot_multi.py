@@ -37,155 +37,28 @@ if 'trading_end_time' not in st.session_state:
 if 'profit_target_pct' not in st.session_state:
     st.session_state.profit_target_pct = 5.0  # 5% profit target from bt2
 
-def get_credentials():
-    """Get credentials with fallback options and validation"""
-    try:
-        # Try Streamlit secrets first
-        user_session = st.secrets.get("FLATTRADE_USER_SESSION")
-        user_id = st.secrets.get("FLATTRADE_USER_ID")
-        
-        # Log what we found (without exposing sensitive data)
-        st.sidebar.write(f"**Environment:** {'Cloud' if 'STREAMLIT_SHARING' in os.environ else 'Local'}")
-        st.sidebar.write(f"**Session Key Length:** {len(user_session) if user_session else 0}")
-        st.sidebar.write(f"**User ID:** {user_id[:3]}***" if user_id else "None")
-        
-        if not user_session or not user_id:
-            # Fallback to environment variables
-            user_session = os.environ.get("FLATTRADE_USER_SESSION")
-            user_id = os.environ.get("FLATTRADE_USER_ID")
-            
-        if not user_session or not user_id:
-            st.error("❌ Missing credentials. Please check your secrets configuration.")
-            st.info("Required secrets: FLATTRADE_USER_SESSION, FLATTRADE_USER_ID")
-            return None, None
-            
-        return user_id, user_session
-        
-    except Exception as e:
-        st.error(f"Error accessing credentials: {e}")
-        return None, None
-
-def validate_session(api):
-    """Validate current session with a simple API call"""
-    try:
-        test_call = api.get_limits()
-        if test_call and isinstance(test_call, dict):
-            if test_call.get('stat') == 'Ok':
-                return True, "Session valid"
-            else:
-                return False, test_call.get('emsg', 'Invalid response')
-        else:
-            return False, "No response from API"
-    except Exception as e:
-        return False, str(e)
-
 @st.cache_resource
-def get_api_instance():
-    """Initializes and caches the NorenApiPy instance with robust error handling."""
-    
-    # Get credentials
-    user_id, user_session = get_credentials()
-    if not user_id or not user_session:
-        return None
-    
+def get_api_instance(user_id, user_session):
+    """Initializes and caches the NorenApiPy instance."""
     api = NorenApiPy()
     logging.info("Attempting to set API session...")
-    
     try:
-        # Attempt to set session
         ret = api.set_session(userid=user_id, password='', usertoken=user_session)
-        
         if ret is True or (isinstance(ret, dict) and ret.get('stat') == 'Ok'):
-            # Validate the session with a test call
-            is_valid, message = validate_session(api)
-            
-            if is_valid:
-                logging.info(f"API session set and validated for user: {user_id}")
-                st.success(f"✅ API session connected for user: {user_id}")
-                return api
-            else:
-                st.error(f"❌ Session validation failed: {message}")
-                return None
+            logging.info(f"API session set successfully for user: {user_id}")
+            st.success(f"API session connected for user: {user_id}")
+            return api
         else:
             error_msg = ret.get('emsg', 'Unknown error') if isinstance(ret, dict) else str(ret)
-            
-            # Provide specific guidance based on error
-            if 'Invalid session' in error_msg or 'session' in error_msg.lower():
-                st.error(f"❌ Session Error: {error_msg}")
-                st.info("🔄 Your session token may have expired. Please generate a new session token from Flattrade and update your secrets.")
-            else:
-                st.error(f"❌ API Connection Error: {error_msg}")
-                
+            st.error(f"Failed to set API session: {error_msg}. Please check your credentials.")
             return None
-            
     except Exception as e:
-        st.error(f"❌ Exception during API session setup: {e}")
-        st.info("💡 This might be a network connectivity issue. Please try again.")
+        st.error(f"An exception occurred during API session setup: {e}")
         return None
 
-# Session management with retry logic
-def get_api_with_retry():
-    """Get API instance with retry mechanism"""
-    api = get_api_instance()
-    
-    if api is None:
-        st.warning("⚠️ API connection failed. You can:")
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if st.button("🔄 Retry Connection"):
-                st.cache_resource.clear()
-                st.rerun()
-                
-        with col2:
-            if st.button("📝 Update Session Token"):
-                st.info("To update your session token:")
-                st.write("1. Login to Flattrade")
-                st.write("2. Generate new session token")
-                st.write("3. Update FLATTRADE_USER_SESSION in your Streamlit secrets")
-                st.write("4. Restart the app")
-        
-        st.stop()
-    
-    return api
-
-# Add session monitoring functionality
-def monitor_session_health(api):
-    """Monitor session health and show status"""
-    try:
-        # Test API connectivity
-        test_response = api.get_limits()
-        
-        if test_response and isinstance(test_response, dict):
-            if test_response.get('stat') == 'Ok':
-                st.sidebar.success("🟢 API Session Active")
-                return True
-            else:
-                error_msg = test_response.get('emsg', 'Unknown API error')
-                st.sidebar.error(f"🔴 API Error: {error_msg}")
-                
-                # Check if it's a session-related error
-                if any(keyword in error_msg.lower() for keyword in ['session', 'token', 'invalid', 'expired']):
-                    st.sidebar.warning("Session token may need refresh")
-                    if st.sidebar.button("🔄 Refresh Session"):
-                        st.cache_resource.clear()
-                        st.rerun()
-                
-                return False
-        else:
-            st.sidebar.error("🔴 No API Response")
-            return False
-            
-    except Exception as e:
-        st.sidebar.error(f"🔴 API Exception: {str(e)[:50]}...")
-        return False
-
-# Add this after API initialization
-if api:
-    session_healthy = monitor_session_health(api)
-    if not session_healthy:
-        st.warning("⚠️ API session issues detected. Some features may not work properly.")
-        st.info("If the issue persists, please generate a new session token from Flattrade.")
+api = get_api_instance(USER_ID, USER_SESSION)
+if api is None:
+    st.stop()
 
 @st.cache_data
 def load_symbols_from_csv(file_path="NSE_Equity.csv"):
