@@ -663,7 +663,7 @@ with col1:
         trade_executions = []
         
         progress_bar = st.progress(0, text="Running SDVWAP screening from 9:15 AM...")
-        screening_symbols = nifty500_symbols[:20]  # Test with first 20 symbols
+        screening_symbols = nifty500_symbols[:1]  # Test with first 20 symbols
         
         for i, stock in enumerate(screening_symbols):
             symbol, signal, reason, price, quantity, params, trade_executed = screen_and_trade_stock_sdvwap(
