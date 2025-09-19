@@ -15,13 +15,13 @@ from api_helper import NorenApiPy
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Flattrade API Credentials ---
-USER_SESSION = st.secrets.get("FLATTRADE_USER_SESSION", "fcdc3a9d93f15000ea83b027eb2bc5ed9e2249c40ed346fc3e2f98c1492dbf14")
+USER_SESSION = st.secrets.get("FLATTRADE_USER_SESSION", "3ea85354da75184abab889f0247ecb2e8ed20f91607bbbc9543599138504c13b")
 USER_ID = st.secrets.get("FLATTRADE_USER_ID", "FZ03508")
 
 EXCHANGE = 'NSE'
 CANDLE_INTERVAL = '1'  # 1-minute candles
 REQUIRED_CANDLES = 50  # Enough candles for SDVWAP calculation
-MARKET_START_TIME = datetime.time(3, 45)  # Market starts at 9:15 AM
+MARKET_START_TIME = datetime.time(9, 15)  # Market starts at 9:15 AM
 
 # Initialize session state variables
 if 'predetermined_capital' not in st.session_state:
@@ -31,9 +31,9 @@ if 'open_tracked_trades' not in st.session_state:
 if 'daily_profit_exits' not in st.session_state:
     st.session_state.daily_profit_exits = {}  # Track profit exits per stock per day
 if 'trading_start_time' not in st.session_state:
-    st.session_state.trading_start_time = datetime.time(4, 00)  # Updated to match bt2 logic
+    st.session_state.trading_start_time = datetime.time(9, 30)  # Updated to match bt2 logic
 if 'trading_end_time' not in st.session_state:
-    st.session_state.trading_end_time = datetime.time(9, 50)  # Updated to match bt2 logic
+    st.session_state.trading_end_time = datetime.time(15, 20)  # Updated to match bt2 logic
 if 'profit_target_pct' not in st.session_state:
     st.session_state.profit_target_pct = 5.0  # 5% profit target from bt2
 
@@ -87,7 +87,7 @@ def load_symbols_from_csv(file_path="NSE_Equity.csv"):
         st.error(f"Error loading symbols from CSV: {e}")
         return []
 
-def place_market_order(api, symbol, exchange, action, quantity, product_type='MIS', remarks='SDVWAP_Strategy'):
+def place_market_order(api, symbol, exchange, action, quantity, product_type='C', remarks='SDVWAP_Strategy'):
     """Place a market order"""
     try:
         st.info(f"Placing {action} order for {symbol}: Qty={quantity}")
