@@ -27,6 +27,65 @@ FLATTRADE_CONFIG = {
     "PASSWORD": "Shubhi@2",
     "BASE_URL": "https://piconnect.flattrade.in/PiConnectTP"
 }
+# Add to your app - record immediately on each ping
+import atexit
+
+def record_on_ping():
+    """Record data immediately when app starts (on each ping)"""
+    if 'data_recorder' in st.session_state:
+        try:
+            # Record data immediately for all symbols
+            current_time = datetime.now()
+            symbols = DEFAULT_SYMBOLS
+            
+            for symbol in symbols:
+                market_data = st.session_state.data_recorder.flattrade_api.get_market_data(symbol)
+                if market_data:
+                    candle_data = st.session_state.data_recorder._parse_market_data(
+                        symbol, market_data, current_time
+                    )
+                    if candle_data:
+                        st.session_state.data_recorder.supabase_manager.insert_candle_data(candle_data)
+                        logger.info(f"Ping-recorded data for {symbol}")
+        except Exception as e:
+            logger.error(f"Ping recording error: {e}")
+
+# Call this on every app start
+record_on_ping()
+# Add this to your main() function in trade_app.py
+def ping_based_recording():
+    """Record data on each app startup (UptimeRobot ping)"""
+    current_time = datetime.now()
+    
+    # Check if we should record (avoid duplicate records)
+    last_record_key = f"last_record_{current_time.strftime('%Y-%m-%d-%H-%M')}"
+    
+    if last_record_key not in st.session_state:
+        st.session_state[last_record_key] = True
+        
+        # Record immediately for all symbols
+        if 'data_recorder' in st.session_state:
+            symbols = DEFAULT_SYMBOLS
+            success_count = 0
+            
+            for symbol in symbols:
+                try:
+                    market_data = st.session_state.data_recorder.flattrade_api.get_market_data(symbol)
+                    if market_data:
+                        candle_data = st.session_state.data_recorder._parse_market_data(
+                            symbol, market_data, current_time
+                        )
+                        if candle_data:
+                            if st.session_state.data_recorder.supabase_manager.insert_candle_data(candle_data):
+                                success_count += 1
+                                
+                except Exception as e:
+                    logger.error(f"Ping recording error for {symbol}: {e}")
+            
+            if success_count > 0:
+                logger.info(f"Ping recording: {success_count}/{len(symbols)} successful")
+                st.success(f"🎯 Ping recording: {success_count}/{len(symbols)} successful")
+
 
 class FlattradeAPI:
     def __init__(self):
@@ -640,7 +699,8 @@ def main():
         page_icon="📈",
         layout="wide"
     )
-    
+    # Call this in your main() function
+    ping_based_recording()
     st.title("📈 Stock OHLC Data Recorder")
     st.markdown("Record 1-minute candle data for stocks using Flattrade API and store in Supabase")
     
