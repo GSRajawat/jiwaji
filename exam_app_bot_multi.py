@@ -50,8 +50,7 @@ def record_on_ping():
         except Exception as e:
             logger.error(f"Ping recording error: {e}")
 
-# Call this on every app start
-record_on_ping()
+
 # Add this to your main() function in trade_app.py
 def ping_based_recording():
     """Record data on each app startup (UptimeRobot ping)"""
