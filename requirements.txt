@@ -9,6 +9,8 @@ requests
 python-dotenv
 plotly
 yfinance
+pytz
+
 
 
 
