@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
 from collections import defaultdict
 import numpy as np
+import pytz # Add this import
 
 # Supabase configuration
 SUPABASE_URL = "https://zybakxpyibubzjhzdcwl.supabase.co"
@@ -644,18 +645,28 @@ DEFAULT_SYMBOLS = ["ACC", "APLAPOLLO", "AUBANK", "ATGL", "ABCAPITAL", "ABFRL", "
 PING_BASED_RECORDING = True  # Enable ping-based recording for Streamlit Cloud
 RECORD_ON_STARTUP = True     # Record immediately when app starts
 
-def is_market_hours():
-    """Check if it's within market hours (9:15 AM to 3:30 PM IST)"""
-    now = datetime.now()
-    market_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    market_end = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    
-    # Only record on weekdays during market hours
-    is_weekday = now.weekday() < 5  # Monday = 0, Friday = 4
-    is_market_time = market_start <= now <= market_end
-    
-    return is_weekday and is_market_time
+def is_market_hours() -> bool:
+    """
+    Check if the current time is within Indian market hours (IST),
+    which are from 9:15 AM to 3:30 PM on weekdays (Monday to Friday).
+    """
+    ist = pytz.timezone('Asia/Kolkata')
+    now_ist = datetime.now(ist)
 
+    # Check if it's a weekday (Monday=0, Friday=4)
+    if now_ist.weekday() >= 5: # Saturday or Sunday
+        return False
+
+    # Define market open and close times in IST
+    market_open_time = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_close_time = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+
+    # Check if the current time is within the market hours
+    if market_open_time <= now_ist <= market_close_time:
+        return True
+    else:
+        return False
+    
 def should_record_now():
     """Check if we should record data now (avoid duplicates)"""
     current_time = datetime.now()
