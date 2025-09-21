@@ -822,8 +822,6 @@ def main():
     
     st.title("📈 Stock OHLC Data Recorder (Streamlit Cloud)")
     st.markdown("Ping-based recording every 5 minutes via UptimeRobot")
-    st.write(f"🕐 Current Time: {datetime.now().strftime('%H:%M:%S')}")
-    # Show health check for UptimeRobot
     st.sidebar.success("✅ Stock Recorder is running")
     ist_timezone = pytz.timezone('Asia/Kolkata')
     current_time_ist = datetime.now(ist_timezone)
