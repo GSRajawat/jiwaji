@@ -1,4 +1,4 @@
-
+import streamlit as st
 import pandas as pd
 from supabase import create_client, Client
 import requests
@@ -14,11 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
 from collections import defaultdict
 import numpy as np
-import streamlit as st
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import pytz # Add this import
 
 # Supabase configuration
 SUPABASE_URL = "https://zybakxpyibubzjhzdcwl.supabase.co"
@@ -31,6 +27,27 @@ FLATTRADE_CONFIG = {
     "PASSWORD": "Shubhi@2",
     "BASE_URL": "https://piconnect.flattrade.in/PiConnectTP"
 }
+def is_market_hours() -> bool:
+    """
+    Check if the current time is within Indian market hours (IST),
+    which are from 9:15 AM to 3:30 PM on weekdays (Monday to Friday).
+    """
+    ist = pytz.timezone('Asia/Kolkata')
+    now_ist = datetime.now(ist)
+
+    # Check if it's a weekday (Monday=0, Friday=4)
+    if now_ist.weekday() >= 5: # Saturday or Sunday
+        return False
+
+    # Define market open and close times in IST
+    market_open_time = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_close_time = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+
+    # Check if the current time is within the market hours
+    if market_open_time <= now_ist <= market_close_time:
+        return True
+    else:
+        return False
 class FlattradeAPI:
     def __init__(self):
         self.config = FLATTRADE_CONFIG
@@ -156,9 +173,9 @@ class SupabaseManager:
             ON stock_candles(symbol, timestamp DESC);
             """
             
-            st.info("🔧 **Database Setup Required**")
+            st.info("ðŸ”§ **Database Setup Required**")
             st.markdown("""
-            **Step 1:** Go to your Supabase Dashboard → SQL Editor
+            **Step 1:** Go to your Supabase Dashboard â†’ SQL Editor
             
             **Step 2:** Run this SQL command:
             """)
@@ -172,10 +189,10 @@ class SupabaseManager:
             try:
                 # This might not work if RLS is enabled without proper policies
                 result = self.client.rpc('sql', {'query': sql_schema}).execute()
-                st.success("✅ Table created successfully!")
+                st.success("âœ… Table created successfully!")
                 return True
             except Exception as e:
-                st.warning(f"⚠️ Could not create table automatically: {str(e)}")
+                st.warning(f"âš ï¸ Could not create table automatically: {str(e)}")
                 st.info("Please run the SQL manually in your Supabase dashboard.")
                 return False
                 
@@ -402,7 +419,7 @@ class DataRecorder:
         self.recording_threads = {}
         self.recording_stats = {}  # Changed from defaultdict to regular dict
         self.data_queue = queue.Queue()
-        self.max_workers = 10  # Maximum concurrent threads for API calls
+        self.max_workers = 200  # Maximum concurrent threads for API calls
     
     def _init_symbol_stats(self, symbol: str):
         """Initialize statistics for a symbol"""
@@ -636,15 +653,301 @@ class DataRecorder:
                 'sdvwap1_minus': None
             }
 
+
+import streamlit as st
+import time
+from datetime import datetime, timedelta
+
+# Add this after your existing configuration
+DEFAULT_SYMBOLS = ["ACC", "APLAPOLLO", "AUBANK", "ATGL", "ABCAPITAL", "ABFRL", "ALKEM", "APOLLOTYRE", "ASHOKLEY", "ASTRAL", "AUROPHARMA", "BSE", "BANDHANBNK", "BANKINDIA", "MAHABANK", "BDL", "BHARATFORG", "BHEL", "BHARTIHEXA", "BIOCON", "COCHINSHIP", "COFORGE", "COLPAL", "CONCOR", "CUMMINSIND", "DIXON", "ESCORTS", "EXIDEIND", "NYKAA", "FEDERALBNK", "GMRAIRPORT", "GLENMARK", "GODREJPROP", "HDFCAMC", "HINDPETRO", "HINDZINC", "HUDCO", "IDFCFIRSTB", "IRB", "INDIANB", "IRCTC", "IREDA", "IGL", "INDUSTOWER", "JUBLFOOD", "KPITTECH", "KALYANKJIL", "LTF", "LICHSGFIN", "LUPIN", "MRF", "M&MFIN", "MANKIND", "MARICO", "MFSL", "MAXHEALTH", "MAZDOCK", "MOTILALOFS", "MPHASIS", "MUTHOOTFIN", "NHPC", "NMDC", "NTPCGREEN", "NATIONALUM", "OBEROIRLTY", "OIL", "OLAELEC", "PAYTM", "OFSS", "POLICYBZR", "PIIND", "PAGEIND", "PATANJALI", "PERSISTENT", "PETRONET", "PHOENIXLTD", "POLYCAB", "PREMIERENE", "PRESTIGE", "RVNL", "SBICARD", "SJVN", "SRF", "SOLARINDS", "SONACOMS", "SAIL", "SUPREMEIND", "SUZLON", "TATACOMM", "TATAELXSI", "TATATECH", "TORNTPOWER", "TIINDIA", "UPL", "UNIONBANK", "VMM", "IDEA", "VOLTAS", "WAAREEENER", "YESBANK"]
+# Streamlit Cloud specific configuration
+PING_BASED_RECORDING = True  # Enable ping-based recording for Streamlit Cloud
+RECORD_ON_STARTUP = True     # Record immediately when app starts
+
+def is_market_hours():
+    """Check if it's within market hours (9:15 AM to 3:30 PM IST)"""
+    now = datetime.now()
+    market_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_end = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    
+    # Only record on weekdays during market hours
+    is_weekday = now.weekday() < 5  # Monday = 0, Friday = 4
+    is_market_time = market_start <= now <= market_end
+    
+    return is_weekday and is_market_time
+
+def should_record_now():
+    """Check if we should record data now (avoid duplicates)"""
+    current_time = datetime.now()
+    
+    # Create a unique key for this 5-minute window
+    time_window = current_time.replace(second=0, microsecond=0)
+    time_window = time_window - timedelta(minutes=time_window.minute % 5)
+    record_key = f"recorded_{time_window.strftime('%Y%m%d_%H%M')}"
+    
+    # Check if we already recorded in this window
+    if record_key in st.session_state:
+        return False
+    
+    # Mark this window as recorded
+    st.session_state[record_key] = True
+    
+    # Clean up old keys (keep only last 12 windows = 1 hour)
+    keys_to_remove = []
+    for key in st.session_state.keys():
+        if key.startswith('recorded_') and key != record_key:
+            try:
+                key_time = datetime.strptime(key.split('_')[1] + '_' + key.split('_')[2], '%Y%m%d_%H%M')
+                if (current_time - key_time).total_seconds() > 3600:  # Older than 1 hour
+                    keys_to_remove.append(key)
+            except:
+                keys_to_remove.append(key)
+    
+    for key in keys_to_remove:
+        del st.session_state[key]
+    
+    return True
+
+def ping_based_recording():
+    """Record data immediately when UptimeRobot pings (Streamlit Cloud compatible)"""
+    
+    # Only proceed if we should record now
+    if not should_record_now():
+        st.info("â­ï¸ Already recorded in this time window")
+        return
+    
+    # Only record during market hours
+    if not is_market_hours():
+        st.info("ðŸ• Outside market hours - skipping recording")
+        return
+    
+    current_time = datetime.now()
+    
+    # Show recording status
+    st.info(f"ðŸŽ¯ Ping-based recording started at {current_time.strftime('%H:%M:%S')}")
+    
+    # Initialize data recorder if not exists
+    if 'data_recorder' not in st.session_state:
+        st.session_state.data_recorder = DataRecorder()
+    
+    # Record data for all symbols immediately
+    symbols = DEFAULT_SYMBOLS
+    results = {'success': 0, 'errors': 0, 'details': []}
+    
+    # Create progress bar
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, symbol in enumerate(symbols):
+        try:
+            status_text.text(f"Recording {symbol}...")
+            progress_bar.progress((i + 1) / len(symbols))
+            
+            # Get market data
+            market_data = st.session_state.data_recorder.flattrade_api.get_market_data(symbol)
+            
+            if market_data:
+                # Parse data with indicators
+                candle_data = st.session_state.data_recorder._parse_market_data(
+                    symbol, market_data, current_time
+                )
+                
+                if candle_data:
+                    # Insert into database
+                    success = st.session_state.data_recorder.supabase_manager.insert_candle_data(candle_data)
+                    
+                    if success:
+                        results['success'] += 1
+                        results['details'].append(f"âœ… {symbol}: â‚¹{candle_data['close']}")
+                        logger.info(f"Ping recorded: {symbol} - â‚¹{candle_data['close']}")
+                    else:
+                        results['errors'] += 1
+                        results['details'].append(f"âŒ {symbol}: Database error")
+                else:
+                    results['errors'] += 1
+                    results['details'].append(f"âŒ {symbol}: Parse error")
+            else:
+                results['errors'] += 1
+                results['details'].append(f"âŒ {symbol}: API error")
+                
+        except Exception as e:
+            results['errors'] += 1
+            results['details'].append(f"âŒ {symbol}: {str(e)[:50]}")
+            logger.error(f"Ping recording error for {symbol}: {e}")
+    
+    # Clear progress
+    progress_bar.empty()
+    status_text.empty()
+    
+    # Show results
+    if results['success'] > 0:
+        st.success(f"ðŸŽ¯ Ping Recording Complete: {results['success']}/{len(symbols)} successful")
+        
+        # Show details in expander
+        with st.expander("ðŸ“‹ Recording Details"):
+            for detail in results['details']:
+                if detail.startswith('âœ…'):
+                    st.success(detail)
+                else:
+                    st.error(detail)
+    else:
+        st.error(f"âŒ Ping Recording Failed: {results['errors']} errors")
+        
+    # Store stats in session state
+    st.session_state['last_ping_recording'] = {
+        'time': current_time,
+        'success': results['success'],
+        'errors': results['errors'],
+        'total': len(symbols)
+    }
+
+def show_ping_recording_stats():
+    """Show statistics from ping-based recordings"""
+    if 'last_ping_recording' in st.session_state:
+        stats = st.session_state['last_ping_recording']
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Last Recording", stats['time'].strftime('%H:%M:%S'))
+        
+        with col2:
+            st.metric("Successful", stats['success'])
+        
+        with col3:
+            st.metric("Errors", stats['errors'])
+        
+        with col4:
+            success_rate = (stats['success'] / stats['total']) * 100 if stats['total'] > 0 else 0
+            st.metric("Success Rate", f"{success_rate:.1f}%")
+
+# Enhanced main function for Streamlit Cloud
+def main():
+    st.set_page_config(
+        page_title="Stock Data Recorder - Streamlit Cloud",
+        page_icon="ðŸ“ˆ",
+        layout="wide"
+    )
+    
+    st.title("ðŸ“ˆ Stock OHLC Data Recorder (Streamlit Cloud)")
+    st.markdown("Ping-based recording every 5 minutes via UptimeRobot")
+    
+    # Show health check for UptimeRobot
+    st.sidebar.success("âœ… Stock Recorder is running")
+    ist_timezone = pytz.timezone('Asia/Kolkata')
+    current_time_ist = datetime.now(ist_timezone)
+    st.write(f"🕐 Current Time: {current_time_ist.strftime('%H:%M:%S')}")
+    st.sidebar.info(f"ðŸ“… Market Hours: {'âœ…' if is_market_hours() else 'âŒ'}")
+    
+    # Initialize components
+    if 'data_recorder' not in st.session_state:
+        st.session_state.data_recorder = DataRecorder()
+    
+    # PING-BASED RECORDING - This runs on every UptimeRobot ping
+    if PING_BASED_RECORDING and RECORD_ON_STARTUP:
+        ping_based_recording()
+    
+    # Main dashboard
+    st.subheader("ðŸŽ¯ Ping-Based Recording Dashboard")
+    
+    # Show current recording stats
+    show_ping_recording_stats()
+    
+    # Market status
+    if is_market_hours():
+        st.success("ðŸŸ¢ Market is OPEN - Recording active")
+    else:
+        st.warning("ðŸŸ¡ Market is CLOSED - Recording paused")
+    
+    # Manual recording button
+    st.subheader("ðŸ”§ Manual Controls")
+    
+    if st.button("ðŸš€ Record Now (Manual)", type="primary"):
+        ping_based_recording()
+    
+    # Show recent data
+    st.subheader("ðŸ“Š Recent Data")
+    
+    symbol_to_view = st.selectbox("Select Symbol", DEFAULT_SYMBOLS)
+    
+    if st.button("ðŸ“ˆ View Recent Data"):
+        df = st.session_state.data_recorder.supabase_manager.get_latest_candles(
+            symbol_to_view, limit=20
+        )
+        
+        if not df.empty:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df = df.sort_values('timestamp', ascending=False)
+            
+            # Show latest price
+            latest = df.iloc[0]
+            st.metric(f"{symbol_to_view} Latest Price", f"â‚¹{latest['close']:.2f}")
+            
+            # Show data table
+            display_df = df[['timestamp', 'close', 'volume', 'vwap']].head(10)
+            st.dataframe(display_df, use_container_width=True)
+            
+            # Simple chart
+            if len(df) > 1:
+                chart_data = df.set_index('timestamp')[['close', 'vwap']].tail(10)
+                st.line_chart(chart_data)
+        else:
+            st.info(f"No data found for {symbol_to_view}")
+    
+    # Connection status
+    st.subheader("ðŸ”— System Status")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Test database connection
+        is_connected, message = st.session_state.data_recorder.supabase_manager.test_connection()
+        if is_connected:
+            st.success("âœ… Database Connected")
+        else:
+            st.error(f"âŒ Database: {message}")
+    
+    with col2:
+        # API status
+        st.info("ðŸ”„ Flattrade API Ready")
+    
+    # Instructions
+    st.subheader("â„¹ï¸ How It Works")
+    st.info("""
+    **Streamlit Cloud Ping-Based Recording:**
+    
+    1. ðŸ“¡ **UptimeRobot pings every 5 minutes**
+    2. ðŸš€ **App wakes up and runs ping_based_recording()**  
+    3. ðŸ“Š **Records data for all symbols immediately**
+    4. ðŸ’¾ **Saves to Supabase database**
+    5. ðŸ˜´ **App goes to sleep until next ping**
+    
+    **Result:** You get fresh data every 5 minutes during market hours!
+    
+    âš ï¸ **Note:** This is not continuous background recording, but timed data collection.
+    """)
+    
+    # Show environment info
+    with st.expander("ðŸ”§ Configuration"):
+        st.write("**Symbols:**", DEFAULT_SYMBOLS)
+        st.write("**Market Hours:** 9:15 AM - 3:30 PM (Mon-Fri)")
+        st.write("**Recording Frequency:** Every 5 minutes via UptimeRobot")
+        st.write("**Platform:** Streamlit Community Cloud")
+
+if __name__ == "__main__":
+    main()
+
+
 # Streamlit App
 def main():
     st.set_page_config(
         page_title="Stock Data Recorder",
-        page_icon="📈",
+        page_icon="ðŸ“ˆ",
         layout="wide"
     )
-    
-    st.title("📈 Stock OHLC Data Recorder")
+    # Call this in your main() function
+    ping_based_recording()
+    st.title("ðŸ“ˆ Stock OHLC Data Recorder")
     st.markdown("Record 1-minute candle data for stocks using Flattrade API and store in Supabase")
     
     # Initialize components
@@ -659,12 +962,12 @@ def main():
         st.subheader("Database Setup")
         
         # Test connection button
-        if st.button("🔍 Test Connection"):
+        if st.button("ðŸ” Test Connection"):
             is_connected, message = st.session_state.data_recorder.supabase_manager.test_connection()
             if is_connected:
-                st.success(f"✅ {message}")
+                st.success(f"âœ… {message}")
             else:
-                st.error(f"❌ {message}")
+                st.error(f"âŒ {message}")
         
         # Show current status
         status = st.session_state.data_recorder.supabase_manager.connection_status
@@ -673,7 +976,7 @@ def main():
         else:
             st.error(f"Status: {status}")
         
-        if st.button("🔧 Setup Database Table"):
+        if st.button("ðŸ”§ Setup Database Table"):
             st.session_state.data_recorder.supabase_manager.create_candle_table()
         
         # Recording configuration
@@ -682,7 +985,7 @@ def main():
         # Symbol input
         symbols_input = st.text_area(
             "Stock Symbols (one per line)",
-            value="RELIANCE\nTCS\nINFY\nHDFC\nICICIBANK",
+            value="ACC\nAPLAPOLLO\nAUBANK\nATGL\nABCAPITAL\nABFRL\nALKEM\nAPOLLOTYRE\nASHOKLEY\nASTRAL\nAUROPHARMA\nBSE\nBANDHANBNK\nBANKINDIA\nMAHABANK\nBDL\nBHARATFORG\nBHEL\nBHARTIHEXA\nBIOCON\nCOCHINSHIP\nCOFORGE\nCOLPAL\nCONCOR\nCUMMINSIND\nDIXON\nESCORTS\nEXIDEIND\nNYKAA\nFEDERALBNK\nGMRAIRPORT\nGLENMARK\nGODREJPROP\nHDFCAMC\nHINDPETRO\nHINDZINC\nHUDCO\nIDFCFIRSTB\nIRB\nINDIANB\nIRCTC\nIREDA\nIGL\nINDUSTOWER\nJUBLFOOD\nKPITTECH\nKALYANKJIL\nLTF\nLICHSGFIN\nLUPIN\nMRF\nM&MFIN\nMANKIND\nMARICO\nMFSL\nMAXHEALTH\nMAZDOCK\nMOTILALOFS\nMPHASIS\nMUTHOOTFIN\nNHPC\nNMDC\nNTPCGREEN\nNATIONALUM\nOBEROIRLTY\nOIL\nOLAELEC\nPAYTM\nOFSS\nPOLICYBZR\nPIIND\nPAGEIND\nPATANJALI\nPERSISTENT\nPETRONET\nPHOENIXLTD\nPOLYCAB\nPREMIERENE\nPRESTIGE\nRVNL\nSBICARD\nSJVN\nSRF\nSOLARINDS\nSONACOMS\nSAIL\nSUPREMEIND\nSUZLON\nTATACOMM\nTATAELXSI\nTATATECH\nTORNTPOWER\nTIINDIA\nUPL\nUNIONBANK\nVMM\nIDEA\nVOLTAS\nWAAREEENER\nYESBANK",
             help="Enter stock symbols, one per line"
         )
         
@@ -702,7 +1005,7 @@ def main():
         col1, col2 = st.columns(2)
         
         with col1:
-            if st.button("▶️ Start Recording", type="primary"):
+            if st.button("â–¶ï¸ Start Recording", type="primary"):
                 if symbols:
                     success, message = st.session_state.data_recorder.start_recording(symbols, interval)
                     if success:
@@ -714,7 +1017,7 @@ def main():
                     st.error("Please enter at least one symbol!")
         
         with col2:
-            if st.button("⏹️ Stop Recording", type="secondary"):
+            if st.button("â¹ï¸ Stop Recording", type="secondary"):
                 message = st.session_state.data_recorder.stop_recording()
                 st.success(message)
                 st.session_state.recording_status = "Stopped"
@@ -724,15 +1027,15 @@ def main():
         st.write(f"**Status:** {status}")
         
         if st.session_state.data_recorder.is_recording:
-            st.write("🟢 Recording Active")
+            st.write("ðŸŸ¢ Recording Active")
         else:
-            st.write("🔴 Recording Inactive")
+            st.write("ðŸ”´ Recording Inactive")
     
     # Main content area
     col1, col2 = st.columns([3, 1])
     
     with col1:
-        st.subheader("📊 Real-time Recording Dashboard")
+        st.subheader("ðŸ“Š Real-time Recording Dashboard")
         
         # Show recording statistics if recording is active
         if st.session_state.data_recorder.is_recording:
@@ -747,13 +1050,13 @@ def main():
                     with metrics_cols[col_idx]:
                         # Color code based on status
                         if stat['status'] == 'Recording':
-                            status_color = "🟢"
+                            status_color = "ðŸŸ¢"
                         elif stat['status'] == 'Error':
-                            status_color = "🔴"
+                            status_color = "ðŸ”´"
                         elif 'Starting' in stat['status'] or 'Stopping' in stat['status']:
-                            status_color = "🟡"
+                            status_color = "ðŸŸ¡"
                         else:
-                            status_color = "⚪"
+                            status_color = "âšª"
                         
                         st.metric(
                             label=f"{status_color} {symbol}",
@@ -767,7 +1070,7 @@ def main():
                             st.caption("No data yet")
                 
                 # Detailed statistics table
-                st.subheader("📈 Detailed Statistics")
+                st.subheader("ðŸ“ˆ Detailed Statistics")
                 
                 stats_df = pd.DataFrame([
                     {
@@ -792,10 +1095,10 @@ def main():
                 st.rerun()
         
         else:
-            st.info("📴 Recording is stopped. Start recording to see real-time dashboard.")
+            st.info("ðŸ“´ Recording is stopped. Start recording to see real-time dashboard.")
         
         # Data viewer section
-        st.subheader("📋 Historical Data Viewer")
+        st.subheader("ðŸ“‹ Historical Data Viewer")
         
         # Symbol selector for viewing data
         if symbols:
@@ -804,7 +1107,7 @@ def main():
             col_refresh, col_limit = st.columns([1, 1])
             
             with col_refresh:
-                refresh_data = st.button("🔄 Refresh Data")
+                refresh_data = st.button("ðŸ”„ Refresh Data")
             
             with col_limit:
                 data_limit = st.selectbox("Records to show", [20, 50, 100, 200], index=1)
@@ -825,13 +1128,13 @@ def main():
                     col1_metrics, col2_metrics, col3_metrics, col4_metrics = st.columns(4)
                     
                     with col1_metrics:
-                        st.metric("Latest Close", f"₹{latest_record['close']:.2f}")
+                        st.metric("Latest Close", f"â‚¹{latest_record['close']:.2f}")
                     with col2_metrics:
                         st.metric("Volume", f"{latest_record['volume']:,}")
                     with col3_metrics:
                         if len(df) > 1:
                             price_change = latest_record['close'] - df.iloc[1]['close']
-                            st.metric("Change", f"₹{price_change:.2f}", delta=f"{price_change:.2f}")
+                            st.metric("Change", f"â‚¹{price_change:.2f}", delta=f"{price_change:.2f}")
                         else:
                             st.metric("Change", "N/A")
                     with col4_metrics:
@@ -847,12 +1150,12 @@ def main():
                     
                     # Price chart
                     if len(df) > 1:
-                        st.subheader(f"📈 {selected_symbol} Price Chart")
+                        st.subheader(f"ðŸ“ˆ {selected_symbol} Price Chart")
                         chart_df = df.set_index('timestamp')[['open', 'high', 'low', 'close']].tail(50)
                         st.line_chart(chart_df)
                         
                         # Volume chart
-                        st.subheader(f"📊 {selected_symbol} Volume Chart")
+                        st.subheader(f"ðŸ“Š {selected_symbol} Volume Chart")
                         volume_df = df.set_index('timestamp')[['volume']].tail(50)
                         st.bar_chart(volume_df)
                 else:
@@ -861,28 +1164,28 @@ def main():
             st.info("Enter symbols in the sidebar to view data")
     
     with col2:
-        st.subheader("ℹ️ System Information")
+        st.subheader("â„¹ï¸ System Information")
         
         # Recording status
         if st.session_state.data_recorder.is_recording:
-            st.success("🟢 **Recording Active**")
+            st.success("ðŸŸ¢ **Recording Active**")
             
             # Show queue size
             queue_size = st.session_state.data_recorder.data_queue.qsize()
             if queue_size > 0:
-                st.info(f"📥 Queue: {queue_size} pending")
+                st.info(f"ðŸ“¥ Queue: {queue_size} pending")
             else:
-                st.success("📥 Queue: Empty")
+                st.success("ðŸ“¥ Queue: Empty")
         else:
-            st.error("🔴 **Recording Inactive**")
+            st.error("ðŸ”´ **Recording Inactive**")
         
         # Performance settings
-        st.subheader("⚙️ Performance Settings")
+        st.subheader("âš™ï¸ Performance Settings")
         
         max_workers = st.slider(
             "Max Concurrent API Calls",
             min_value=1,
-            max_value=20,
+            max_value=200,
             value=st.session_state.data_recorder.max_workers,
             help="Higher values = faster data collection but more API load"
         )
@@ -892,7 +1195,7 @@ def main():
             st.success(f"Updated to {max_workers} workers")
         
         # Auto-refresh toggle
-        st.subheader("🔄 Auto Refresh")
+        st.subheader("ðŸ”„ Auto Refresh")
         auto_refresh = st.toggle(
             "Auto-refresh dashboard",
             value=False,
@@ -902,12 +1205,12 @@ def main():
         
         st.markdown("""
         **Features:**
-        - ✅ Simultaneous multi-stock recording
-        - ✅ Real-time performance monitoring  
-        - ✅ Concurrent API calls for speed
-        - ✅ Separate database thread
-        - ✅ Error tracking per symbol
-        - ✅ Queue-based data processing
+        - âœ… Simultaneous multi-stock recording
+        - âœ… Real-time performance monitoring  
+        - âœ… Concurrent API calls for speed
+        - âœ… Separate database thread
+        - âœ… Error tracking per symbol
+        - âœ… Queue-based data processing
         
         **Performance Tips:**
         - More workers = faster collection
@@ -917,17 +1220,17 @@ def main():
         """)
         
         # Connection status
-        st.subheader("🔗 Connection Status")
+        st.subheader("ðŸ”— Connection Status")
         
         # Test Supabase connection
         is_connected, conn_message = st.session_state.data_recorder.supabase_manager.test_connection()
         if is_connected:
-            st.success(f"✅ Supabase: {conn_message}")
+            st.success(f"âœ… Supabase: {conn_message}")
         else:
-            st.error(f"❌ Supabase: {conn_message}")
+            st.error(f"âŒ Supabase: {conn_message}")
             
             # Show troubleshooting tips
-            with st.expander("🔧 Troubleshooting Tips"):
+            with st.expander("ðŸ”§ Troubleshooting Tips"):
                 st.markdown("""
                 **Common Issues & Solutions:**
                 
@@ -949,7 +1252,5 @@ def main():
                 """)
         
         # Test Flattrade connection (placeholder)
-        st.info("🔄 Flattrade API - Ready (requires market hours for testing)")
-
-if __name__ == "__main__":
-    main()
+        st.info("ðŸ”„ Flattrade API - Ready (requires market hours for testing)")
+# Add this to your existing trade_app.py for Streamlit Cloud compatibility
