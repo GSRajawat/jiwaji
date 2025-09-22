@@ -23,7 +23,7 @@ SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 
 # Flattrade configuration
 FLATTRADE_CONFIG = {
-    "USER_SESSION": "78c0ed04e7880b6dc64c7ef121525c9f5555cabebf865f22e3e17c75abff903a",
+    "USER_SESSION": "b1de36f2c66db606b5dbe5fe45dfb40b0a2f391d0265edd01af0ad972a9d48db",
     "USER_ID": "FZ03508",
     "PASSWORD": "Shubhi@2",
     "BASE_URL": "https://piconnect.flattrade.in/PiConnectTP"
