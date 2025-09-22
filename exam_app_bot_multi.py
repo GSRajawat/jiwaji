@@ -41,7 +41,7 @@ def is_market_hours() -> bool:
 
     # Define market open and close times in IST
     market_open_time = now_ist.replace(hour=3, minute=45, second=0, microsecond=0)
-    market_close_time = now_ist.replace(hour=10 minute=0, second=0, microsecond=0)
+    market_close_time = now_ist.replace(hour=10, minute=0, second=0, microsecond=0)
 
     # Check if the current time is within the market hours
     if market_open_time <= now_ist <= market_close_time:
