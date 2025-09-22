@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
 from collections import defaultdict
 import numpy as np
+import streamlit as st
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -97,7 +98,7 @@ class FlattradeAPI:
             
         except Exception as e:
             logger.error(f"Error fetching historical data: {e}")
-            return []import streamlit as st
+            return []
 class SupabaseManager:
     def __init__(self):
         try:
