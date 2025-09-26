@@ -16,428 +16,345 @@ import json
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from api_helper import NorenApiPy
 
-# --- Configuration ---
-# Set logging level to DEBUG to see all detailed messages
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 # --- Flattrade API Credentials ---
-USER_SESSION = st.secrets.get("FLATTRADE_USER_SESSION", "f68b270591263a92f1d4182a6a5397142b0c254bdf885738c55d854445b3ac9c")
-USER_ID = st.secrets.get("FLATTRADE_USER_ID", "FZ03508")
+USER_SESSION = "f68b270591263a92f1d4182a6a5397142b0c254bdf885738c55d854445b3ac9c"
+USER_ID = "FZ03508"
+FLATTRADE_PASSWORD = "Shubhi@2"  # Note: Session is usually preferred over password/2FA for live trading
+# SUPABASE credentials are noted but not used in the Flattrade trading logic
+SUPABASE_URL = "https://zybakxpyibubzjhzdcwl.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp5YmFreHB5aWJ1YnpqaHpkY3dsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQ4OTQyMDgsImV4cCI6MjA3MDQ3MDIwOH0.8ZqreKy5zg_M-B1uH79T6lQXn62eRvvouo_OiMjwqGU"
 
-# --- Supabase Credentials ---
-SUPABASE_URL = st.secrets.get("SUPABASE_URL", "https://zybakxpyibubzjhzdcwl.supabase.co")
-SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp5YmFreHB5aWJ1YnpqaHpkY3dsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQ4OTQyMDgsImV4cCI6MjA3MDQ3MDIwOH0.8ZqreKy5zg_M-B1uH79T6lQXn62eRvvouo_OiMjwqGU")
+# --- Strategy Parameters ---
+PROFIT_TARGET = 0.04  # 4%
+# Using a 20-period EMA as a proxy for the custom VWAP bands
+# This is a major assumption as the custom VWAP bands are not standard API data.
+EMA_PERIOD = 20
 
-# Initialize Supabase client
-@st.cache_resource
-def init_supabase():
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+# --- Global State Variables for Trading Logic ---
+# These mimic the state tracking in the Backtest class
+entry_price = None
+target_hit_today = False
+last_exit_date = None
+last_exit_direction = None # 'long' or 'short'
+position_size = 0 # 0 for no position, positive for long, negative for short
 
-# Initialize Flattrade API
-@st.cache_resource
-def init_flattrade_api():
-    api = NorenApiPy()
-    # Set session with userid, usertoken, and password
-    # The password must be provided through a secure method, like Streamlit secrets
-    PASSWORD = st.secrets.get("FLATTRADE_PASSWORD") 
-    api.set_session(userid=USER_ID, usertoken=USER_SESSION, password=PASSWORD)
-    return api
-
-class OLAELECStrategy:
-    def __init__(self):
-        self.profit_target = 0.04  # 4% profit target
-        self.entry_price = None
-        self.current_position = None
-        self.position_size = 0
-        self.last_exit_date = None
-        self.last_exit_direction = None
-        self.target_hit_today = False
-        self.current_date = None
-        
-    def reset_daily_flags(self, current_date):
-        """Reset daily flags for new trading day"""
-        if self.current_date != current_date:
-            self.current_date = current_date
-            self.target_hit_today = False
-            self.last_exit_date = None
-            self.last_exit_direction = None
-    
-    def check_time_constraints(self, current_time):
-        """Check if current time is within trading hours"""
-        if current_time <= time(9, 30) or current_time >= time(15, 20):
-            return False
-        return True
-    
-    def check_exit_conditions(self, current_price):
-        """Check if position should be exited based on profit target"""
-        if not self.current_position or not self.entry_price:
-            return False
-            
-        if self.current_position == 'long':
-            profit_pct = (current_price - self.entry_price) / self.entry_price
-            return profit_pct >= self.profit_target
-        elif self.current_position == 'short':
-            profit_pct = (self.entry_price - current_price) / self.entry_price
-            return profit_pct >= self.profit_target
-        return False
-    
-    def get_signals(self, df):
-        """Generate buy/sell signals based on VWAP strategy"""
-        if len(df) < 2:
-            return None, None
-            
-        # Get last two candles
-        candle_1 = df.iloc[-1]  # Current candle
-        candle_2 = df.iloc[-2]  # Previous candle
-        
-        # Check sell conditions (short entry)
-        sell_condition_1 = (candle_2['Close'] < candle_2['Open'] and 
-                           candle_2['Close'] < candle_2['SDVWAP1_minus'])
-        sell_condition_2 = (candle_1['Close'] < candle_1['Open'] and 
-                           candle_1['Close'] < candle_1['SDVWAP1_minus'])
-        
-        # Check buy conditions (long entry)
-        buy_condition_1 = (candle_2['Close'] > candle_2['Open'] and 
-                          candle_2['Close'] > candle_2['SDVWAP1_plus'])
-        buy_condition_2 = (candle_1['Close'] > candle_1['Open'] and 
-                          candle_1['Close'] > candle_1['SDVWAP1_plus'])
-        
-        sell_signal = sell_condition_1 and sell_condition_2
-        buy_signal = buy_condition_1 and buy_condition_2
-        
-        return buy_signal, sell_signal
-
-def load_market_data():
-    """Load market data from CSV or database"""
+def initialize_flattrade():
+    """Initializes and logs into the Flattrade API."""
     try:
-        # This would typically load real-time data
-        # For demo purposes, we'll create sample data
-        dates = pd.date_range(start='2025-09-09 09:15:00', periods=100, freq='1Min')
+        ft = Flattrade(USER_ID)
+        # Assuming the API requires login, though a session ID is provided.
+        # Often a session ID (like USER_SESSION) is sufficient to instantiate and use.
+        # If the API needs explicit login, this block is used:
+        # login_response = ft.login(USER_ID, FLATTRADE_PASSWORD, 'OTP_OR_2FA_TOKEN')
+        # print("Flattrade Login Response:", login_response)
         
-        # Generate sample OHLC data with VWAP bands
-        np.random.seed(42)
-        base_price = 60.0
-        data = []
+        # Set the session ID provided in the credentials
+        ft.set_session_id(USER_SESSION)
         
-        for i, date in enumerate(dates):
-            price_change = np.random.normal(0, 0.5)
-            open_price = base_price + price_change
-            high_price = open_price + abs(np.random.normal(0, 0.3))
-            low_price = open_price - abs(np.random.normal(0, 0.3))
-            close_price = open_price + np.random.normal(0, 0.2)
-            volume = np.random.randint(1000, 10000)
-            
-            # Simple VWAP bands (would be calculated properly in real implementation)
-            vwap_plus = close_price * 1.02
-            vwap_minus = close_price * 0.98
-            
-            data.append({
-                'Date': date,
-                'Open': open_price,
-                'High': high_price,
-                'Low': low_price,
-                'Close': close_price,
-                'Volume': volume,
-                'SDVWAP1_plus': vwap_plus,
-                'SDVWAP1_minus': vwap_minus
-            })
-            
-            base_price = close_price
-        
-        df = pd.DataFrame(data)
-        df.set_index('Date', inplace=True)
-        return df
-        
+        # Check connection/session validity (optional but recommended)
+        user_details = ft.get_user_details()
+        if user_details and 'user_id' in user_details:
+             print(f"✅ Flattrade API initialized successfully for User: {user_details['user_id']}")
+             return ft
+        else:
+             print(f"❌ Failed to validate Flattrade session. Check USER_SESSION.")
+             sys.exit(1)
+             
     except Exception as e:
-        st.error(f"Error loading market data: {e}")
-        return None
+        print(f"❌ Error initializing Flattrade API: {e}")
+        sys.exit(1)
 
-def create_chart(df, signals_df=None):
-    """Create candlestick chart with VWAP bands and signals"""
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                        vertical_spacing=0.1,
-                        subplot_titles=('Price & VWAP Bands', 'Volume'),
-                        row_heights=[0.8, 0.2])
+def get_user_inputs():
+    """Gets and validates user inputs for the trade."""
+    print("\n--- Trade Setup ---")
     
-    # Candlestick chart
-    fig.add_trace(go.Candlestick(x=df.index,
-                                open=df['Open'],
-                                high=df['High'],
-                                low=df['Low'],
-                                close=df['Close'],
-                                name='OLAELEC'), row=1, col=1)
+    stock = input("Enter Stock/Instrument symbol (e.g., 'NTPC', 'RELIANCE'): ").upper().strip()
     
-    # VWAP bands
-    fig.add_trace(go.Scatter(x=df.index, y=df['SDVWAP1_plus'],
-                            mode='lines', name='VWAP+',
-                            line=dict(color='green', dash='dash')), row=1, col=1)
-    
-    fig.add_trace(go.Scatter(x=df.index, y=df['SDVWAP1_minus'],
-                            mode='lines', name='VWAP-',
-                            line=dict(color='red', dash='dash')), row=1, col=1)
-    
-    # Volume
-    fig.add_trace(go.Bar(x=df.index, y=df['Volume'],
-                        name='Volume'), row=2, col=1)
-    
-    # Add buy/sell signals if provided
-    if signals_df is not None and len(signals_df) > 0:
-        buy_signals = signals_df[signals_df['Signal'] == 'BUY']
-        sell_signals = signals_df[signals_df['Signal'] == 'SELL']
-        
-        if len(buy_signals) > 0:
-            fig.add_trace(go.Scatter(x=buy_signals['Time'], y=buy_signals['Price'],
-                                   mode='markers', name='Buy Signal',
-                                   marker=dict(color='green', size=10, symbol='triangle-up')),
-                         row=1, col=1)
-        
-        if len(sell_signals) > 0:
-            fig.add_trace(go.Scatter(x=sell_signals['Time'], y=sell_signals['Price'],
-                                   mode='markers', name='Sell Signal',
-                                   marker=dict(color='red', size=10, symbol='triangle-down')),
-                         row=1, col=1)
-    
-    fig.update_layout(title='OLAELEC Trading Strategy',
-                     xaxis_rangeslider_visible=False,
-                     height=800)
-    
-    return fig
+    while True:
+        try:
+            quantity = int(input("Enter Quantity (integer > 0): "))
+            if quantity > 0:
+                break
+            print("Quantity must be a positive integer.")
+        except ValueError:
+            print("Invalid input. Please enter an integer.")
 
-def execute_trade(api, signal_type, quantity, symbol="OLAELEC-EQ"):
-    """Execute trade through Flattrade API"""
+    order_type = input("Enter Order Type (MIS or CNC, default is MIS): ").upper().strip() or "MIS"
+    if order_type not in ["MIS", "CNC"]:
+        print("Invalid Order Type. Defaulting to MIS.")
+        order_type = "MIS"
+        
+    while True:
+        try:
+            capital = float(input("Enter Max Capital to risk (default 500.0): ")) or 500.0
+            if capital > 0:
+                break
+            print("Capital must be a positive number.")
+        except ValueError:
+            print("Invalid input. Defaulting to 500.0.")
+            capital = 500.0
+            break
+
+    print(f"\nTrade Parameters: Stock={stock}, Qty={quantity}, Type={order_type}, Capital Limit={capital}")
+    return stock, quantity, order_type, capital
+
+def get_instrument_token(ft: Flattrade, symbol: str):
+    """Fetches the instrument token for a given symbol."""
+    # Flattrade API usually needs the exchange and symbol. Assuming 'NSE' for equity.
     try:
-        buy_or_sell = 'B' if signal_type == 'BUY' else 'S'
+        # This is a placeholder as the exact search API may vary.
+        # Real-world APIs often require a mapping file or a search endpoint.
+        # For a known stock like 'NTPC', the token might be looked up from a local file.
+        print(f"Searching for instrument token for {symbol} on NSE...")
         
-        result = api.place_order(
-            buy_or_sell=buy_or_sell,
-            product_type='C',  # Cash
-            exchange='NSE',
-            tradingsymbol=symbol,
+        # Mocking a search function to find the token
+        search_result = ft.get_instrument_by_symbol('NSE', symbol) 
+        
+        if search_result and 'token' in search_result[0]:
+            token = search_result[0]['token']
+            print(f"Found Token: {token}")
+            return token
+        else:
+            print(f"❌ Could not find instrument token for {symbol}. Check symbol and exchange.")
+            sys.exit(1)
+            
+    except Exception as e:
+        print(f"❌ Error fetching instrument token: {e}")
+        sys.exit(1)
+        
+def fetch_and_prepare_data(ft: Flattrade, instrument_token: str, symbol: str) -> pd.DataFrame:
+    """
+    Fetches the latest minute-level data and calculates the required indicators (EMA).
+    
+    NOTE: This is a placeholder. Flattrade API usually provides historic candles.
+    We are mocking the data fetching for demonstration.
+    
+    In a real scenario, you'd fetch the last N minutes of data (e.g., 50 bars for a 5-min EMA)
+    and then append the real-time tick/quote data to calculate the latest value.
+    """
+    print(f"Fetching latest minute data for {symbol} (Token: {instrument_token})...")
+    
+    # --- MOCK DATA FOR DEMO ---
+    # You must replace this with actual API calls (e.g., historical data endpoint)
+    # The API might be `ft.get_historical_data(instrument_token, 'MINUTE', count=50)`
+    data = {
+        'Open': [100, 101, 102, 103, 104],
+        'High': [102, 103, 104, 105, 106],
+        'Low': [99, 100, 101, 102, 103],
+        'Close': [101, 102, 103, 104, 105],
+        'Volume': [1000, 1200, 1100, 1300, 1400],
+        # Replace the custom VWAP bands with an EMA for this demo
+        'EMA': [99.5, 100.5, 101.5, 102.5, 103.5] 
+    }
+    index = [
+        dt.datetime.now() - dt.timedelta(minutes=i) for i in range(5, 0, -1)
+    ]
+    df = pd.DataFrame(data, index=index)
+    df.index.name = 'Date'
+    # --- END MOCK DATA ---
+    
+    # In a real scenario, calculate the EMA on the fetched data
+    # df['EMA'] = df['Close'].ewm(span=EMA_PERIOD, adjust=False).mean()
+
+    # The strategy needs the last two candles (at least)
+    if len(df) < 2:
+        print("❌ Not enough data points to run strategy.")
+        return None
+        
+    print(f"Data prepared. Last close: {df['Close'].iloc[-1]}, Last EMA: {df['EMA'].iloc[-1]}")
+    return df
+
+def execute_trade(ft: Flattrade, instrument_token: str, symbol: str, quantity: int, order_type: str, price: float, transaction_type: str):
+    """Places an order using the Flattrade API."""
+    
+    # Flattrade API uses 'BUY' or 'SELL' for transaction_type
+    # order_type: 'MIS' or 'CNC'
+    # product_type: 'MARKET', 'LIMIT', etc.
+    
+    print(f"Attempting to place {transaction_type} order for {quantity} of {symbol} at Market price...")
+
+    try:
+        order_response = ft.place_order(
+            instrument_token=instrument_token,
+            transaction_type=transaction_type,  # 'BUY' or 'SELL'
             quantity=quantity,
-            discloseqty=0,
-            price_type='MKT',  # Market order
-            retention='DAY'
+            product_type=order_type,            # 'MIS' or 'CNC'
+            order_type='MARKET',                # Placing Market Order
+            price=0.0                           # Market price, so price is 0
         )
         
-        return result
-    except Exception as e:
-        st.error(f"Error executing trade: {e}")
-        return None
-
-def save_trade_to_db(supabase, trade_data):
-    """Save trade data to Supabase"""
-    try:
-        result = supabase.table('trades').insert(trade_data).execute()
-        return result
-    except Exception as e:
-        st.error(f"Error saving trade to database: {e}")
-        return None
-
-def main():
-    st.set_page_config(page_title="OLAELEC Trading App", layout="wide")
-    
-    st.title("OLAELEC Trading Strategy App")
-    
-    # Check if user is logged in
-    if 'logged_in' not in st.session_state:
-        st.session_state['logged_in'] = False
-    
-    # Initialize connections
-    try:
-        supabase = init_supabase()
-        strategy = OLAELECStrategy()
-        
-        # Handle API initialization
-        if not st.session_state['logged_in']:
-            api = init_flattrade_api()
-            if api is None:
-                # Show login form
-                api = login_to_flattrade()
-                if api is None:
-                    st.stop()
+        if order_response and 'order_id' in order_response:
+            print(f"✅ Order placed successfully! ID: {order_response['order_id']}")
+            # In a real system, you would check for order execution status here
+            return True
         else:
-            api = init_flattrade_api()
+            print(f"❌ Order failed: {order_response}")
+            return False
             
     except Exception as e:
-        st.error(f"Error initializing APIs: {e}")
+        print(f"❌ Error executing trade: {e}")
+        return False
+
+def check_and_trade(ft: Flattrade, instrument_token: str, symbol: str, base_quantity: int, order_type: str, df: pd.DataFrame):
+    """
+    Applies the strategy logic to the latest data and executes trades.
+    
+    NOTE: Replaced custom VWAP bands with a 20-period EMA (df['EMA']).
+    Buy/Sell conditions are adapted: Crossover of Close and EMA.
+    """
+    global entry_price, target_hit_today, last_exit_date, last_exit_direction, position_size
+    
+    current_datetime = df.index[-1]
+    current_time = current_datetime.time()
+    current_date = current_datetime.date()
+    current_close = df['Close'].iloc[-1]
+    
+    # --- Daily Reset (Mimics Backtest init) ---
+    # This should ideally be outside and check against a persistent state
+    # For a simple script, we assume a new run or a timed loop handles this.
+    
+    # --- Time Check ---
+    if current_time < dt.time(9, 30):
+        print("Market not open yet (before 9:30 AM). Waiting...")
         return
+        
+    # --- Intraday Square Off (3:20 PM) ---
+    if current_time >= dt.time(15, 20):
+        if position_size != 0:
+            print(f"🕒 Squaring off position at 3:20 PM...")
+            transaction_type = 'BUY' if position_size < 0 else 'SELL'
+            success = execute_trade(ft, instrument_token, symbol, abs(position_size), 'MIS', current_close, transaction_type)
+            if success:
+                position_size = 0
+                entry_price = None
+                target_hit_today = True # No re-entry after final square-off
+        return
+        
+    # --- Exit Logic (Profit Target) ---
+    if position_size != 0 and entry_price is not None:
+        profit_pct = 0
+        if position_size > 0: # Long
+            profit_pct = (current_close - entry_price) / entry_price
+        elif position_size < 0: # Short
+            profit_pct = (entry_price - current_close) / entry_price
+            
+        if profit_pct >= PROFIT_TARGET:
+            print(f"💰 Profit target ({PROFIT_TARGET*100}%) hit at {current_close}. Exiting position.")
+            transaction_type = 'BUY' if position_size < 0 else 'SELL'
+            success = execute_trade(ft, instrument_token, symbol, abs(position_size), 'MIS', current_close, transaction_type)
+            
+            if success:
+                # Update state after successful exit
+                last_exit_date = current_date
+                last_exit_direction = 'long' if position_size > 0 else 'short'
+                target_hit_today = True
+                position_size = 0
+                entry_price = None
+                return # Stop further logic for this bar
     
-    # Sidebar for controls
-    with st.sidebar:
-        st.header("Trading Controls")
-        
-        # Trading parameters
-        st.subheader("Strategy Parameters")
-        profit_target = st.slider("Profit Target (%)", 1, 10, 4) / 100
-        strategy.profit_target = profit_target
-        
-        quantity = st.number_input("Quantity", min_value=1, value=1)
-        symbol = st.text_input("Trading Symbol", value="OLAELEC-EQ")
-        
-        # Auto-trading toggle
-        auto_trading = st.toggle("Enable Auto Trading", False)
-        
-        # Manual trade buttons
-        st.subheader("Manual Trading")
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if st.button("ðŸ”´ Manual Sell", type="secondary"):
-                if auto_trading:
-                    result = execute_trade(api, 'SELL', quantity, symbol)
-                    if result and result.get('stat') == 'Ok':
-                        st.success(f"Sell order placed: {result.get('norenordno')}")
-                    else:
-                        st.error("Failed to place sell order")
-        
-        with col2:
-            if st.button("ðŸŸ¢ Manual Buy", type="primary"):
-                if auto_trading:
-                    result = execute_trade(api, 'BUY', quantity, symbol)
-                    if result and result.get('stat') == 'Ok':
-                        st.success(f"Buy order placed: {result.get('norenordno')}")
-                    else:
-                        st.error("Failed to place buy order")
+    # --- Target Hit Restriction ---
+    if target_hit_today:
+        print(f"🚫 Target hit today. No further entries.")
+        return
+
+    # --- Strategy Entry Logic (Adapted to Close vs EMA) ---
+    # Get previous two candles' data and EMA values
+    candle_minus_1_close = df['Close'].iloc[-1]
+    candle_minus_2_close = df['Close'].iloc[-2]
+    ema_val_1 = df['EMA'].iloc[-1]
+    ema_val_2 = df['EMA'].iloc[-2]
+
+    # SELL condition (Simplified): Close crosses below EMA and stays below.
+    # Original logic: close < open AND close < vwap_minus (for two consecutive bars)
+    sell_condition_1 = candle_minus_2_close < ema_val_2
+    sell_condition_2 = candle_minus_1_close < ema_val_1
     
-    # Main content area
-    col1, col2 = st.columns([2, 1])
+    # BUY condition (Simplified): Close crosses above EMA and stays above.
+    # Original logic: close > open AND close > vwap_plus (for two consecutive bars)
+    buy_condition_1 = candle_minus_2_close > ema_val_2
+    buy_condition_2 = candle_minus_1_close > ema_val_1
+
+    if position_size == 0:
+        # No position - enter fresh
+        if sell_condition_1 and sell_condition_2:
+            if last_exit_direction != 'short' or last_exit_date != current_date:
+                print(f"⬇️ SELL signal detected. Entering fresh SHORT position.")
+                success = execute_trade(ft, instrument_token, symbol, base_quantity, order_type, current_close, 'SELL')
+                if success:
+                    position_size = -base_quantity
+                    entry_price = current_close
+            else:
+                print("🚫 SELL signal ignored: Restricted due to previous same-direction exit today.")
+                
+        elif buy_condition_1 and buy_condition_2:
+            if last_exit_direction != 'long' or last_exit_date != current_date:
+                print(f"⬆️ BUY signal detected. Entering fresh LONG position.")
+                success = execute_trade(ft, instrument_token, symbol, base_quantity, order_type, current_close, 'BUY')
+                if success:
+                    position_size = base_quantity
+                    entry_price = current_close
+            else:
+                print("🚫 BUY signal ignored: Restricted due to previous same-direction exit today.")
     
-    with col1:
-        st.subheader("ðŸ“ˆ Market Data & Signals")
+    else:
+        # Have position - check for opposite signal (Reverse and Triple)
+        current_abs_size = abs(position_size)
+        triple_size = current_abs_size * 3
         
-        # Load and display market data
-        df = load_market_data()
+        if position_size > 0 and sell_condition_1 and sell_condition_2: # Long position + Short signal
+            print(f"🔄 Reverse signal (Long -> Short) detected. Exiting Long and entering {triple_size} Short.")
+            # Execute a SELL order for triple_size: This closes the 'current_abs_size' long
+            # and opens a short for 'triple_size - current_abs_size'
+            success = execute_trade(ft, instrument_token, symbol, triple_size, order_type, current_close, 'SELL')
+            if success:
+                position_size = -triple_size
+                entry_price = current_close
+                
+        elif position_size < 0 and buy_condition_1 and buy_condition_2: # Short position + Long signal
+            print(f"🔄 Reverse signal (Short -> Long) detected. Exiting Short and entering {triple_size} Long.")
+            # Execute a BUY order for triple_size: This closes the 'current_abs_size' short
+            # and opens a long for 'triple_size - current_abs_size'
+            success = execute_trade(ft, instrument_token, symbol, triple_size, order_type, current_close, 'BUY')
+            if success:
+                position_size = triple_size
+                entry_price = current_close
+                
+def main():
+    """Main function to run the live trading script."""
+    
+    # 1. Initialize API and get user inputs
+    ft = initialize_flattrade()
+    symbol, quantity, order_type, capital = get_user_inputs()
+    
+    # 2. Get Instrument Token
+    instrument_token = get_instrument_token(ft, symbol)
+    
+    # --- Live Trading Loop ---
+    # In a real scenario, this loop runs every minute (or 5 minutes, matching the bar size)
+    # The total capital limit is for risk management outside this script.
+    
+    # For a demonstration, we will just run the logic once with mock data
+    print("\n--- Starting Trading Simulation (Once-off run with mock data) ---")
+    
+    try:
+        # 3. Fetch and prepare data
+        df = fetch_and_prepare_data(ft, instrument_token, symbol)
+        
         if df is not None:
-            # Get current signals
-            current_time = datetime.now().time()
-            current_date = datetime.now().date()
+            # 4. Apply strategy and trade
+            check_and_trade(ft, instrument_token, symbol, quantity, order_type, df)
             
-            strategy.reset_daily_flags(current_date)
-            
-            if strategy.check_time_constraints(current_time):
-                buy_signal, sell_signal = strategy.get_signals(df)
-                
-                # Display current signals
-                signal_col1, signal_col2, signal_col3 = st.columns(3)
-                
-                with signal_col1:
-                    if buy_signal:
-                        st.success("ðŸŸ¢ BUY SIGNAL ACTIVE")
-                    else:
-                        st.info("âšª No Buy Signal")
-                
-                with signal_col2:
-                    if sell_signal:
-                        st.error("ðŸ”´ SELL SIGNAL ACTIVE")
-                    else:
-                        st.info("âšª No Sell Signal")
-                
-                with signal_col3:
-                    current_price = df['Close'].iloc[-1]
-                    st.metric("Current Price", f"â‚¹{current_price:.2f}")
-                
-                # Auto-execute trades
-                if auto_trading:
-                    if buy_signal and not strategy.current_position:
-                        result = execute_trade(api, 'BUY', quantity, symbol)
-                        if result and result.get('stat') == 'Ok':
-                            strategy.current_position = 'long'
-                            strategy.position_size = quantity
-                            strategy.entry_price = current_price
-                            st.success("âœ… Auto Buy Order Executed!")
-                    
-                    elif sell_signal and not strategy.current_position:
-                        result = execute_trade(api, 'SELL', quantity, symbol)
-                        if result and result.get('stat') == 'Ok':
-                            strategy.current_position = 'short'
-                            strategy.position_size = quantity
-                            strategy.entry_price = current_price
-                            st.success("âœ… Auto Sell Order Executed!")
-                    
-                    # Check exit conditions
-                    if strategy.check_exit_conditions(current_price):
-                        exit_signal = 'SELL' if strategy.current_position == 'long' else 'BUY'
-                        result = execute_trade(api, exit_signal, strategy.position_size, symbol)
-                        if result and result.get('stat') == 'Ok':
-                            strategy.current_position = None
-                            strategy.position_size = 0
-                            strategy.entry_price = None
-                            strategy.target_hit_today = True
-                            st.success("âœ… Position Closed at Target!")
-            
-            else:
-                st.warning("â° Outside Trading Hours (9:30 AM - 3:20 PM)")
-            
-            # Create and display chart
-            chart = create_chart(df)
-            st.plotly_chart(chart, use_container_width=True)
-        
-        else:
-            st.error("Failed to load market data")
+    except KeyboardInterrupt:
+        print("\n👋 Trading loop manually stopped.")
+    except Exception as e:
+        print(f"\n❌ An unhandled error occurred in the trading loop: {e}")
+        import traceback
+        traceback.print_exc()
+
+    print("\n--- Trading session finished. ---")
+    print(f"Final Position Size: {position_size} (Positive for Long, Negative for Short)")
     
-    with col2:
-        st.subheader("ðŸ“Š Position & Status")
-        
-        # Current position status
-        if strategy.current_position:
-            st.info(f"Position: {strategy.current_position.upper()}")
-            st.info(f"Size: {strategy.position_size}")
-            st.info(f"Entry: â‚¹{strategy.entry_price:.2f}")
-            
-            if df is not None:
-                current_price = df['Close'].iloc[-1]
-                if strategy.current_position == 'long':
-                    pnl = (current_price - strategy.entry_price) * strategy.position_size
-                    pnl_pct = (current_price - strategy.entry_price) / strategy.entry_price * 100
-                else:
-                    pnl = (strategy.entry_price - current_price) * strategy.position_size
-                    pnl_pct = (strategy.entry_price - current_price) / strategy.entry_price * 100
-                
-                if pnl >= 0:
-                    st.success(f"P&L: +â‚¹{pnl:.2f} ({pnl_pct:.2f}%)")
-                else:
-                    st.error(f"P&L: â‚¹{pnl:.2f} ({pnl_pct:.2f}%)")
-        else:
-            st.info("No Open Position")
-        
-        # Account status
-        # Account status
-        # Account status
-        st.subheader("ðŸ’° Account Status")
-        try:
-            # Get account details from the API
-            account_details = api.get_limits()
-            
-            # Print the full response to see the available keys
-            st.write(account_details)
-
-            # Use the correct keys from the API response
-            cash = account_details.get('cash', 'N/A')
-            available = account_details.get('margin', 'N/A')
-
-            st.info(f"Cash: â‚¹{cash}")
-            st.info(f"Available: â‚¹{available}")
-
-        except Exception as e:
-            st.warning(f"Could not fetch account details: {e}")
-        
-        # Recent trades
-        st.subheader("ðŸ“‹ Recent Trades")
-        try:
-            # Get order book from API
-            orders = api.get_order_book()
-            if orders and len(orders) > 0:
-                orders_df = pd.DataFrame(orders[:5])  # Show last 5 orders
-                st.dataframe(orders_df[['tsym', 'trantype', 'qty', 'status']], 
-                           use_container_width=True)
-            else:
-                st.info("No recent trades")
-        except Exception as e:
-            st.warning(f"Could not fetch orders: {e}")
-        
-        # Refresh button
-        if st.button("ðŸ”„ Refresh Data", type="secondary"):
-            st.rerun()
-
 if __name__ == "__main__":
     main()
