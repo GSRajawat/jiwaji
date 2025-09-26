@@ -10,6 +10,7 @@ python-dotenv
 plotly
 yfinance
 pytz
+flattrade-api
 
 
 
