@@ -1,1256 +1,560 @@
-import streamlit as st
-import pandas as pd
-from supabase import create_client, Client
-import requests
-import json
-import time
-from datetime import datetime, timedelta
-import threading
-import hashlib
-import hmac
-from typing import Dict, List, Optional
-import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import queue
-from collections import defaultdict
-import numpy as np
-import pytz # Add this import
+# live_trader_olaelec.py
 
-# Supabase configuration
+import pandas as pd
+import numpy as np
+import requests
+import hashlib
+import time
+from datetime import datetime, time as dt_time
+import json
+import threading
+from supabase import create_client, Client
+import warnings
+warnings.filterwarnings('ignore')
+
+# --- Flattrade API Credentials ---
+USER_SESSION = "f68b270591263a92f1d4182a6a5397142b0c254bdf885738c55d854445b3ac9c"
+USER_ID = "FZ03508"
+FLATTRADE_PASSWORD = "Shubhi@2"
+API_SECRET = "your_api_secret_here"  # You'll need to get this from Flattrade
+
+# --- Supabase Credentials ---
 SUPABASE_URL = "https://zybakxpyibubzjhzdcwl.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp5YmFreHB5aWJ1YnpqaHpkY3dsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQ4OTQyMDgsImV4cCI6MjA3MDQ3MDIwOH0.8ZqreKy5zg_M-B1uH79T6lQXn62eRvvouo_OiMjwqGU"
 
-# Flattrade configuration
-FLATTRADE_CONFIG = {
-    "USER_SESSION": "b1de36f2c66db606b5dbe5fe45dfb40b0a2f391d0265edd01af0ad972a9d48db",
-    "USER_ID": "FZ03508",
-    "PASSWORD": "Shubhi@2",
-    "BASE_URL": "https://piconnect.flattrade.in/PiConnectTP"
-}
-def is_market_hours() -> bool:
-    """
-    Check if the current time is within Indian market hours (IST),
-    which are from 9:15 AM to 3:30 PM on weekdays (Monday to Friday).
-    """
-    ist = pytz.timezone('Asia/Kolkata')
-    now_ist = datetime.now(ist)
-
-    # Check if it's a weekday (Monday=0, Friday=4)
-    if now_ist.weekday() >= 5: # Saturday or Sunday
-        return False
-
-    # Define market open and close times in IST
-    market_open_time = now_ist.replace(hour=3, minute=45, second=0, microsecond=0)
-    market_close_time = now_ist.replace(hour=10, minute=0, second=0, microsecond=0)
-
-    # Check if the current time is within the market hours
-    if market_open_time <= now_ist <= market_close_time:
-        return True
-    else:
-        return False
 class FlattradeAPI:
-    def __init__(self):
-        self.config = FLATTRADE_CONFIG
-        self.session = requests.Session()
+    def __init__(self, user_id, password, user_session, api_secret):
+        self.user_id = user_id
+        self.password = password
+        self.user_session = user_session
+        self.api_secret = api_secret
+        self.base_url = "https://piconnect.flattrade.in/PiConnectTP"
+        self.session_token = None
+        self.login()
     
-    def get_market_data(self, symbol: str, exchange: str = "NSE") -> Optional[Dict]:
-        """Get real-time market data from Flattrade"""
+    def sha256_hash(self, data):
+        """Generate SHA256 hash"""
+        return hashlib.sha256(data.encode()).hexdigest()
+    
+    def login(self):
+        """Login to Flattrade API"""
         try:
-            # Note: This is a simplified example. You'll need to implement proper Flattrade API calls
-            # based on their documentation. This includes proper authentication and API endpoints.
+            # Create hash for login
+            hash_string = f"{self.user_id}|{self.password}"
+            app_key = self.sha256_hash(hash_string + self.api_secret)
             
-            url = f"{self.config['BASE_URL']}/GetQuotes"
-            payload = {
-                "uid": self.config["USER_ID"],
-                "actid": self.config["USER_ID"],
-                "exch": exchange,
-                "token": symbol,
+            login_data = {
+                "apkversion": "1.0.0",
+                "uid": self.user_id,
+                "pwd": self.sha256_hash(self.password),
+                "factor2": "second_factor",
+                "vc": "vendor_code",
+                "appkey": app_key,
+                "imei": "mac_address",
+                "source": "API"
             }
             
-            # Add authentication headers as required by Flattrade API
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.config['USER_SESSION']}"
-            }
-            
-            response = self.session.post(url, json=payload, headers=headers)
+            response = requests.post(f"{self.base_url}/QuickAuth", json=login_data)
             
             if response.status_code == 200:
-                return response.json()
-            else:
-                logger.error(f"API call failed: {response.status_code} - {response.text}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error fetching market data: {e}")
-            return None
-    
-    def get_historical_data(self, symbol: str, exchange: str = "NSE", 
-                          from_date: str = None, to_date: str = None) -> List[Dict]:
-        """Get historical candle data"""
-        try:
-            # Implement historical data fetching based on Flattrade API
-            # This is a placeholder - you'll need to implement based on actual API
-            url = f"{self.config['BASE_URL']}/TPSeries"
-            payload = {
-                "uid": self.config["USER_ID"],
-                "exch": exchange,
-                "token": symbol,
-                "st": from_date or datetime.now().strftime("%d-%m-%Y"),
-                "et": to_date or datetime.now().strftime("%d-%m-%Y"),
-                "intrv": "1"  # 1 minute interval
-            }
-            
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.config['USER_SESSION']}"
-            }
-            
-            response = self.session.post(url, json=payload, headers=headers)
-            
-            if response.status_code == 200:
-                data = response.json()
-                return data.get('data', [])
-            return []
-            
-        except Exception as e:
-            logger.error(f"Error fetching historical data: {e}")
-            return []
-class SupabaseManager:
-    def __init__(self):
-        try:
-            self.client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-            self.connection_status = "Connected"
-        except Exception as e:
-            logger.error(f"Failed to initialize Supabase client: {e}")
-            self.connection_status = f"Failed: {str(e)}"
-            self.client = None
-    
-    def test_connection(self) -> tuple[bool, str]:
-        """Test Supabase connection"""
-        if not self.client:
-            return False, "Client not initialized"
-        
-        try:
-            # Try to access a system table to test connection
-            result = self.client.from_('stock_candles').select('*').limit(1).execute()
-            return True, "Connected successfully"
-        except Exception as e:
-            error_msg = str(e).lower()
-            if "relation" in error_msg and "does not exist" in error_msg:
-                return False, "Table 'stock_candles' does not exist. Please create it first."
-            elif "invalid" in error_msg or "unauthorized" in error_msg:
-                return False, f"Authentication failed: {str(e)}"
-            else:
-                return False, f"Connection error: {str(e)}"
-    
-    def create_candle_table(self) -> bool:
-        """Create the candle data table if it doesn't exist"""
-        try:
-            if not self.client:
-                st.error("Supabase client not initialized")
-                return False
-                
-            # SQL schema for creating the table
-            sql_schema = """
-            CREATE TABLE IF NOT EXISTS stock_candles (
-                id SERIAL PRIMARY KEY,
-                symbol VARCHAR(50) NOT NULL,
-                timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
-                open_price DECIMAL(10, 2) NOT NULL,
-                high_price DECIMAL(10, 2) NOT NULL,
-                low_price DECIMAL(10, 2) NOT NULL,
-                close_price DECIMAL(10, 2) NOT NULL,
-                volume BIGINT NOT NULL,
-                vwap DECIMAL(10, 2),
-                sdvwap1_plus DECIMAL(10, 2),
-                sdvwap1_minus DECIMAL(10, 2),
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                UNIQUE(symbol, timestamp)
-            );
-            
-            CREATE INDEX IF NOT EXISTS idx_stock_candles_symbol_timestamp 
-            ON stock_candles(symbol, timestamp DESC);
-            """
-            
-            st.info("ðŸ”§ **Database Setup Required**")
-            st.markdown("""
-            **Step 1:** Go to your Supabase Dashboard â†’ SQL Editor
-            
-            **Step 2:** Run this SQL command:
-            """)
-            st.code(sql_schema, language="sql")
-            
-            st.markdown("""
-            **Step 3:** After running the SQL, click 'Test Connection' below to verify.
-            """)
-            
-            # Try to execute the SQL directly (requires RLS to be disabled or proper policies)
-            try:
-                # This might not work if RLS is enabled without proper policies
-                result = self.client.rpc('sql', {'query': sql_schema}).execute()
-                st.success("âœ… Table created successfully!")
-                return True
-            except Exception as e:
-                st.warning(f"âš ï¸ Could not create table automatically: {str(e)}")
-                st.info("Please run the SQL manually in your Supabase dashboard.")
-                return False
-                
-        except Exception as e:
-            st.error(f"Error in table creation process: {e}")
-            return False
-    
-    def insert_candle_data(self, candle_data: Dict) -> bool:
-        """Insert candle data into Supabase"""
-        if not self.client:
-            logger.error("Supabase client not initialized")
-            return False
-            
-        try:
-            # Adjust field names to match database schema
-            formatted_data = {
-                "symbol": candle_data.get("symbol"),
-                "timestamp": candle_data.get("timestamp"),
-                "open_price": candle_data.get("open"),
-                "high_price": candle_data.get("high"),
-                "low_price": candle_data.get("low"),
-                "close_price": candle_data.get("close"),
-                "volume": candle_data.get("volume"),
-                "vwap": candle_data.get("vwap"),
-                "sdvwap1_plus": candle_data.get("sdvwap1_plus"),
-                "sdvwap1_minus": candle_data.get("sdvwap1_minus")
-            }
-            
-            result = self.client.table('stock_candles').insert(formatted_data).execute()
-            return True
-        except Exception as e:
-            logger.error(f"Error inserting candle data: {e}")
-            return False
-    
-    def get_latest_candles(self, symbol: str, limit: int = 100) -> pd.DataFrame:
-        """Get latest candle data for a symbol"""
-        if not self.client:
-            logger.error("Supabase client not initialized")
-            return pd.DataFrame()
-            
-        try:
-            result = self.client.table('stock_candles')\
-                .select('*')\
-                .eq('symbol', symbol)\
-                .order('timestamp', desc=True)\
-                .limit(limit)\
-                .execute()
-            
-            if result.data:
-                df = pd.DataFrame(result.data)
-                # Rename columns to match expected format
-                column_mapping = {
-                    'open_price': 'open',
-                    'high_price': 'high',
-                    'low_price': 'low',
-                    'close_price': 'close'
-                }
-                df = df.rename(columns=column_mapping)
-                return df
-            return pd.DataFrame()
-        except Exception as e:
-            logger.error(f"Error fetching candle data: {e}")
-            return pd.DataFrame()
-    
-    def get_historical_data_for_indicators(self, symbol: str, limit: int = 50) -> pd.DataFrame:
-        """Get historical data needed for indicator calculations"""
-        if not self.client:
-            return pd.DataFrame()
-            
-        try:
-            result = self.client.table('stock_candles')\
-                .select('timestamp, open_price, high_price, low_price, close_price, volume')\
-                .eq('symbol', symbol)\
-                .order('timestamp', desc=False)\
-                .limit(limit)\
-                .execute()
-            
-            if result.data:
-                df = pd.DataFrame(result.data)
-                df['timestamp'] = pd.to_datetime(df['timestamp'])
-                return df.sort_values('timestamp')
-            return pd.DataFrame()
-        except Exception as e:
-            logger.error(f"Error fetching historical data: {e}")
-            return pd.DataFrame()
-
-class TechnicalIndicators:
-    """Calculate technical indicators for stock data"""
-    
-    @staticmethod
-    def calculate_vwap(df: pd.DataFrame) -> float:
-        """Calculate Volume Weighted Average Price"""
-        if df.empty or len(df) == 0:
-            return None
-        
-        try:
-            # VWAP = Sum(Price * Volume) / Sum(Volume)
-            # Using typical price (HLC/3) for calculation
-            typical_price = (df['high_price'] + df['low_price'] + df['close_price']) / 3
-            price_volume = typical_price * df['volume']
-            
-            vwap = price_volume.sum() / df['volume'].sum()
-            return float(vwap)
-        except Exception as e:
-            logger.error(f"Error calculating VWAP: {e}")
-            return None
-    
-    @staticmethod
-    def calculate_sdvwap(df: pd.DataFrame, period: int = 14, multiplier: float = 1.0) -> tuple:
-        """
-        Calculate Standard Deviation VWAP bands
-        
-        Args:
-            df: DataFrame with OHLCV data
-            period: Period for standard deviation calculation (default: 14)
-            multiplier: Standard deviation multiplier (default: 1.0)
-            
-        Returns:
-            tuple: (sdvwap_plus, sdvwap_minus)
-        """
-        if df.empty or len(df) < period:
-            return None, None
-        
-        try:
-            # Calculate VWAP first
-            vwap = TechnicalIndicators.calculate_vwap(df)
-            if vwap is None:
-                return None, None
-            
-            # Calculate typical price
-            typical_price = (df['high_price'] + df['low_price'] + df['close_price']) / 3
-            
-            # Take the last 'period' values for standard deviation calculation
-            recent_prices = typical_price.tail(period)
-            
-            # Calculate standard deviation
-            std_dev = recent_prices.std()
-            
-            # Calculate bands
-            sdvwap_plus = vwap + (multiplier * std_dev)
-            sdvwap_minus = vwap - (multiplier * std_dev)
-            
-            return float(sdvwap_plus), float(sdvwap_minus)
-            
-        except Exception as e:
-            logger.error(f"Error calculating SDVWAP: {e}")
-            return None, None
-
-class FlattradeAPI:
-    def __init__(self):
-        self.config = FLATTRADE_CONFIG
-        self.session = requests.Session()
-    
-    def get_market_data(self, symbol: str, exchange: str = "NSE") -> Optional[Dict]:
-        """Get real-time market data from Flattrade"""
-        try:
-            # Note: This is a simplified example. You'll need to implement proper Flattrade API calls
-            # based on their documentation. This includes proper authentication and API endpoints.
-            
-            url = f"{self.config['BASE_URL']}/GetQuotes"
-            payload = {
-                "uid": self.config["USER_ID"],
-                "actid": self.config["USER_ID"],
-                "exch": exchange,
-                "token": symbol,
-            }
-            
-            # Add authentication headers as required by Flattrade API
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.config['USER_SESSION']}"
-            }
-            
-            response = self.session.post(url, json=payload, headers=headers)
-            
-            if response.status_code == 200:
-                return response.json()
-            else:
-                logger.error(f"API call failed: {response.status_code} - {response.text}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error fetching market data: {e}")
-            return None
-    
-    def get_historical_data(self, symbol: str, exchange: str = "NSE", 
-                          from_date: str = None, to_date: str = None) -> List[Dict]:
-        """Get historical candle data"""
-        try:
-            # Implement historical data fetching based on Flattrade API
-            # This is a placeholder - you'll need to implement based on actual API
-            url = f"{self.config['BASE_URL']}/TPSeries"
-            payload = {
-                "uid": self.config["USER_ID"],
-                "exch": exchange,
-                "token": symbol,
-                "st": from_date or datetime.now().strftime("%d-%m-%Y"),
-                "et": to_date or datetime.now().strftime("%d-%m-%Y"),
-                "intrv": "1"  # 1 minute interval
-            }
-            
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.config['USER_SESSION']}"
-            }
-            
-            response = self.session.post(url, json=payload, headers=headers)
-            
-            if response.status_code == 200:
-                data = response.json()
-                return data.get('data', [])
-            return []
-            
-        except Exception as e:
-            logger.error(f"Error fetching historical data: {e}")
-            return []
-
-class DataRecorder:
-    def __init__(self):
-        self.supabase_manager = SupabaseManager()
-        self.flattrade_api = FlattradeAPI()
-        self.technical_indicators = TechnicalIndicators()
-        self.is_recording = False
-        self.recording_threads = {}
-        self.recording_stats = {}  # Changed from defaultdict to regular dict
-        self.data_queue = queue.Queue()
-        self.max_workers = 200  # Maximum concurrent threads for API calls
-    
-    def _init_symbol_stats(self, symbol: str):
-        """Initialize statistics for a symbol"""
-        self.recording_stats[symbol] = {
-            'last_update': None,
-            'total_records': 0,
-            'errors': 0,
-            'status': 'Stopped'
-        }
-    
-    def start_recording(self, symbols: List[str], interval_seconds: int = 60):
-        """Start recording data for given symbols"""
-        if self.is_recording:
-            return False, "Recording already in progress"
-        
-        if not symbols:
-            return False, "No symbols provided"
-        
-        self.is_recording = True
-        
-        # Initialize stats for all symbols
-        for symbol in symbols:
-            self._init_symbol_stats(symbol)
-            self.recording_stats[symbol]['status'] = 'Starting...'
-        
-        # Start main recording thread
-        self.main_recording_thread = threading.Thread(
-            target=self._main_recording_loop,
-            args=(symbols, interval_seconds),
-            daemon=True
-        )
-        self.main_recording_thread.start()
-        
-        # Start database writer thread
-        self.db_writer_thread = threading.Thread(
-            target=self._database_writer_loop,
-            daemon=True
-        )
-        self.db_writer_thread.start()
-        
-        return True, f"Started recording for {len(symbols)} symbols"
-    
-    def stop_recording(self):
-        """Stop recording data"""
-        if not self.is_recording:
-            return "Recording was not active"
-        
-        self.is_recording = False
-        
-        # Update all symbols status
-        for symbol in self.recording_stats:
-            self.recording_stats[symbol]['status'] = 'Stopping...'
-        
-        # Wait for threads to finish
-        if hasattr(self, 'main_recording_thread') and self.main_recording_thread.is_alive():
-            self.main_recording_thread.join(timeout=5)
-        
-        if hasattr(self, 'db_writer_thread') and self.db_writer_thread.is_alive():
-            self.db_writer_thread.join(timeout=5)
-        
-        # Update final status
-        for symbol in self.recording_stats:
-            self.recording_stats[symbol]['status'] = 'Stopped'
-        
-        return "Recording stopped successfully"
-    
-    def _main_recording_loop(self, symbols: List[str], interval_seconds: int):
-        """Main recording loop using ThreadPoolExecutor for concurrent API calls"""
-        logger.info(f"Starting recording for symbols: {symbols}")
-        
-        while self.is_recording:
-            start_time = time.time()
-            current_time = datetime.now()
-            
-            # Use ThreadPoolExecutor for concurrent API calls
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                # Submit all API calls concurrently
-                future_to_symbol = {
-                    executor.submit(self._fetch_and_process_symbol, symbol, current_time): symbol
-                    for symbol in symbols
-                }
-                
-                # Process completed futures as they finish
-                for future in as_completed(future_to_symbol):
-                    symbol = future_to_symbol[future]
-                    try:
-                        result = future.result()
-                        if result:
-                            self.recording_stats[symbol]['status'] = 'Recording'
-                            self.recording_stats[symbol]['last_update'] = current_time
-                        else:
-                            self.recording_stats[symbol]['errors'] += 1
-                            self.recording_stats[symbol]['status'] = 'Error'
-                    except Exception as e:
-                        logger.error(f"Error processing {symbol}: {e}")
-                        self.recording_stats[symbol]['errors'] += 1
-                        self.recording_stats[symbol]['status'] = 'Error'
-            
-            # Calculate how long to sleep to maintain interval
-            elapsed_time = time.time() - start_time
-            sleep_time = max(0, interval_seconds - elapsed_time)
-            
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            else:
-                logger.warning(f"Recording cycle took {elapsed_time:.2f}s, longer than interval {interval_seconds}s")
-    
-    def _fetch_and_process_symbol(self, symbol: str, timestamp: datetime) -> bool:
-        """Fetch and process data for a single symbol"""
-        try:
-            # Get market data from Flattrade
-            market_data = self.flattrade_api.get_market_data(symbol)
-            
-            if market_data:
-                # Parse the data and create candle record
-                candle_data = self._parse_market_data(symbol, market_data, timestamp)
-                
-                if candle_data:
-                    # Add to queue for database insertion
-                    self.data_queue.put((symbol, candle_data))
+                result = response.json()
+                if result.get('stat') == 'Ok':
+                    self.session_token = result.get('susertoken')
+                    print("✅ Flattrade login successful")
                     return True
-            return False
-        except Exception as e:
-            logger.error(f"Error fetching data for {symbol}: {e}")
-            return False
-    
-    def _database_writer_loop(self):
-        """Separate thread for database writes to avoid blocking API calls"""
-        logger.info("Database writer thread started")
-        
-        while self.is_recording or not self.data_queue.empty():
-            try:
-                # Get data from queue with timeout
-                symbol, candle_data = self.data_queue.get(timeout=1)
-                
-                # Insert into database
-                success = self.supabase_manager.insert_candle_data(candle_data)
-                
-                if success:
-                    if symbol not in self.recording_stats:
-                        self._init_symbol_stats(symbol)
-                    self.recording_stats[symbol]['total_records'] += 1
-                    logger.info(f"Recorded data for {symbol}")
                 else:
-                    if symbol not in self.recording_stats:
-                        self._init_symbol_stats(symbol)
-                    self.recording_stats[symbol]['errors'] += 1
-                    logger.error(f"Failed to record data for {symbol}")
+                    print(f"❌ Login failed: {result.get('emsg', 'Unknown error')}")
+                    return False
+            else:
+                print(f"❌ Login request failed: {response.status_code}")
+                return False
                 
-                self.data_queue.task_done()
-                
-            except queue.Empty:
-                # No data in queue, continue
-                continue
-            except Exception as e:
-                logger.error(f"Database writer error: {e}")
-    
-    def get_recording_stats(self) -> Dict:
-        """Get current recording statistics"""
-        return dict(self.recording_stats)
-    
-    def _parse_market_data(self, symbol: str, market_data: Dict, timestamp: datetime) -> Optional[Dict]:
-        """Parse market data into candle format with technical indicators"""
-        try:
-            # Basic OHLCV data
-            ohlcv_data = {
-                "symbol": symbol,
-                "timestamp": timestamp.isoformat(),
-                "open": float(market_data.get('o', 0)),
-                "high": float(market_data.get('h', 0)),
-                "low": float(market_data.get('l', 0)),
-                "close": float(market_data.get('c', 0)),
-                "volume": int(market_data.get('v', 0))
-            }
-            
-            # Calculate technical indicators
-            indicators = self._calculate_indicators(symbol, ohlcv_data)
-            
-            # Merge OHLCV data with indicators
-            ohlcv_data.update(indicators)
-            
-            return ohlcv_data
-            
         except Exception as e:
-            logger.error(f"Error parsing market data for {symbol}: {e}")
+            print(f"❌ Login error: {str(e)}")
+            return False
+    
+    def get_holdings(self):
+        """Get current holdings"""
+        try:
+            data = {
+                "uid": self.user_id,
+                "actid": self.user_id
+            }
+            response = requests.post(f"{self.base_url}/Holdings", json=data)
+            
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except Exception as e:
+            print(f"❌ Error getting holdings: {str(e)}")
             return None
     
-    def _calculate_indicators(self, symbol: str, current_data: Dict) -> Dict:
-        """Calculate technical indicators for the current candle"""
+    def get_positions(self):
+        """Get current positions"""
         try:
-            # Get historical data for indicator calculations
-            historical_df = self.supabase_manager.get_historical_data_for_indicators(symbol, limit=50)
+            data = {
+                "uid": self.user_id,
+                "actid": self.user_id
+            }
+            response = requests.post(f"{self.base_url}/PositionBook", json=data)
             
-            # Create current candle data in the same format
-            current_candle = {
-                'timestamp': pd.to_datetime(current_data['timestamp']),
-                'open_price': current_data['open'],
-                'high_price': current_data['high'],
-                'low_price': current_data['low'],
-                'close_price': current_data['close'],
-                'volume': current_data['volume']
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except Exception as e:
+            print(f"❌ Error getting positions: {str(e)}")
+            return None
+    
+    def place_order(self, symbol, quantity, side, order_type="MIS", price_type="MKT", price=0):
+        """Place an order"""
+        try:
+            order_data = {
+                "uid": self.user_id,
+                "actid": self.user_id,
+                "exch": "NSE",  # Default to NSE
+                "tsym": symbol,
+                "qty": str(quantity),
+                "prc": str(price) if price > 0 else "0",
+                "prd": order_type,  # MIS or CNC
+                "trantype": side,   # B for buy, S for sell
+                "prctyp": price_type,  # MKT for market, LMT for limit
+                "ret": "DAY"
             }
             
-            # If we have historical data, append current candle
-            if not historical_df.empty:
-                current_df = pd.DataFrame([current_candle])
-                combined_df = pd.concat([historical_df, current_df], ignore_index=True)
-            else:
-                # If no historical data, use just current candle (indicators will be None)
-                combined_df = pd.DataFrame([current_candle])
+            response = requests.post(f"{self.base_url}/PlaceOrder", json=order_data)
             
-            # Calculate VWAP
-            vwap = self.technical_indicators.calculate_vwap(combined_df)
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('stat') == 'Ok':
+                    print(f"✅ Order placed successfully: {side} {quantity} {symbol}")
+                    return result
+                else:
+                    print(f"❌ Order failed: {result.get('emsg', 'Unknown error')}")
+                    return None
+            return None
             
-            # Calculate SDVWAP with parameters: period=14, multiplier=1.0
-            sdvwap_plus, sdvwap_minus = self.technical_indicators.calculate_sdvwap(
-                combined_df, period=14, multiplier=1.0
+        except Exception as e:
+            print(f"❌ Error placing order: {str(e)}")
+            return None
+    
+    def get_quotes(self, symbol, exchange="NSE"):
+        """Get real-time quotes"""
+        try:
+            data = {
+                "uid": self.user_id,
+                "exch": exchange,
+                "token": symbol
+            }
+            response = requests.post(f"{self.base_url}/GetQuotes", json=data)
+            
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except Exception as e:
+            print(f"❌ Error getting quotes: {str(e)}")
+            return None
+
+class OLAELECLiveTrader:
+    def __init__(self, flattrade_api, supabase_client):
+        self.api = flattrade_api
+        self.supabase = supabase_client
+        
+        # Trading parameters (will be set by user)
+        self.symbol = None
+        self.quantity = 1
+        self.order_type = "MIS"
+        self.capital = 500
+        
+        # Strategy parameters
+        self.profit_target = 0.04  # 4% as in backtest
+        self.entry_price = None
+        self.current_position = 0  # 0: no position, +ve: long, -ve: short
+        
+        # Daily restrictions
+        self.last_exit_date = None
+        self.last_exit_direction = None
+        self.target_hit_today = False
+        self.current_date = None
+        
+        # Data storage
+        self.price_data = []
+        self.vwap_data = []
+        
+        # Trading status
+        self.is_trading = False
+        self.trading_thread = None
+        
+    def setup_trading(self):
+        """Interactive setup for trading parameters"""
+        print("\n" + "="*50)
+        print("🚀 OLAELEC Live Trading Setup")
+        print("="*50)
+        
+        # Get stock symbol
+        self.symbol = input("📊 Enter stock symbol (e.g., RELIANCE, TCS): ").upper().strip()
+        
+        # Get quantity
+        try:
+            qty_input = input(f"📈 Enter quantity (default 1): ").strip()
+            self.quantity = int(qty_input) if qty_input else 1
+        except:
+            self.quantity = 1
+            
+        # Get order type
+        order_input = input("🔄 Enter order type - MIS/CNC (default MIS): ").upper().strip()
+        self.order_type = order_input if order_input in ['MIS', 'CNC'] else 'MIS'
+        
+        # Get capital
+        try:
+            capital_input = input("💰 Enter capital amount (default 500): ").strip()
+            self.capital = float(capital_input) if capital_input else 500
+        except:
+            self.capital = 500
+            
+        print(f"\n✅ Trading setup complete:")
+        print(f"   Symbol: {self.symbol}")
+        print(f"   Quantity: {self.quantity}")
+        print(f"   Order Type: {self.order_type}")
+        print(f"   Capital: ₹{self.capital}")
+        print(f"   Profit Target: {self.profit_target*100}%")
+        
+        # Confirmation
+        confirm = input("\n🚨 Start live trading? (y/N): ").lower().strip()
+        return confirm == 'y'
+    
+    def calculate_vwap_bands(self, data_points=20):
+        """Calculate VWAP bands (simplified version)"""
+        if len(self.price_data) < data_points:
+            return None, None
+            
+        # Get recent data
+        recent_data = self.price_data[-data_points:]
+        
+        # Calculate VWAP
+        total_volume = sum([d['volume'] for d in recent_data])
+        if total_volume == 0:
+            return None, None
+            
+        vwap = sum([d['price'] * d['volume'] for d in recent_data]) / total_volume
+        
+        # Calculate standard deviation
+        prices = [d['price'] for d in recent_data]
+        std_dev = np.std(prices)
+        
+        # VWAP bands (using 1 standard deviation as in backtest)
+        vwap_plus = vwap + std_dev
+        vwap_minus = vwap - std_dev
+        
+        return vwap_plus, vwap_minus
+    
+    def get_current_price_data(self):
+        """Get current price and volume data"""
+        try:
+            quotes = self.api.get_quotes(self.symbol)
+            if quotes and quotes.get('stat') == 'Ok':
+                price = float(quotes.get('lp', 0))  # Last price
+                volume = float(quotes.get('v', 0))   # Volume
+                
+                return {
+                    'timestamp': datetime.now(),
+                    'price': price,
+                    'volume': volume,
+                    'open': float(quotes.get('o', price)),
+                    'high': float(quotes.get('h', price)),
+                    'low': float(quotes.get('l', price)),
+                    'close': price
+                }
+            return None
+        except Exception as e:
+            print(f"❌ Error getting price data: {str(e)}")
+            return None
+    
+    def check_trading_hours(self):
+        """Check if current time is within trading hours"""
+        current_time = datetime.now().time()
+        return dt_time(9, 30) <= current_time <= dt_time(15, 20)
+    
+    def check_exit_time(self):
+        """Check if it's time to exit all positions"""
+        current_time = datetime.now().time()
+        return current_time >= dt_time(15, 20)
+    
+    def execute_trade(self, side, quantity):
+        """Execute a trade"""
+        try:
+            result = self.api.place_order(
+                symbol=self.symbol,
+                quantity=quantity,
+                side=side,  # 'B' for buy, 'S' for sell
+                order_type=self.order_type,
+                price_type="MKT"  # Market order
             )
             
-            return {
-                'vwap': vwap,
-                'sdvwap1_plus': sdvwap_plus,
-                'sdvwap1_minus': sdvwap_minus
-            }
+            if result:
+                # Log trade to Supabase
+                self.log_trade_to_supabase(side, quantity, result)
+                return True
+            return False
             
         except Exception as e:
-            logger.error(f"Error calculating indicators for {symbol}: {e}")
-            return {
-                'vwap': None,
-                'sdvwap1_plus': None,
-                'sdvwap1_minus': None
+            print(f"❌ Trade execution error: {str(e)}")
+            return False
+    
+    def log_trade_to_supabase(self, side, quantity, order_result):
+        """Log trade details to Supabase"""
+        try:
+            trade_data = {
+                'timestamp': datetime.now().isoformat(),
+                'symbol': self.symbol,
+                'side': side,
+                'quantity': quantity,
+                'order_type': self.order_type,
+                'order_result': order_result,
+                'strategy': 'OLAELEC'
             }
-
-
-import streamlit as st
-import time
-from datetime import datetime, timedelta
-
-# Add this after your existing configuration
-DEFAULT_SYMBOLS = ["ACC", "APLAPOLLO", "AUBANK", "ATGL", "ABCAPITAL", "ABFRL", "ALKEM", "APOLLOTYRE", "ASHOKLEY", "ASTRAL", "AUROPHARMA", "BSE", "BANDHANBNK", "BANKINDIA", "MAHABANK", "BDL", "BHARATFORG", "BHEL", "BHARTIHEXA", "BIOCON", "COCHINSHIP", "COFORGE", "COLPAL", "CONCOR", "CUMMINSIND", "DIXON", "ESCORTS", "EXIDEIND", "NYKAA", "FEDERALBNK", "GMRAIRPORT", "GLENMARK", "GODREJPROP", "HDFCAMC", "HINDPETRO", "HINDZINC", "HUDCO", "IDFCFIRSTB", "IRB", "INDIANB", "IRCTC", "IREDA", "IGL", "INDUSTOWER", "JUBLFOOD", "KPITTECH", "KALYANKJIL", "LTF", "LICHSGFIN", "LUPIN", "MRF", "M&MFIN", "MANKIND", "MARICO", "MFSL", "MAXHEALTH", "MAZDOCK", "MOTILALOFS", "MPHASIS", "MUTHOOTFIN", "NHPC", "NMDC", "NTPCGREEN", "NATIONALUM", "OBEROIRLTY", "OIL", "OLAELEC", "PAYTM", "OFSS", "POLICYBZR", "PIIND", "PAGEIND", "PATANJALI", "PERSISTENT", "PETRONET", "PHOENIXLTD", "POLYCAB", "PREMIERENE", "PRESTIGE", "RVNL", "SBICARD", "SJVN", "SRF", "SOLARINDS", "SONACOMS", "SAIL", "SUPREMEIND", "SUZLON", "TATACOMM", "TATAELXSI", "TATATECH", "TORNTPOWER", "TIINDIA", "UPL", "UNIONBANK", "VMM", "IDEA", "VOLTAS", "WAAREEENER", "YESBANK"]
-# Streamlit Cloud specific configuration
-PING_BASED_RECORDING = True  # Enable ping-based recording for Streamlit Cloud
-RECORD_ON_STARTUP = True     # Record immediately when app starts
-
-def is_market_hours():
-    """Check if it's within market hours (9:15 AM to 3:30 PM IST)"""
-    now = datetime.now()
-    market_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    market_end = now.replace(hour=15, minute=30, second=0, microsecond=0)
+            
+            self.supabase.table('trades').insert(trade_data).execute()
+            print(f"📝 Trade logged to database")
+            
+        except Exception as e:
+            print(f"❌ Error logging trade: {str(e)}")
     
-    # Only record on weekdays during market hours
-    is_weekday = now.weekday() < 5  # Monday = 0, Friday = 4
-    is_market_time = market_start <= now <= market_end
-    
-    return is_weekday and is_market_time
-
-def should_record_now():
-    """Check if we should record data now (avoid duplicates)"""
-    current_time = datetime.now()
-    
-    # Create a unique key for this 5-minute window
-    time_window = current_time.replace(second=0, microsecond=0)
-    time_window = time_window - timedelta(minutes=time_window.minute % 5)
-    record_key = f"recorded_{time_window.strftime('%Y%m%d_%H%M')}"
-    
-    # Check if we already recorded in this window
-    if record_key in st.session_state:
+    def check_profit_target(self, current_price):
+        """Check if profit target is reached"""
+        if self.entry_price is None or self.current_position == 0:
+            return False
+            
+        if self.current_position > 0:  # Long position
+            profit_pct = (current_price - self.entry_price) / self.entry_price
+            if profit_pct >= self.profit_target:
+                return True
+                
+        elif self.current_position < 0:  # Short position
+            profit_pct = (self.entry_price - current_price) / self.entry_price
+            if profit_pct >= self.profit_target:
+                return True
+                
         return False
     
-    # Mark this window as recorded
-    st.session_state[record_key] = True
-    
-    # Clean up old keys (keep only last 12 windows = 1 hour)
-    keys_to_remove = []
-    for key in st.session_state.keys():
-        if key.startswith('recorded_') and key != record_key:
+    def trading_loop(self):
+        """Main trading loop"""
+        print(f"\n🔄 Starting trading loop for {self.symbol}...")
+        
+        while self.is_trading:
             try:
-                key_time = datetime.strptime(key.split('_')[1] + '_' + key.split('_')[2], '%Y%m%d_%H%M')
-                if (current_time - key_time).total_seconds() > 3600:  # Older than 1 hour
-                    keys_to_remove.append(key)
-            except:
-                keys_to_remove.append(key)
-    
-    for key in keys_to_remove:
-        del st.session_state[key]
-    
-    return True
-
-def ping_based_recording():
-    """Record data immediately when UptimeRobot pings (Streamlit Cloud compatible)"""
-    
-    # Only proceed if we should record now
-    if not should_record_now():
-        st.info("â­ï¸ Already recorded in this time window")
-        return
-    
-    # Only record during market hours
-    if not is_market_hours():
-        st.info("ðŸ• Outside market hours - skipping recording")
-        return
-    
-    current_time = datetime.now()
-    
-    # Show recording status
-    st.info(f"ðŸŽ¯ Ping-based recording started at {current_time.strftime('%H:%M:%S')}")
-    
-    # Initialize data recorder if not exists
-    if 'data_recorder' not in st.session_state:
-        st.session_state.data_recorder = DataRecorder()
-    
-    # Record data for all symbols immediately
-    symbols = DEFAULT_SYMBOLS
-    results = {'success': 0, 'errors': 0, 'details': []}
-    
-    # Create progress bar
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    for i, symbol in enumerate(symbols):
-        try:
-            status_text.text(f"Recording {symbol}...")
-            progress_bar.progress((i + 1) / len(symbols))
-            
-            # Get market data
-            market_data = st.session_state.data_recorder.flattrade_api.get_market_data(symbol)
-            
-            if market_data:
-                # Parse data with indicators
-                candle_data = st.session_state.data_recorder._parse_market_data(
-                    symbol, market_data, current_time
+                current_datetime = datetime.now()
+                current_date = current_datetime.date()
+                
+                # Reset daily flags if new day
+                if self.current_date != current_date:
+                    self.current_date = current_date
+                    self.target_hit_today = False
+                    self.last_exit_date = None
+                    self.last_exit_direction = None
+                    print(f"📅 New trading day: {current_date}")
+                
+                # Check trading hours
+                if not self.check_trading_hours():
+                    time.sleep(60)  # Wait 1 minute if outside trading hours
+                    continue
+                
+                # Get current price data
+                price_data = self.get_current_price_data()
+                if not price_data:
+                    time.sleep(30)  # Wait 30 seconds and retry
+                    continue
+                
+                self.price_data.append(price_data)
+                
+                # Keep only recent data (last 100 points)
+                if len(self.price_data) > 100:
+                    self.price_data = self.price_data[-100:]
+                
+                current_price = price_data['price']
+                
+                # Check if it's time to close all positions (3:20 PM)
+                if self.check_exit_time():
+                    if self.current_position != 0:
+                        if self.current_position > 0:
+                            self.execute_trade('S', abs(self.current_position))
+                        else:
+                            self.execute_trade('B', abs(self.current_position))
+                        
+                        self.current_position = 0
+                        self.entry_price = None
+                        self.target_hit_today = True
+                        print("🕒 End of trading day - All positions closed")
+                    continue
+                
+                # Check profit target
+                if self.check_profit_target(current_price):
+                    if self.current_position > 0:
+                        self.execute_trade('S', abs(self.current_position))
+                        self.last_exit_direction = 'long'
+                    else:
+                        self.execute_trade('B', abs(self.current_position))
+                        self.last_exit_direction = 'short'
+                    
+                    self.current_position = 0
+                    self.entry_price = None
+                    self.target_hit_today = True
+                    self.last_exit_date = current_date
+                    print(f"🎯 Profit target reached! Position closed")
+                    continue
+                
+                # Skip if target hit today
+                if self.target_hit_today:
+                    time.sleep(30)
+                    continue
+                
+                # Need at least 2 data points for strategy
+                if len(self.price_data) < 2:
+                    time.sleep(30)
+                    continue
+                
+                # Calculate VWAP bands
+                vwap_plus, vwap_minus = self.calculate_vwap_bands()
+                if vwap_plus is None or vwap_minus is None:
+                    time.sleep(30)
+                    continue
+                
+                # Get previous candle data
+                candle_minus_1 = self.price_data[-1]
+                candle_minus_2 = self.price_data[-2]
+                
+                # Strategy conditions (simplified from backtest)
+                sell_condition = (
+                    candle_minus_2['close'] < candle_minus_2['open'] and
+                    candle_minus_2['close'] < vwap_minus and
+                    candle_minus_1['close'] < candle_minus_1['open'] and
+                    candle_minus_1['close'] < vwap_minus
                 )
                 
-                if candle_data:
-                    # Insert into database
-                    success = st.session_state.data_recorder.supabase_manager.insert_candle_data(candle_data)
-                    
-                    if success:
-                        results['success'] += 1
-                        results['details'].append(f"âœ… {symbol}: â‚¹{candle_data['close']}")
-                        logger.info(f"Ping recorded: {symbol} - â‚¹{candle_data['close']}")
-                    else:
-                        results['errors'] += 1
-                        results['details'].append(f"âŒ {symbol}: Database error")
-                else:
-                    results['errors'] += 1
-                    results['details'].append(f"âŒ {symbol}: Parse error")
-            else:
-                results['errors'] += 1
-                results['details'].append(f"âŒ {symbol}: API error")
+                buy_condition = (
+                    candle_minus_2['close'] > candle_minus_2['open'] and
+                    candle_minus_2['close'] > vwap_plus and
+                    candle_minus_1['close'] > candle_minus_1['open'] and
+                    candle_minus_1['close'] > vwap_plus
+                )
                 
-        except Exception as e:
-            results['errors'] += 1
-            results['details'].append(f"âŒ {symbol}: {str(e)[:50]}")
-            logger.error(f"Ping recording error for {symbol}: {e}")
+                # Execute strategy
+                if self.current_position == 0:  # No position
+                    if sell_condition and self.last_exit_direction != 'short':
+                        if self.execute_trade('S', self.quantity):
+                            self.current_position = -self.quantity
+                            self.entry_price = current_price
+                            print(f"📉 Opened SHORT position: {self.quantity} @ ₹{current_price}")
+                    
+                    elif buy_condition and self.last_exit_direction != 'long':
+                        if self.execute_trade('B', self.quantity):
+                            self.current_position = self.quantity
+                            self.entry_price = current_price
+                            print(f"📈 Opened LONG position: {self.quantity} @ ₹{current_price}")
+                
+                else:  # Have position - check for reversal
+                    if self.current_position > 0 and sell_condition:  # Long + Sell signal
+                        triple_qty = self.quantity * 3
+                        close_qty = self.current_position
+                        new_short_qty = triple_qty - close_qty
+                        
+                        if self.execute_trade('S', triple_qty):
+                            self.current_position = -new_short_qty
+                            self.entry_price = current_price
+                            print(f"🔄 Reversed to SHORT: {new_short_qty} @ ₹{current_price}")
+                    
+                    elif self.current_position < 0 and buy_condition:  # Short + Buy signal
+                        triple_qty = self.quantity * 3
+                        close_qty = abs(self.current_position)
+                        new_long_qty = triple_qty - close_qty
+                        
+                        if self.execute_trade('B', triple_qty):
+                            self.current_position = new_long_qty
+                            self.entry_price = current_price
+                            print(f"🔄 Reversed to LONG: {new_long_qty} @ ₹{current_price}")
+                
+                # Display current status
+                if self.current_position != 0:
+                    position_type = "LONG" if self.current_position > 0 else "SHORT"
+                    pnl_pct = 0
+                    if self.entry_price:
+                        if self.current_position > 0:
+                            pnl_pct = (current_price - self.entry_price) / self.entry_price * 100
+                        else:
+                            pnl_pct = (self.entry_price - current_price) / self.entry_price * 100
+                    
+                    print(f"💼 Position: {position_type} {abs(self.current_position)} | "
+                          f"Entry: ₹{self.entry_price:.2f} | Current: ₹{current_price:.2f} | "
+                          f"P&L: {pnl_pct:.2f}%")
+                
+                time.sleep(30)  # Wait 30 seconds before next iteration
+                
+            except Exception as e:
+                print(f"❌ Trading loop error: {str(e)}")
+                time.sleep(60)  # Wait 1 minute on error
     
-    # Clear progress
-    progress_bar.empty()
-    status_text.empty()
+    def start_trading(self):
+        """Start the trading bot"""
+        if not self.setup_trading():
+            print("❌ Trading setup cancelled")
+            return
+        
+        self.is_trading = True
+        self.trading_thread = threading.Thread(target=self.trading_loop)
+        self.trading_thread.daemon = True
+        self.trading_thread.start()
+        
+        print(f"\n🚀 Trading bot started for {self.symbol}")
+        print("Press Ctrl+C to stop trading...")
+        
+        try:
+            while self.is_trading:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.stop_trading()
     
-    # Show results
-    if results['success'] > 0:
-        st.success(f"ðŸŽ¯ Ping Recording Complete: {results['success']}/{len(symbols)} successful")
+    def stop_trading(self):
+        """Stop the trading bot"""
+        print("\n🛑 Stopping trading bot...")
+        self.is_trading = False
         
-        # Show details in expander
-        with st.expander("ðŸ“‹ Recording Details"):
-            for detail in results['details']:
-                if detail.startswith('âœ…'):
-                    st.success(detail)
-                else:
-                    st.error(detail)
-    else:
-        st.error(f"âŒ Ping Recording Failed: {results['errors']} errors")
+        # Close any open positions
+        if self.current_position != 0:
+            if self.current_position > 0:
+                self.execute_trade('S', abs(self.current_position))
+            else:
+                self.execute_trade('B', abs(self.current_position))
+            print("🔒 All positions closed")
         
-    # Store stats in session state
-    st.session_state['last_ping_recording'] = {
-        'time': current_time,
-        'success': results['success'],
-        'errors': results['errors'],
-        'total': len(symbols)
-    }
+        print("✅ Trading bot stopped successfully")
 
-def show_ping_recording_stats():
-    """Show statistics from ping-based recordings"""
-    if 'last_ping_recording' in st.session_state:
-        stats = st.session_state['last_ping_recording']
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("Last Recording", stats['time'].strftime('%H:%M:%S'))
-        
-        with col2:
-            st.metric("Successful", stats['success'])
-        
-        with col3:
-            st.metric("Errors", stats['errors'])
-        
-        with col4:
-            success_rate = (stats['success'] / stats['total']) * 100 if stats['total'] > 0 else 0
-            st.metric("Success Rate", f"{success_rate:.1f}%")
-
-# Enhanced main function for Streamlit Cloud
 def main():
-    st.set_page_config(
-        page_title="Stock Data Recorder - Streamlit Cloud",
-        page_icon="ðŸ“ˆ",
-        layout="wide"
+    """Main function"""
+    print("🎯 OLAELEC Live Trading Bot")
+    print("="*50)
+    
+    # Initialize Flattrade API
+    flattrade_api = FlattradeAPI(
+        user_id=USER_ID,
+        password=FLATTRADE_PASSWORD,
+        user_session=USER_SESSION,
+        api_secret=API_SECRET
     )
     
-    st.title("ðŸ“ˆ Stock OHLC Data Recorder (Streamlit Cloud)")
-    st.markdown("Ping-based recording every 5 minutes via UptimeRobot")
+    if not flattrade_api.session_token:
+        print("❌ Failed to connect to Flattrade API")
+        return
     
-    # Show health check for UptimeRobot
-    st.sidebar.success("âœ… Stock Recorder is running")
-    ist_timezone = pytz.timezone('Asia/Kolkata')
-    current_time_ist = datetime.now(ist_timezone)
-    st.write(f"🕐 Current Time: {current_time_ist.strftime('%H:%M:%S')}")
-    st.sidebar.info(f"ðŸ“… Market Hours: {'âœ…' if is_market_hours() else 'âŒ'}")
+    # Initialize Supabase
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("✅ Connected to Supabase")
+    except Exception as e:
+        print(f"❌ Supabase connection failed: {str(e)}")
+        supabase = None
     
-    # Initialize components
-    if 'data_recorder' not in st.session_state:
-        st.session_state.data_recorder = DataRecorder()
-    
-    # PING-BASED RECORDING - This runs on every UptimeRobot ping
-    if PING_BASED_RECORDING and RECORD_ON_STARTUP:
-        ping_based_recording()
-    
-    # Main dashboard
-    st.subheader("ðŸŽ¯ Ping-Based Recording Dashboard")
-    
-    # Show current recording stats
-    show_ping_recording_stats()
-    
-    # Market status
-    if is_market_hours():
-        st.success("ðŸŸ¢ Market is OPEN - Recording active")
-    else:
-        st.warning("ðŸŸ¡ Market is CLOSED - Recording paused")
-    
-    # Manual recording button
-    st.subheader("ðŸ”§ Manual Controls")
-    
-    if st.button("ðŸš€ Record Now (Manual)", type="primary"):
-        ping_based_recording()
-    
-    # Show recent data
-    st.subheader("ðŸ“Š Recent Data")
-    
-    symbol_to_view = st.selectbox("Select Symbol", DEFAULT_SYMBOLS)
-    
-    if st.button("ðŸ“ˆ View Recent Data"):
-        df = st.session_state.data_recorder.supabase_manager.get_latest_candles(
-            symbol_to_view, limit=20
-        )
-        
-        if not df.empty:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df = df.sort_values('timestamp', ascending=False)
-            
-            # Show latest price
-            latest = df.iloc[0]
-            st.metric(f"{symbol_to_view} Latest Price", f"â‚¹{latest['close']:.2f}")
-            
-            # Show data table
-            display_df = df[['timestamp', 'close', 'volume', 'vwap']].head(10)
-            st.dataframe(display_df, use_container_width=True)
-            
-            # Simple chart
-            if len(df) > 1:
-                chart_data = df.set_index('timestamp')[['close', 'vwap']].tail(10)
-                st.line_chart(chart_data)
-        else:
-            st.info(f"No data found for {symbol_to_view}")
-    
-    # Connection status
-    st.subheader("ðŸ”— System Status")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Test database connection
-        is_connected, message = st.session_state.data_recorder.supabase_manager.test_connection()
-        if is_connected:
-            st.success("âœ… Database Connected")
-        else:
-            st.error(f"âŒ Database: {message}")
-    
-    with col2:
-        # API status
-        st.info("ðŸ”„ Flattrade API Ready")
-    
-    # Instructions
-    st.subheader("â„¹ï¸ How It Works")
-    st.info("""
-    **Streamlit Cloud Ping-Based Recording:**
-    
-    1. ðŸ“¡ **UptimeRobot pings every 5 minutes**
-    2. ðŸš€ **App wakes up and runs ping_based_recording()**  
-    3. ðŸ“Š **Records data for all symbols immediately**
-    4. ðŸ’¾ **Saves to Supabase database**
-    5. ðŸ˜´ **App goes to sleep until next ping**
-    
-    **Result:** You get fresh data every 5 minutes during market hours!
-    
-    âš ï¸ **Note:** This is not continuous background recording, but timed data collection.
-    """)
-    
-    # Show environment info
-    with st.expander("ðŸ”§ Configuration"):
-        st.write("**Symbols:**", DEFAULT_SYMBOLS)
-        st.write("**Market Hours:** 9:15 AM - 3:30 PM (Mon-Fri)")
-        st.write("**Recording Frequency:** Every 5 minutes via UptimeRobot")
-        st.write("**Platform:** Streamlit Community Cloud")
+    # Create and start trading bot
+    trader = OLAELECLiveTrader(flattrade_api, supabase)
+    trader.start_trading()
 
 if __name__ == "__main__":
     main()
-
-
-# Streamlit App
-def main():
-    st.set_page_config(
-        page_title="Stock Data Recorder",
-        page_icon="ðŸ“ˆ",
-        layout="wide"
-    )
-    # Call this in your main() function
-    ping_based_recording()
-    st.title("ðŸ“ˆ Stock OHLC Data Recorder")
-    st.markdown("Record 1-minute candle data for stocks using Flattrade API and store in Supabase")
-    
-    # Initialize components
-    if 'data_recorder' not in st.session_state:
-        st.session_state.data_recorder = DataRecorder()
-    
-    # Sidebar for configuration
-    with st.sidebar:
-        st.header("Configuration")
-        
-        # Database setup
-        st.subheader("Database Setup")
-        
-        # Test connection button
-        if st.button("ðŸ” Test Connection"):
-            is_connected, message = st.session_state.data_recorder.supabase_manager.test_connection()
-            if is_connected:
-                st.success(f"âœ… {message}")
-            else:
-                st.error(f"âŒ {message}")
-        
-        # Show current status
-        status = st.session_state.data_recorder.supabase_manager.connection_status
-        if "Connected" in status:
-            st.success(f"Status: {status}")
-        else:
-            st.error(f"Status: {status}")
-        
-        if st.button("ðŸ”§ Setup Database Table"):
-            st.session_state.data_recorder.supabase_manager.create_candle_table()
-        
-        # Recording configuration
-        st.subheader("Recording Settings")
-        
-        # Symbol input
-        symbols_input = st.text_area(
-            "Stock Symbols (one per line)",
-            value="ACC\nAPLAPOLLO\nAUBANK\nATGL\nABCAPITAL\nABFRL\nALKEM\nAPOLLOTYRE\nASHOKLEY\nASTRAL\nAUROPHARMA\nBSE\nBANDHANBNK\nBANKINDIA\nMAHABANK\nBDL\nBHARATFORG\nBHEL\nBHARTIHEXA\nBIOCON\nCOCHINSHIP\nCOFORGE\nCOLPAL\nCONCOR\nCUMMINSIND\nDIXON\nESCORTS\nEXIDEIND\nNYKAA\nFEDERALBNK\nGMRAIRPORT\nGLENMARK\nGODREJPROP\nHDFCAMC\nHINDPETRO\nHINDZINC\nHUDCO\nIDFCFIRSTB\nIRB\nINDIANB\nIRCTC\nIREDA\nIGL\nINDUSTOWER\nJUBLFOOD\nKPITTECH\nKALYANKJIL\nLTF\nLICHSGFIN\nLUPIN\nMRF\nM&MFIN\nMANKIND\nMARICO\nMFSL\nMAXHEALTH\nMAZDOCK\nMOTILALOFS\nMPHASIS\nMUTHOOTFIN\nNHPC\nNMDC\nNTPCGREEN\nNATIONALUM\nOBEROIRLTY\nOIL\nOLAELEC\nPAYTM\nOFSS\nPOLICYBZR\nPIIND\nPAGEIND\nPATANJALI\nPERSISTENT\nPETRONET\nPHOENIXLTD\nPOLYCAB\nPREMIERENE\nPRESTIGE\nRVNL\nSBICARD\nSJVN\nSRF\nSOLARINDS\nSONACOMS\nSAIL\nSUPREMEIND\nSUZLON\nTATACOMM\nTATAELXSI\nTATATECH\nTORNTPOWER\nTIINDIA\nUPL\nUNIONBANK\nVMM\nIDEA\nVOLTAS\nWAAREEENER\nYESBANK",
-            help="Enter stock symbols, one per line"
-        )
-        
-        symbols = [symbol.strip().upper() for symbol in symbols_input.split('\n') if symbol.strip()]
-        
-        # Recording interval
-        interval = st.selectbox(
-            "Recording Interval",
-            options=[60, 300, 900, 1800, 3600],
-            format_func=lambda x: f"{x//60} minute{'s' if x//60 != 1 else ''}",
-            index=0
-        )
-        
-        # Recording controls
-        st.subheader("Recording Controls")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if st.button("â–¶ï¸ Start Recording", type="primary"):
-                if symbols:
-                    success, message = st.session_state.data_recorder.start_recording(symbols, interval)
-                    if success:
-                        st.success(message)
-                        st.session_state.recording_status = "Recording"
-                    else:
-                        st.error(message)
-                else:
-                    st.error("Please enter at least one symbol!")
-        
-        with col2:
-            if st.button("â¹ï¸ Stop Recording", type="secondary"):
-                message = st.session_state.data_recorder.stop_recording()
-                st.success(message)
-                st.session_state.recording_status = "Stopped"
-        
-        # Status
-        status = getattr(st.session_state, 'recording_status', 'Stopped')
-        st.write(f"**Status:** {status}")
-        
-        if st.session_state.data_recorder.is_recording:
-            st.write("ðŸŸ¢ Recording Active")
-        else:
-            st.write("ðŸ”´ Recording Inactive")
-    
-    # Main content area
-    col1, col2 = st.columns([3, 1])
-    
-    with col1:
-        st.subheader("ðŸ“Š Real-time Recording Dashboard")
-        
-        # Show recording statistics if recording is active
-        if st.session_state.data_recorder.is_recording:
-            stats = st.session_state.data_recorder.get_recording_stats()
-            
-            if stats:
-                # Create metrics columns
-                metrics_cols = st.columns(min(len(stats), 4))
-                
-                for idx, (symbol, stat) in enumerate(stats.items()):
-                    col_idx = idx % 4
-                    with metrics_cols[col_idx]:
-                        # Color code based on status
-                        if stat['status'] == 'Recording':
-                            status_color = "ðŸŸ¢"
-                        elif stat['status'] == 'Error':
-                            status_color = "ðŸ”´"
-                        elif 'Starting' in stat['status'] or 'Stopping' in stat['status']:
-                            status_color = "ðŸŸ¡"
-                        else:
-                            status_color = "âšª"
-                        
-                        st.metric(
-                            label=f"{status_color} {symbol}",
-                            value=f"{stat['total_records']} records",
-                            delta=f"{stat['errors']} errors" if stat['errors'] > 0 else "No errors"
-                        )
-                        
-                        if stat['last_update']:
-                            st.caption(f"Last: {stat['last_update'].strftime('%H:%M:%S')}")
-                        else:
-                            st.caption("No data yet")
-                
-                # Detailed statistics table
-                st.subheader("ðŸ“ˆ Detailed Statistics")
-                
-                stats_df = pd.DataFrame([
-                    {
-                        'Symbol': symbol,
-                        'Status': stat['status'],
-                        'Records': stat['total_records'],
-                        'Errors': stat['errors'],
-                        'Success Rate': f"{((stat['total_records'] / max(stat['total_records'] + stat['errors'], 1)) * 100):.1f}%",
-                        'Last Update': stat['last_update'].strftime('%H:%M:%S') if stat['last_update'] else 'Never'
-                    }
-                    for symbol, stat in stats.items()
-                ])
-                
-                st.dataframe(
-                    stats_df,
-                    use_container_width=True,
-                    hide_index=True
-                )
-                
-                # Auto-refresh every 30 seconds when recording
-                time.sleep(0.1)  # Small delay to prevent excessive refreshing
-                st.rerun()
-        
-        else:
-            st.info("ðŸ“´ Recording is stopped. Start recording to see real-time dashboard.")
-        
-        # Data viewer section
-        st.subheader("ðŸ“‹ Historical Data Viewer")
-        
-        # Symbol selector for viewing data
-        if symbols:
-            selected_symbol = st.selectbox("Select Symbol to View", symbols, key="data_viewer_symbol")
-            
-            col_refresh, col_limit = st.columns([1, 1])
-            
-            with col_refresh:
-                refresh_data = st.button("ðŸ”„ Refresh Data")
-            
-            with col_limit:
-                data_limit = st.selectbox("Records to show", [20, 50, 100, 200], index=1)
-            
-            if refresh_data or st.session_state.get('auto_refresh_data', False):
-                # Fetch latest data for selected symbol
-                df = st.session_state.data_recorder.supabase_manager.get_latest_candles(
-                    selected_symbol, limit=data_limit
-                )
-                
-                if not df.empty:
-                    # Convert timestamp to datetime
-                    df['timestamp'] = pd.to_datetime(df['timestamp'])
-                    df = df.sort_values('timestamp', ascending=False)
-                    
-                    # Display summary metrics
-                    latest_record = df.iloc[0]
-                    col1_metrics, col2_metrics, col3_metrics, col4_metrics = st.columns(4)
-                    
-                    with col1_metrics:
-                        st.metric("Latest Close", f"â‚¹{latest_record['close']:.2f}")
-                    with col2_metrics:
-                        st.metric("Volume", f"{latest_record['volume']:,}")
-                    with col3_metrics:
-                        if len(df) > 1:
-                            price_change = latest_record['close'] - df.iloc[1]['close']
-                            st.metric("Change", f"â‚¹{price_change:.2f}", delta=f"{price_change:.2f}")
-                        else:
-                            st.metric("Change", "N/A")
-                    with col4_metrics:
-                        st.metric("Total Records", len(df))
-                    
-                    # Display data table
-                    display_df = df[['timestamp', 'symbol', 'open', 'high', 'low', 'close', 'volume', 'vwap', 'sdvwap1_plus', 'sdvwap1_minus']].head(20)
-                    st.dataframe(
-                        display_df,
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                    
-                    # Price chart
-                    if len(df) > 1:
-                        st.subheader(f"ðŸ“ˆ {selected_symbol} Price Chart")
-                        chart_df = df.set_index('timestamp')[['open', 'high', 'low', 'close']].tail(50)
-                        st.line_chart(chart_df)
-                        
-                        # Volume chart
-                        st.subheader(f"ðŸ“Š {selected_symbol} Volume Chart")
-                        volume_df = df.set_index('timestamp')[['volume']].tail(50)
-                        st.bar_chart(volume_df)
-                else:
-                    st.info(f"No data found for {selected_symbol}")
-        else:
-            st.info("Enter symbols in the sidebar to view data")
-    
-    with col2:
-        st.subheader("â„¹ï¸ System Information")
-        
-        # Recording status
-        if st.session_state.data_recorder.is_recording:
-            st.success("ðŸŸ¢ **Recording Active**")
-            
-            # Show queue size
-            queue_size = st.session_state.data_recorder.data_queue.qsize()
-            if queue_size > 0:
-                st.info(f"ðŸ“¥ Queue: {queue_size} pending")
-            else:
-                st.success("ðŸ“¥ Queue: Empty")
-        else:
-            st.error("ðŸ”´ **Recording Inactive**")
-        
-        # Performance settings
-        st.subheader("âš™ï¸ Performance Settings")
-        
-        max_workers = st.slider(
-            "Max Concurrent API Calls",
-            min_value=1,
-            max_value=200,
-            value=st.session_state.data_recorder.max_workers,
-            help="Higher values = faster data collection but more API load"
-        )
-        
-        if max_workers != st.session_state.data_recorder.max_workers:
-            st.session_state.data_recorder.max_workers = max_workers
-            st.success(f"Updated to {max_workers} workers")
-        
-        # Auto-refresh toggle
-        st.subheader("ðŸ”„ Auto Refresh")
-        auto_refresh = st.toggle(
-            "Auto-refresh dashboard",
-            value=False,
-            help="Automatically refresh data every 30 seconds"
-        )
-        st.session_state.auto_refresh_data = auto_refresh
-        
-        st.markdown("""
-        **Features:**
-        - âœ… Simultaneous multi-stock recording
-        - âœ… Real-time performance monitoring  
-        - âœ… Concurrent API calls for speed
-        - âœ… Separate database thread
-        - âœ… Error tracking per symbol
-        - âœ… Queue-based data processing
-        
-        **Performance Tips:**
-        - More workers = faster collection
-        - Monitor queue size during heavy load
-        - Check error rates for API limits
-        - Use shorter intervals for active trading
-        """)
-        
-        # Connection status
-        st.subheader("ðŸ”— Connection Status")
-        
-        # Test Supabase connection
-        is_connected, conn_message = st.session_state.data_recorder.supabase_manager.test_connection()
-        if is_connected:
-            st.success(f"âœ… Supabase: {conn_message}")
-        else:
-            st.error(f"âŒ Supabase: {conn_message}")
-            
-            # Show troubleshooting tips
-            with st.expander("ðŸ”§ Troubleshooting Tips"):
-                st.markdown("""
-                **Common Issues & Solutions:**
-                
-                1. **Table doesn't exist:**
-                   - Click "Setup Database Table" in sidebar
-                   - Run the SQL in your Supabase dashboard
-                
-                2. **Authentication failed:**
-                   - Check your Supabase URL and API key
-                   - Ensure the key has proper permissions
-                
-                3. **RLS (Row Level Security) issues:**
-                   - Disable RLS for testing: `ALTER TABLE stock_candles DISABLE ROW LEVEL SECURITY;`
-                   - Or create proper RLS policies
-                
-                4. **Network issues:**
-                   - Check internet connection
-                   - Verify Supabase service status
-                """)
-        
-        # Test Flattrade connection (placeholder)
-        st.info("ðŸ”„ Flattrade API - Ready (requires market hours for testing)")
-# Add this to your existing trade_app.py for Streamlit Cloud compatibility
