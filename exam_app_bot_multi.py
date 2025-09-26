@@ -9,8 +9,12 @@ from datetime import datetime, time as dt_time
 import json
 import threading
 from supabase import create_client, Client
+import pytz
 import warnings
 warnings.filterwarnings('ignore')
+
+# Set up IST timezone
+IST = pytz.timezone('Asia/Kolkata')
 
 # --- Flattrade API Credentials ---
 USER_SESSION = "f68b270591263a92f1d4182a6a5397142b0c254bdf885738c55d854445b3ac9c"
@@ -60,17 +64,17 @@ class FlattradeAPI:
                 result = response.json()
                 if result.get('stat') == 'Ok':
                     self.session_token = result.get('susertoken')
-                    print("✅ Flattrade login successful")
+                    print("SUCCESS: Flattrade login successful")
                     return True
                 else:
-                    print(f"❌ Login failed: {result.get('emsg', 'Unknown error')}")
+                    print(f"ERROR: Login failed: {result.get('emsg', 'Unknown error')}")
                     return False
             else:
-                print(f"❌ Login request failed: {response.status_code}")
+                print(f"ERROR: Login request failed: {response.status_code}")
                 return False
                 
         except Exception as e:
-            print(f"❌ Login error: {str(e)}")
+            print(f"ERROR: Login error: {str(e)}")
             return False
     
     def get_holdings(self):
@@ -86,7 +90,7 @@ class FlattradeAPI:
                 return response.json()
             return None
         except Exception as e:
-            print(f"❌ Error getting holdings: {str(e)}")
+            print(f"ERROR: Error getting holdings: {str(e)}")
             return None
     
     def get_positions(self):
@@ -102,7 +106,7 @@ class FlattradeAPI:
                 return response.json()
             return None
         except Exception as e:
-            print(f"❌ Error getting positions: {str(e)}")
+            print(f"ERROR: Error getting positions: {str(e)}")
             return None
     
     def place_order(self, symbol, quantity, side, order_type="MIS", price_type="MKT", price=0):
@@ -126,15 +130,15 @@ class FlattradeAPI:
             if response.status_code == 200:
                 result = response.json()
                 if result.get('stat') == 'Ok':
-                    print(f"✅ Order placed successfully: {side} {quantity} {symbol}")
+                    print(f"SUCCESS: Order placed successfully: {side} {quantity} {symbol}")
                     return result
                 else:
-                    print(f"❌ Order failed: {result.get('emsg', 'Unknown error')}")
+                    print(f"ERROR: Order failed: {result.get('emsg', 'Unknown error')}")
                     return None
             return None
             
         except Exception as e:
-            print(f"❌ Error placing order: {str(e)}")
+            print(f"ERROR: Error placing order: {str(e)}")
             return None
     
     def get_quotes(self, symbol, exchange="NSE"):
@@ -151,7 +155,7 @@ class FlattradeAPI:
                 return response.json()
             return None
         except Exception as e:
-            print(f"❌ Error getting quotes: {str(e)}")
+            print(f"ERROR: Error getting quotes: {str(e)}")
             return None
 
 class OLAELECLiveTrader:
@@ -187,39 +191,39 @@ class OLAELECLiveTrader:
     def setup_trading(self):
         """Interactive setup for trading parameters"""
         print("\n" + "="*50)
-        print("🚀 OLAELEC Live Trading Setup")
+        print("OLAELEC Live Trading Setup")
         print("="*50)
         
         # Get stock symbol
-        self.symbol = input("📊 Enter stock symbol (e.g., RELIANCE, TCS): ").upper().strip()
+        self.symbol = input("Enter stock symbol (e.g., RELIANCE, TCS): ").upper().strip()
         
         # Get quantity
         try:
-            qty_input = input(f"📈 Enter quantity (default 1): ").strip()
+            qty_input = input(f"Enter quantity (default 1): ").strip()
             self.quantity = int(qty_input) if qty_input else 1
         except:
             self.quantity = 1
             
         # Get order type
-        order_input = input("🔄 Enter order type - MIS/CNC (default MIS): ").upper().strip()
+        order_input = input("Enter order type - MIS/CNC (default MIS): ").upper().strip()
         self.order_type = order_input if order_input in ['MIS', 'CNC'] else 'MIS'
         
         # Get capital
         try:
-            capital_input = input("💰 Enter capital amount (default 500): ").strip()
+            capital_input = input("Enter capital amount (default 500): ").strip()
             self.capital = float(capital_input) if capital_input else 500
         except:
             self.capital = 500
             
-        print(f"\n✅ Trading setup complete:")
+        print(f"\nTRADING SETUP COMPLETE:")
         print(f"   Symbol: {self.symbol}")
         print(f"   Quantity: {self.quantity}")
         print(f"   Order Type: {self.order_type}")
-        print(f"   Capital: ₹{self.capital}")
+        print(f"   Capital: Rs.{self.capital}")
         print(f"   Profit Target: {self.profit_target*100}%")
         
         # Confirmation
-        confirm = input("\n🚨 Start live trading? (y/N): ").lower().strip()
+        confirm = input("\nStart live trading? (y/N): ").lower().strip()
         return confirm == 'y'
     
     def calculate_vwap_bands(self, data_points=20):
@@ -256,7 +260,7 @@ class OLAELECLiveTrader:
                 volume = float(quotes.get('v', 0))   # Volume
                 
                 return {
-                    'timestamp': datetime.now(),
+                    'timestamp': datetime.now(IST),
                     'price': price,
                     'volume': volume,
                     'open': float(quotes.get('o', price)),
@@ -266,17 +270,17 @@ class OLAELECLiveTrader:
                 }
             return None
         except Exception as e:
-            print(f"❌ Error getting price data: {str(e)}")
+            print(f"ERROR: Error getting price data: {str(e)}")
             return None
     
     def check_trading_hours(self):
-        """Check if current time is within trading hours"""
-        current_time = datetime.now().time()
+        """Check if current time is within trading hours (IST)"""
+        current_time = datetime.now(IST).time()
         return dt_time(9, 30) <= current_time <= dt_time(15, 20)
     
     def check_exit_time(self):
-        """Check if it's time to exit all positions"""
-        current_time = datetime.now().time()
+        """Check if it's time to exit all positions (IST)"""
+        current_time = datetime.now(IST).time()
         return current_time >= dt_time(15, 20)
     
     def execute_trade(self, side, quantity):
@@ -297,14 +301,14 @@ class OLAELECLiveTrader:
             return False
             
         except Exception as e:
-            print(f"❌ Trade execution error: {str(e)}")
+            print(f"ERROR: Trade execution error: {str(e)}")
             return False
     
     def log_trade_to_supabase(self, side, quantity, order_result):
         """Log trade details to Supabase"""
         try:
             trade_data = {
-                'timestamp': datetime.now().isoformat(),
+                'timestamp': datetime.now(IST).isoformat(),
                 'symbol': self.symbol,
                 'side': side,
                 'quantity': quantity,
@@ -314,10 +318,10 @@ class OLAELECLiveTrader:
             }
             
             self.supabase.table('trades').insert(trade_data).execute()
-            print(f"📝 Trade logged to database")
+            print(f"LOGGED: Trade logged to database")
             
         except Exception as e:
-            print(f"❌ Error logging trade: {str(e)}")
+            print(f"ERROR: Error logging trade: {str(e)}")
     
     def check_profit_target(self, current_price):
         """Check if profit target is reached"""
@@ -338,11 +342,11 @@ class OLAELECLiveTrader:
     
     def trading_loop(self):
         """Main trading loop"""
-        print(f"\n🔄 Starting trading loop for {self.symbol}...")
+        print(f"\nStarting trading loop for {self.symbol}...")
         
         while self.is_trading:
             try:
-                current_datetime = datetime.now()
+                current_datetime = datetime.now(IST)
                 current_date = current_datetime.date()
                 
                 # Reset daily flags if new day
@@ -351,7 +355,7 @@ class OLAELECLiveTrader:
                     self.target_hit_today = False
                     self.last_exit_date = None
                     self.last_exit_direction = None
-                    print(f"📅 New trading day: {current_date}")
+                    print(f"NEW DAY: New trading day: {current_date}")
                 
                 # Check trading hours
                 if not self.check_trading_hours():
