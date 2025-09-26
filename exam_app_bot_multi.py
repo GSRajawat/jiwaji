@@ -1,572 +1,360 @@
-
 import pandas as pd
-import numpy as np
-import requests
-import hashlib
 import time
-from datetime import datetime, time as dt_time
-import json
-import threading
+import datetime as dt
 import sys
-import traceback
+# Assume the FLATTRADE API client is installed (e.g., pip install flattrade-api)
+from flattrade_api import Flattrade
 
-try:
-    from supabase import create_client, Client
-    SUPABASE_AVAILABLE = True
-except ImportError:
-    print("WARNING: Supabase not installed. Run: pip install supabase")
-    SUPABASE_AVAILABLE = False
-
-try:
-    import pytz
-    IST = pytz.timezone('Asia/Kolkata')
-    PYTZ_AVAILABLE = True
-except ImportError:
-    print("WARNING: pytz not installed. Run: pip install pytz")
-    print("Using local time instead of IST")
-    PYTZ_AVAILABLE = False
-
-# --- Flattrade API Credentials ---
-
-# --- Flattrade API Credentials ---
+# --- API Credentials ---
+# NOTE: In a real application, never hardcode passwords. Use environment variables.
 USER_SESSION = "f68b270591263a92f1d4182a6a5397142b0c254bdf885738c55d854445b3ac9c"
 USER_ID = "FZ03508"
-FLATTRADE_PASSWORD = "Shubhi@2"
-API_SECRET = "2025.523da4413a454b8e878a11f8e10026205facdbeef612c23a"  # You'll need to get this from Flattrade
+FLATTRADE_PASSWORD = "Shubhi@2" # Note: Only used if session ID expires/is invalid
 
-# --- Supabase Credentials ---
-SUPABASE_URL = "https://zybakxpyibubzjhzdcwl.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp5YmFreHB5aWJ1YnpqaHpkY3dsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQ4OTQyMDgsImV4cCI6MjA3MDQ3MDIwOH0.8ZqreKy5zg_M-B1uH79T6lQXn62eRvvouo_OiMjwqGU"
+# --- Strategy Parameters ---
+PROFIT_TARGET = 0.04 # 4%
+# NOTE: Replacing custom VWAP bands with a 20-period SMA for demonstration
+SMA_PERIOD = 20 
+EXCHANGE = 'NSE' # Assuming all trades are in NSE Equity
 
-def get_current_time():
-    """Get current time in IST if available, otherwise local time"""
-    if PYTZ_AVAILABLE:
-        return datetime.now(IST)
-    else:
-        return datetime.now()
+# --- Global Trading State Variables (must be persistent in a real system) ---
+entry_price = None
+target_hit_today = False
+last_exit_date = None
+last_exit_direction = None # 'long' or 'short'
+position_size = 0          # 0 for no position, positive for long, negative for short
 
-class FlattradeAPI:
-    def __init__(self, user_id, password, user_session, api_secret):
-        print("Initializing Flattrade API...")
-        self.user_id = user_id
-        self.password = password
-        self.user_session = user_session
-        self.api_secret = api_secret
-        self.base_url = "https://piconnect.flattrade.in/PiConnectTP"
-        self.session_token = None
-        
-        # For demo mode if API secret not provided
-        if api_secret == "your_api_secret_here":
-            print("WARNING: API_SECRET not configured. Running in DEMO mode.")
-            print("No actual trades will be placed.")
-            self.demo_mode = True
-        else:
-            self.demo_mode = False
-            self.login()
-    
-    def sha256_hash(self, data):
-        """Generate SHA256 hash"""
-        try:
-            return hashlib.sha256(data.encode()).hexdigest()
-        except Exception as e:
-            print(f"ERROR: Hash generation failed: {str(e)}")
-            return None
-    
-    def login(self):
-        """Login to Flattrade API"""
-        if self.demo_mode:
-            print("DEMO MODE: Skipping actual login")
-            self.session_token = "demo_token"
-            return True
-            
-        try:
-            print("Attempting Flattrade login...")
-            
-            # Create hash for login
-            hash_string = f"{self.user_id}|{self.password}"
-            app_key = self.sha256_hash(hash_string + self.api_secret)
-            
-            if not app_key:
-                return False
-            
-            login_data = {
-                "apkversion": "1.0.0",
-                "uid": self.user_id,
-                "pwd": self.sha256_hash(self.password),
-                "factor2": "second_factor",
-                "vc": "vendor_code",
-                "appkey": app_key,
-                "imei": "mac_address",
-                "source": "API"
-            }
-            
-            print("Sending login request...")
-            response = requests.post(f"{self.base_url}/QuickAuth", json=login_data, timeout=30)
-            
-            if response.status_code == 200:
-                result = response.json()
-                if result.get('stat') == 'Ok':
-                    self.session_token = result.get('susertoken')
-                    print("SUCCESS: Flattrade login successful")
-                    return True
-                else:
-                    print(f"ERROR: Login failed: {result.get('emsg', 'Unknown error')}")
-                    return False
-            else:
-                print(f"ERROR: Login request failed: {response.status_code}")
-                return False
-                
-        except Exception as e:
-            print(f"ERROR: Login error: {str(e)}")
-            traceback.print_exc()
-            return False
-    
-    def place_order(self, symbol, quantity, side, order_type="MIS", price_type="MKT", price=0):
-        """Place an order"""
-        if self.demo_mode:
-            print(f"DEMO ORDER: {side} {quantity} {symbol} at market price")
-            return {"stat": "Ok", "norenordno": "demo_order_123"}
-            
-        try:
-            order_data = {
-                "uid": self.user_id,
-                "actid": self.user_id,
-                "exch": "NSE",
-                "tsym": symbol,
-                "qty": str(quantity),
-                "prc": str(price) if price > 0 else "0",
-                "prd": order_type,
-                "trantype": side,
-                "prctyp": price_type,
-                "ret": "DAY"
-            }
-            
-            response = requests.post(f"{self.base_url}/PlaceOrder", json=order_data, timeout=30)
-            
-            if response.status_code == 200:
-                result = response.json()
-                if result.get('stat') == 'Ok':
-                    print(f"SUCCESS: Order placed: {side} {quantity} {symbol}")
-                    return result
-                else:
-                    print(f"ERROR: Order failed: {result.get('emsg', 'Unknown error')}")
-                    return None
-            return None
-            
-        except Exception as e:
-            print(f"ERROR: Error placing order: {str(e)}")
-            return None
-    
-    def get_quotes(self, symbol, exchange="NSE"):
-        """Get real-time quotes"""
-        if self.demo_mode:
-            # Return demo price data
-            import random
-            base_price = 100
-            return {
-                "stat": "Ok",
-                "lp": str(base_price + random.uniform(-5, 5)),
-                "v": str(random.randint(1000, 10000)),
-                "o": str(base_price),
-                "h": str(base_price + 2),
-                "l": str(base_price - 2)
-            }
-            
-        try:
-            data = {
-                "uid": self.user_id,
-                "exch": exchange,
-                "token": symbol
-            }
-            response = requests.post(f"{self.base_url}/GetQuotes", json=data, timeout=30)
-            
-            if response.status_code == 200:
-                return response.json()
-            return None
-        except Exception as e:
-            print(f"ERROR: Error getting quotes: {str(e)}")
-            return None
+# --- Product Type Mapping ---
+# 'M' for MIS (Margin Intraday Square off), 'C' for CNC (Cash & Carry)
+PRODUCT_MAP = {"MIS": "M", "CNC": "C"}
 
-class OLAELECLiveTrader:
-    def __init__(self, flattrade_api, supabase_client=None):
-        print("Initializing OLAELEC Live Trader...")
-        self.api = flattrade_api
-        self.supabase = supabase_client
-        
-        # Trading parameters
-        self.symbol = None
-        self.quantity = 1
-        self.order_type = "MIS"
-        self.capital = 500
-        
-        # Strategy parameters
-        self.profit_target = 0.04  # 4%
-        self.entry_price = None
-        self.current_position = 0
-        
-        # Daily restrictions
-        self.last_exit_date = None
-        self.last_exit_direction = None
-        self.target_hit_today = False
-        self.current_date = None
-        
-        # Data storage
-        self.price_data = []
-        
-        # Trading status
-        self.is_trading = False
-        self.trading_thread = None
-        
-        print("OLAELEC Live Trader initialized successfully")
-    
-    def setup_trading(self):
-        """Interactive setup for trading parameters"""
-        try:
-            print("\n" + "="*50)
-            print("OLAELEC Live Trading Setup")
-            print("="*50)
-            
-            # Get stock symbol
-            symbol_input = input("Enter stock symbol (e.g., RELIANCE, TCS): ").strip()
-            if not symbol_input:
-                print("ERROR: No symbol entered")
-                return False
-            self.symbol = symbol_input.upper()
-            
-            # Get quantity
-            try:
-                qty_input = input("Enter quantity (default 1): ").strip()
-                self.quantity = int(qty_input) if qty_input else 1
-                if self.quantity <= 0:
-                    print("ERROR: Quantity must be positive")
-                    return False
-            except ValueError:
-                print("ERROR: Invalid quantity")
-                return False
-                
-            # Get order type
-            order_input = input("Enter order type - MIS/CNC (default MIS): ").upper().strip()
-            self.order_type = order_input if order_input in ['MIS', 'CNC'] else 'MIS'
-            
-            # Get capital
-            try:
-                capital_input = input("Enter capital amount (default 500): ").strip()
-                self.capital = float(capital_input) if capital_input else 500
-                if self.capital <= 0:
-                    print("ERROR: Capital must be positive")
-                    return False
-            except ValueError:
-                print("ERROR: Invalid capital amount")
-                return False
-                
-            print(f"\nTRADING SETUP COMPLETE:")
-            print(f"   Symbol: {self.symbol}")
-            print(f"   Quantity: {self.quantity}")
-            print(f"   Order Type: {self.order_type}")
-            print(f"   Capital: Rs.{self.capital}")
-            print(f"   Profit Target: {self.profit_target*100}%")
-            
-            # Confirmation
-            confirm = input("\nStart live trading? (y/N): ").lower().strip()
-            return confirm == 'y'
-            
-        except KeyboardInterrupt:
-            print("\nSetup cancelled by user")
-            return False
-        except Exception as e:
-            print(f"ERROR: Setup failed: {str(e)}")
-            return False
-    
-    def get_current_price_data(self):
-        """Get current price and volume data"""
-        try:
-            quotes = self.api.get_quotes(self.symbol)
-            if quotes and quotes.get('stat') == 'Ok':
-                price = float(quotes.get('lp', 0))
-                volume = float(quotes.get('v', 0))
-                
-                return {
-                    'timestamp': get_current_time(),
-                    'price': price,
-                    'volume': volume if volume > 0 else 1000,  # Default volume
-                    'open': float(quotes.get('o', price)),
-                    'high': float(quotes.get('h', price)),
-                    'low': float(quotes.get('l', price)),
-                    'close': price
-                }
-            return None
-        except Exception as e:
-            print(f"ERROR: Error getting price data: {str(e)}")
-            return None
-    
-    def check_trading_hours(self):
-        """Check if current time is within trading hours"""
-        try:
-            current_time = get_current_time().time()
-            return dt_time(9, 30) <= current_time <= dt_time(15, 20)
-        except Exception as e:
-            print(f"ERROR: Error checking trading hours: {str(e)}")
-            return False
-    
-    def check_exit_time(self):
-        """Check if it's time to exit all positions"""
-        try:
-            current_time = get_current_time().time()
-            return current_time >= dt_time(15, 20)
-        except Exception as e:
-            print(f"ERROR: Error checking exit time: {str(e)}")
-            return False
-    
-    def execute_trade(self, side, quantity):
-        """Execute a trade"""
-        try:
-            print(f"EXECUTING: {side} {quantity} {self.symbol}")
-            result = self.api.place_order(
-                symbol=self.symbol,
-                quantity=quantity,
-                side=side,
-                order_type=self.order_type,
-                price_type="MKT"
-            )
-            
-            if result and result.get('stat') == 'Ok':
-                # Log trade if Supabase is available
-                if self.supabase:
-                    self.log_trade_to_supabase(side, quantity, result)
-                return True
-            return False
-            
-        except Exception as e:
-            print(f"ERROR: Trade execution error: {str(e)}")
-            return False
-    
-    def log_trade_to_supabase(self, side, quantity, order_result):
-        """Log trade details to Supabase"""
-        try:
-            trade_data = {
-                'timestamp': get_current_time().isoformat(),
-                'symbol': self.symbol,
-                'side': side,
-                'quantity': quantity,
-                'order_type': self.order_type,
-                'order_result': order_result,
-                'strategy': 'OLAELEC'
-            }
-            
-            self.supabase.table('trades').insert(trade_data).execute()
-            print("LOGGED: Trade logged to database")
-            
-        except Exception as e:
-            print(f"ERROR: Error logging trade: {str(e)}")
-    
-    def calculate_simple_vwap_bands(self):
-        """Calculate simple VWAP bands"""
-        try:
-            if len(self.price_data) < 10:
-                return None, None
-            
-            # Use last 20 data points or available data
-            recent_data = self.price_data[-20:]
-            
-            # Simple VWAP calculation
-            total_volume = sum([d['volume'] for d in recent_data])
-            if total_volume == 0:
-                return None, None
-            
-            vwap = sum([d['price'] * d['volume'] for d in recent_data]) / total_volume
-            
-            # Simple standard deviation
-            prices = [d['price'] for d in recent_data]
-            if len(prices) < 2:
-                return None, None
-                
-            mean_price = sum(prices) / len(prices)
-            variance = sum([(p - mean_price) ** 2 for p in prices]) / len(prices)
-            std_dev = variance ** 0.5
-            
-            # VWAP bands
-            vwap_plus = vwap + std_dev
-            vwap_minus = vwap - std_dev
-            
-            return vwap_plus, vwap_minus
-            
-        except Exception as e:
-            print(f"ERROR: VWAP calculation error: {str(e)}")
-            return None, None
-    
-    def trading_loop(self):
-        """Main trading loop"""
-        print(f"Starting trading loop for {self.symbol}...")
-        
-        while self.is_trading:
-            try:
-                current_datetime = get_current_time()
-                current_date = current_datetime.date()
-                
-                # Reset daily flags if new day
-                if self.current_date != current_date:
-                    self.current_date = current_date
-                    self.target_hit_today = False
-                    self.last_exit_date = None
-                    self.last_exit_direction = None
-                    print(f"NEW DAY: {current_date}")
-                
-                # Check trading hours
-                if not self.check_trading_hours():
-                    print("Outside trading hours, waiting...")
-                    time.sleep(60)
-                    continue
-                
-                # Get current price data
-                price_data = self.get_current_price_data()
-                if not price_data:
-                    print("No price data available, retrying...")
-                    time.sleep(30)
-                    continue
-                
-                self.price_data.append(price_data)
-                current_price = price_data['price']
-                
-                print(f"Current price: Rs.{current_price:.2f}")
-                
-                # Keep only recent data
-                if len(self.price_data) > 100:
-                    self.price_data = self.price_data[-100:]
-                
-                # Check exit time
-                if self.check_exit_time():
-                    if self.current_position != 0:
-                        print("End of trading day - closing positions")
-                        if self.current_position > 0:
-                            self.execute_trade('S', abs(self.current_position))
-                        else:
-                            self.execute_trade('B', abs(self.current_position))
-                        
-                        self.current_position = 0
-                        self.entry_price = None
-                        self.target_hit_today = True
-                    continue
-                
-                # Simple strategy implementation (demo)
-                if len(self.price_data) >= 2 and not self.target_hit_today:
-                    if self.current_position == 0:  # No position
-                        # Simple buy condition (price rising)
-                        if self.price_data[-1]['price'] > self.price_data[-2]['price']:
-                            if self.execute_trade('B', self.quantity):
-                                self.current_position = self.quantity
-                                self.entry_price = current_price
-                                print(f"LONG ENTRY: {self.quantity} @ Rs.{current_price}")
-                
-                # Display position status
-                if self.current_position != 0:
-                    position_type = "LONG" if self.current_position > 0 else "SHORT"
-                    pnl_pct = 0
-                    if self.entry_price:
-                        if self.current_position > 0:
-                            pnl_pct = (current_price - self.entry_price) / self.entry_price * 100
-                        else:
-                            pnl_pct = (self.entry_price - current_price) / self.entry_price * 100
-                    
-                    print(f"POSITION: {position_type} {abs(self.current_position)} | "
-                          f"Entry: Rs.{self.entry_price:.2f} | P&L: {pnl_pct:.2f}%")
-                
-                time.sleep(30)  # Wait 30 seconds
-                
-            except KeyboardInterrupt:
-                print("Trading interrupted by user")
-                break
-            except Exception as e:
-                print(f"ERROR: Trading loop error: {str(e)}")
-                traceback.print_exc()
-                time.sleep(60)
-    
-    def start_trading(self):
-        """Start the trading bot"""
-        try:
-            if not self.setup_trading():
-                print("Trading setup cancelled")
-                return
-            
-            self.is_trading = True
-            self.trading_thread = threading.Thread(target=self.trading_loop)
-            self.trading_thread.daemon = True
-            self.trading_thread.start()
-            
-            print(f"\nSTARTED: Trading bot for {self.symbol}")
-            print("Press Ctrl+C to stop trading...")
-            
-            # Keep main thread alive
-            try:
-                while self.is_trading and self.trading_thread.is_alive():
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                self.stop_trading()
-                
-        except Exception as e:
-            print(f"ERROR: Failed to start trading: {str(e)}")
-            traceback.print_exc()
-    
-    def stop_trading(self):
-        """Stop the trading bot"""
-        print("\nSTOPPING: Trading bot...")
-        self.is_trading = False
-        
-        # Close any open positions
-        if self.current_position != 0:
-            print("Closing all positions...")
-            if self.current_position > 0:
-                self.execute_trade('S', abs(self.current_position))
-            else:
-                self.execute_trade('B', abs(self.current_position))
-            print("All positions closed")
-        
-        print("Trading bot stopped successfully")
-
-def main():
-    """Main function with error handling"""
+def initialize_flattrade() -> Flattrade:
+    """Initializes and sets the session ID for the Flattrade API."""
     try:
-        print("OLAELEC Live Trading Bot")
-        print("="*50)
+        ft = Flattrade(USER_ID)
+        ft.set_session_id(USER_SESSION)
         
-        # Check if API secret is configured
-        if API_SECRET == "your_api_secret_here":
-            print("WARNING: Running in DEMO mode")
-            print("To enable real trading, update API_SECRET in the code")
+        # Check connection validity by fetching limits
+        limits = ft.get_limits()
+        if limits.get('stat') == 'Ok':
+             print(f"✅ Flattrade API initialized successfully for User: {USER_ID}")
+             return ft
+        else:
+             print(f"❌ Failed to validate Flattrade session or fetch limits. Error: {limits.get('emsg', 'Unknown')}")
+             sys.exit(1)
+             
+    except Exception as e:
+        print(f"❌ Error initializing Flattrade API: {e}")
+        sys.exit(1)
+
+# ----------------------------------------------------------------------
+## Helper Functions
+# ----------------------------------------------------------------------
+
+def get_user_inputs(default_capital=500):
+    """Gets and validates user inputs for the trade."""
+    print("\n--- Trade Setup ---")
+    
+    stock = input("Enter Stock/Instrument symbol (e.g., 'RELIANCE-EQ', 'NTPC-EQ'): ").upper().strip()
+    exchange = input(f"Enter Exchange (default {EXCHANGE}): ").upper().strip() or EXCHANGE
+    
+    while True:
+        try:
+            quantity = int(input("Enter Quantity (integer > 0): "))
+            if quantity > 0:
+                break
+            print("Quantity must be a positive integer.")
+        except ValueError:
+            print("Invalid input. Please enter an integer.")
+
+    order_type_str = input("Enter Order Type (MIS or CNC, default is MIS): ").upper().strip() or "MIS"
+    order_type_api = PRODUCT_MAP.get(order_type_str, "M") # Default to 'M' for MIS
+    if order_type_api == "M" and order_type_str != "MIS":
+         print("Invalid Order Type. Defaulting to MIS ('M').")
+         order_type_str = "MIS"
+         
+    while True:
+        try:
+            capital = float(input(f"Enter Max Capital (default {default_capital}.0): ") or default_capital)
+            if capital > 0:
+                break
+            print("Capital must be a positive number.")
+        except ValueError:
+            print(f"Invalid input. Defaulting to {default_capital}.0.")
+            capital = default_capital
+            break
+
+    print(f"\nTrade Parameters: Stock={stock} on {exchange}, Qty={quantity}, Type={order_type_str} ({order_type_api}), Capital Limit={capital}")
+    return exchange, stock, quantity, order_type_api, capital
+
+def fetch_and_prepare_data(ft: Flattrade, exchange: str, symbol: str) -> pd.DataFrame or None:
+    """
+    Fetches the last N minutes of data (e.g., 5-minute bars) and calculates SMA.
+    """
+    try:
+        # Fetch last 50 candles of 5-minute interval for SMA calculation
+        print(f"Fetching 5-minute data for {symbol}...")
         
-        # Initialize Flattrade API
-        print("Setting up Flattrade connection...")
-        flattrade_api = FlattradeAPI(
-            user_id=USER_ID,
-            password=FLATTRADE_PASSWORD,
-            user_session=USER_SESSION,
-            api_secret=API_SECRET
+        # Fetching data using get_time_price_series
+        data_response = ft.get_time_price_series(exchange, symbol, '5', '50') 
+
+        if data_response.get('stat') != 'Ok' or not data_response.get('values'):
+            print(f"❌ Failed to fetch data: {data_response.get('emsg', 'No data returned')}")
+            return None
+
+        # Convert to DataFrame
+        df = pd.DataFrame(data_response['values'])
+        # Rename columns to match backtest logic (Open, High, Low, Close)
+        df.rename(columns={'into': 'Open', 'inth': 'High', 'intl': 'Low', 'intc': 'Close', 'v': 'Volume', 'ssm':'Date'}, inplace=True)
+        
+        # Convert to numeric
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            df[col] = pd.to_numeric(df[col])
+
+        # Convert datetime and set index
+        df['Date'] = pd.to_datetime(df['Date'], format='%d-%m-%Y %H:%M:%S')
+        df.set_index('Date', inplace=True)
+        
+        # Calculate the SMA (replacing custom VWAP bands)
+        df['SMA_plus'] = df['Close'].rolling(window=SMA_PERIOD).mean() * 1.002 # SMA + 0.2% Band
+        df['SMA_minus'] = df['Close'].rolling(window=SMA_PERIOD).mean() * 0.998 # SMA - 0.2% Band
+
+        # We only need the last two candles and valid SMA values
+        df.dropna(inplace=True) 
+        if len(df) < 2:
+            print("❌ Not enough *clean* data points to run strategy.")
+            return None
+        
+        print(f"Data prepared. Last close: {df['Close'].iloc[-1]}, Last SMA_plus: {df['SMA_plus'].iloc[-1]}")
+        return df
+
+    except Exception as e:
+        print(f"❌ Error fetching or processing data: {e}")
+        return None
+
+def execute_trade(ft: Flattrade, exchange: str, symbol: str, quantity: int, product_type: str, transaction_type: str) -> bool:
+    """Places a Market order using the Flattrade API."""
+    
+    print(f"Attempting to place {transaction_type} order ({product_type}) for {quantity} of {symbol} at Market price...")
+
+    # Flattrade API uses 'B' for BUY, 'S' for SELL
+    buy_or_sell = 'B' if transaction_type == 'BUY' else 'S'
+
+    try:
+        # Using MKT order: price=0.0, price_type='MKT'
+        order_response = ft.place_order(
+            buy_or_sell=buy_or_sell, 
+            product_type=product_type,
+            exchange=exchange, 
+            tradingsymbol=symbol,  
+            quantity=quantity, 
+            discloseqty=0,
+            price_type='MKT',
+            price=0.0,
+            retention='DAY', 
+            amo='NO'
         )
         
-        # Initialize Supabase if available
-        supabase = None
-        if SUPABASE_AVAILABLE:
-            try:
-                supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-                print("SUCCESS: Connected to Supabase")
-            except Exception as e:
-                print(f"WARNING: Supabase connection failed: {str(e)}")
-        
-        # Create and start trading bot
-        trader = OLAELECLiveTrader(flattrade_api, supabase)
-        trader.start_trading()
-        
-    except KeyboardInterrupt:
-        print("\nProgram interrupted by user")
+        if order_response.get('stat') == 'Ok':
+            print(f"✅ Order placed successfully! ID: {order_response['norenordno']}")
+            return True
+        else:
+            print(f"❌ Order failed: {order_response.get('emsg', 'Unknown Error')}")
+            return False
+            
     except Exception as e:
-        print(f"CRITICAL ERROR: {str(e)}")
-        traceback.print_exc()
-    finally:
-        print("Program ended")
+        print(f"❌ Error executing trade: {e}")
+        return False
+
+# ----------------------------------------------------------------------
+## Strategy Logic Implementation
+# ----------------------------------------------------------------------
+
+def check_and_trade(ft: Flattrade, exchange: str, symbol: str, base_quantity: int, product_type: str, df: pd.DataFrame):
+    """
+    Applies the adapted strategy logic and executes trades.
+    """
+    global entry_price, target_hit_today, last_exit_date, last_exit_direction, position_size
+    
+    current_datetime = df.index[-1]
+    current_time = current_datetime.time()
+    current_date = current_datetime.date()
+    current_close = df['Close'].iloc[-1]
+    
+    # Reset daily flags if new day
+    if last_exit_date != current_date:
+        target_hit_today = False
+        last_exit_date = None
+        last_exit_direction = None
+
+    # --- Time Check ---
+    if current_time < dt.time(9, 30):
+        print(f"[{current_time}] Market not open yet (before 9:30 AM). Waiting...")
+        return
+        
+    # --- Intraday Square Off (3:20 PM) ---
+    if current_time >= dt.time(15, 20) and product_type == 'M': # Only for MIS
+        if position_size != 0:
+            print(f"[{current_time}] 🕒 Squaring off position at 3:20 PM...")
+            transaction_type = 'BUY' if position_size < 0 else 'SELL'
+            success = execute_trade(ft, exchange, symbol, abs(position_size), product_type, transaction_type)
+            if success:
+                position_size = 0
+                entry_price = None
+                target_hit_today = True # No re-entry after final square-off
+        return
+        
+    # --- Exit Logic (Profit Target) ---
+    if position_size != 0 and entry_price is not None:
+        profit_pct = 0
+        if position_size > 0: # Long
+            profit_pct = (current_close - entry_price) / entry_price
+        elif position_size < 0: # Short
+            profit_pct = (entry_price - current_close) / entry_price
+            
+        if profit_pct >= PROFIT_TARGET:
+            print(f"[{current_time}] 💰 Profit target ({PROFIT_TARGET*100}%) hit at {current_close}. Exiting position.")
+            transaction_type = 'BUY' if position_size < 0 else 'SELL'
+            success = execute_trade(ft, exchange, symbol, abs(position_size), product_type, transaction_type)
+            
+            if success:
+                # Update state after successful exit
+                last_exit_date = current_date
+                last_exit_direction = 'long' if position_size > 0 else 'short'
+                target_hit_today = True
+                position_size = 0
+                entry_price = None
+                return # Stop further logic for this bar
+    
+    # --- Target Hit Restriction ---
+    if target_hit_today:
+        print(f"[{current_time}] 🚫 Target hit today. No further entries.")
+        return
+
+    # --- Strategy Entry Logic (Adapted to Open/Close vs SMA Bands) ---
+    candle_minus_1_close = df['Close'].iloc[-1]
+    candle_minus_1_open = df['Open'].iloc[-1]
+    candle_minus_2_close = df['Close'].iloc[-2]
+    candle_minus_2_open = df['Open'].iloc[-2]
+
+    # Using SMA bands as proxy for SDVWAP1_plus/minus
+    vwap_minus_val_1 = df['SMA_minus'].iloc[-1]
+    vwap_minus_val_2 = df['SMA_minus'].iloc[-2]
+    vwap_plus_val_1 = df['SMA_plus'].iloc[-1]
+    vwap_plus_val_2 = df['SMA_plus'].iloc[-2]
+
+    # SELL condition (short entry)
+    sell_condition_1 = (candle_minus_2_close < candle_minus_2_open and candle_minus_2_close < vwap_minus_val_2)
+    sell_condition_2 = (candle_minus_1_close < candle_minus_1_open and candle_minus_1_close < vwap_minus_val_1)
+    
+    # BUY condition (long entry)
+    buy_condition_1 = (candle_minus_2_close > candle_minus_2_open and candle_minus_2_close > vwap_plus_val_2)
+    buy_condition_2 = (candle_minus_1_close > candle_minus_1_open and candle_minus_1_close > vwap_plus_val_1)
+
+    if position_size == 0:
+        # No position - enter fresh
+        if sell_condition_1 and sell_condition_2:
+            if last_exit_direction != 'short' or last_exit_date != current_date:
+                print(f"[{current_time}] ⬇️ SELL signal detected. Entering fresh SHORT position.")
+                success = execute_trade(ft, exchange, symbol, base_quantity, product_type, 'SELL')
+                if success:
+                    position_size = -base_quantity
+                    entry_price = current_close
+            
+        elif buy_condition_1 and buy_condition_2:
+            if last_exit_direction != 'long' or last_exit_date != current_date:
+                print(f"[{current_time}] ⬆️ BUY signal detected. Entering fresh LONG position.")
+                success = execute_trade(ft, exchange, symbol, base_quantity, product_type, 'BUY')
+                if success:
+                    position_size = base_quantity
+                    entry_price = current_close
+    
+    else:
+        # Have position - check for opposite signal (Reverse and Triple)
+        current_abs_size = abs(position_size)
+        triple_size = current_abs_size * 3
+        
+        if position_size > 0 and sell_condition_1 and sell_condition_2: # Long position + Short signal
+            print(f"[{current_time}] 🔄 Reverse signal (Long -> Short) detected. Exiting Long and entering {triple_size} Short.")
+            # Execute a SELL order for triple_size: This closes current long and opens a new short
+            success = execute_trade(ft, exchange, symbol, triple_size, product_type, 'SELL')
+            if success:
+                position_size = -triple_size
+                entry_price = current_close
+                
+        elif position_size < 0 and buy_condition_1 and buy_condition_2: # Short position + Long signal
+            print(f"[{current_time}] 🔄 Reverse signal (Short -> Long) detected. Exiting Short and entering {triple_size} Long.")
+            # Execute a BUY order for triple_size: This closes current short and opens a new long
+            success = execute_trade(ft, exchange, symbol, triple_size, product_type, 'BUY')
+            if success:
+                position_size = triple_size
+                entry_price = current_close
+
+
+# ----------------------------------------------------------------------
+## Main Execution Loop
+# ----------------------------------------------------------------------
+
+def run_live_trader():
+    """Main function to run the live trading script."""
+    
+    # 1. Initialize API and get user inputs
+    ft = initialize_flattrade()
+    exchange, symbol, quantity, product_type_api, capital = get_user_inputs(default_capital=500)
+    
+    # For Equity, the tradingsymbol is usually appended with '-EQ'
+    if '-EQ' not in symbol:
+        symbol = f"{symbol}-EQ"
+
+    # Define the trading hours window for the loop
+    market_close_time = dt.time(15, 30) # 3:30 PM
+    
+    print("\n--- Starting Live Trading Loop (Checking every 5 minutes) ---")
+    
+    # Loop continuously during market hours
+    while True:
+        try:
+            now = dt.datetime.now().time()
+            if now < dt.time(9, 15) or now > market_close_time:
+                print(f"Market closed/pre-open ({now}). Sleeping...")
+                time.sleep(600) # Sleep for 10 minutes
+                continue
+            
+            # 2. Fetch and prepare data
+            df = fetch_and_prepare_data(ft, exchange, symbol)
+            
+            if df is not None:
+                # 3. Apply strategy and trade
+                check_and_trade(ft, exchange, symbol, quantity, product_type_api, df)
+            
+            # Wait for 5 minutes (or the candle interval time)
+            print(f"Finished check. Current Position: {position_size}. Sleeping for 5 minutes...")
+            time.sleep(300) 
+
+        except KeyboardInterrupt:
+            print("\n👋 Trading loop manually stopped.")
+            break
+        except Exception as e:
+            print(f"\n❌ An unhandled error occurred in the trading loop: {e}. Retrying in 1 minute.")
+            import traceback
+            traceback.print_exc()
+            time.sleep(60)
+
+    print("\n--- Trading session finished. ---")
+    print(f"Final Position Size: {position_size} (Positive for Long, Negative for Short)")
+    
+    # Final square-off check outside the main loop for any remaining position
+    if position_size != 0:
+        print("Attempting final square-off before exit...")
+        transaction_type = 'BUY' if position_size < 0 else 'SELL'
+        execute_trade(ft, exchange, symbol, abs(position_size), product_type_api, transaction_type)
+        
+    print("Script terminated.")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"STARTUP ERROR: {str(e)}")
-        traceback.print_exc()
-        input("Press Enter to exit...")
+    # Ensure the Flattrade SDK is imported before running
+    if 'Flattrade' not in locals():
+         print("Error: Flattrade API SDK is not installed or imported correctly.")
+         sys.exit(1)
+         
+    run_live_trader()
