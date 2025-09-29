@@ -19,7 +19,7 @@ from api_helper import NorenApiPy
 
 
 # --- Flattrade API Credentials ---
-USER_SESSION = "f68b270591263a92f1d4182a6a5397142b0c254bdf885738c55d854445b3ac9c"
+USER_SESSION = "b6ded0e7caa5f7203ad542b9b89a19d73b85dc34037705e4f37ff70ac4200904"
 USER_ID = "FZ03508"
 FLATTRADE_PASSWORD = "Shubhi@2"  # Note: Session is usually preferred over password/2FA for live trading
 # SUPABASE credentials are noted but not used in the Flattrade trading logic
