@@ -5,27 +5,13 @@ import requests
 from datetime import datetime, time as dt_time
 import time
 import json
-import uuid
 
 # ==================== CONFIGURATION ====================
 st.set_page_config(
-    page_title="NSE Automated Trading Strategy",
-    page_icon="🤖",
+    page_title="NSE Enhanced Trading Strategy",
+    page_icon="📊",
     layout="wide"
 )
-
-# ==================== UTILITY FUNCTIONS ====================
-def generate_order_id():
-    """Generates a unique, readable order ID for simulation."""
-    return f"ORD{uuid.uuid4().hex[:8].upper()}"
-
-def generate_position_id():
-    """Generates a unique position ID."""
-    return f"POS{uuid.uuid4().hex[:6].upper()}"
-
-def generate_trade_id():
-    """Generates a unique trade ID for closed trades."""
-    return f"TRD{uuid.uuid4().hex[:6].upper()}"
 
 # ==================== SESSION STATE ====================
 if 'authenticated' not in st.session_state:
@@ -38,15 +24,10 @@ if 'api_instance' not in st.session_state:
     st.session_state.api_instance = None
 if 'access_token' not in st.session_state:
     st.session_state.access_token = None
-# New state variables for logging and tracking
-if 'signals_log' not in st.session_state:
-    st.session_state.signals_log = pd.DataFrame() # Record of all generated signals
-if 'trade_book' not in st.session_state:
-    st.session_state.trade_book = pd.DataFrame() # Executed trades (closed positions)
-if 'order_book' not in st.session_state:
-    st.session_state.order_book = pd.DataFrame() # All orders (filled, rejected, etc.)
-if 'open_positions' not in st.session_state:
-    st.session_state.open_positions = pd.DataFrame() # Active positions
+if 'positions' not in st.session_state:
+    st.session_state.positions = []
+if 'trailing_stops' not in st.session_state:
+    st.session_state.trailing_stops = {}
 
 # ==================== DEMO DATA GENERATOR ====================
 def generate_demo_data():
@@ -68,21 +49,13 @@ def generate_demo_data():
         pct_change = np.random.uniform(-8.0, 8.0)
         ltp = open_price * (1 + pct_change/100)
         
-        # Ensure Day High/Low are properly set relative to LTP and Open
         if pct_change > 0:
-            day_high = max(ltp, open_price) * 1.005
-            day_low = min(ltp, open_price) * 0.995
+            day_high = ltp * 1.005
+            day_low = open_price * 0.995
         else:
-            day_high = max(ltp, open_price) * 1.005
-            day_low = min(ltp, open_price) * 0.995
+            day_high = open_price * 1.005
+            day_low = ltp * 0.995
         
-        # Ensure LTP is at the high/low for breakout signals
-        if np.random.rand() < 0.2: # 20% chance of breakout signal
-            if np.random.rand() > 0.5: # 50% chance for buy
-                ltp = day_high
-            else: # 50% chance for sell
-                ltp = day_low
-                
         current_traded_value = np.random.uniform(50000000, 5000000000)
         prev_traded_value = current_traded_value * np.random.uniform(0.7, 1.3)
         
@@ -102,7 +75,6 @@ def generate_demo_data():
 # ==================== NSE DATA FETCHER ====================
 class NSEDataFetcher:
     """Fetch live data from NSE India"""
-    # (NSEDataFetcher methods remain largely unchanged)
     
     def __init__(self):
         self.base_url = "https://www.nseindia.com"
@@ -163,6 +135,12 @@ class NSEDataFetcher:
             }
             df = df.rename(columns=column_mapping)
             
+            # Show sample symbols
+            with st.expander("🔍 Data Sample", expanded=False):
+                st.write("Columns:", df.columns.tolist())
+                if 'symbol' in df.columns:
+                    st.write("Sample symbols:", df['symbol'].head(10).tolist())
+            
             # Ensure required columns
             required = ['symbol', 'ltp', 'open', 'high', 'low', 'tradedValue']
             for col in required:
@@ -170,7 +148,7 @@ class NSEDataFetcher:
                     if col == 'open' and 'previousClose' in df.columns:
                         df['open'] = df['previousClose']
                     elif col not in df.columns:
-                        #st.error(f"❌ Missing column: {col}")
+                        st.error(f"❌ Missing column: {col}")
                         return pd.DataFrame()
             
             # Convert to numeric
@@ -197,19 +175,17 @@ class NSEDataFetcher:
             df = df[df['tradedValue'] > 0]
             df['pChange'] = df['pChange'].fillna(0)
             
-            #st.success(f"✅ Parsed {len(df)} stocks")
+            st.success(f"✅ Parsed {len(df)} stocks")
             return df
             
         except Exception as e:
             st.error(f"❌ Parsing error: {str(e)}")
             return pd.DataFrame()
 
-
 # ==================== DEFINEDGE API ====================
 class DefinedgeAPI:
-    """Definedge Securities API Wrapper (Includes local logging)"""
+    """Definedge Securities API Wrapper"""
     
-    # (API methods like set_credentials, generate_otp, verify_otp_and_authenticate remain unchanged)
     def __init__(self):
         self.auth_base_url = "https://signin.definedgesecurities.com/auth/realms/debroking/dsbpkc"
         self.api_base_url = "https://integrate.definedgesecurities.com"
@@ -264,49 +240,55 @@ class DefinedgeAPI:
             return False, f"Error {response.status_code}"
         except Exception as e:
             return False, f"Error: {str(e)}"
-
-    def place_order(self, symbol, side, quantity, exchange="NSE", product="INTRADAY", order_type="MARKET", price=0, is_exit=False, position_id=None):
-        """Place order with proper symbol formatting and log it locally."""
+    
+    def place_order(self, symbol, side, quantity, exchange="NSE", product="INTRADAY", order_type="MARKET", price=0):
+        """Place order with proper symbol formatting"""
         if not self.access_token:
             return None, "Not authenticated"
         
-        # Format symbol
-        formatted_symbol = self.format_symbol(symbol, exchange)
+        try:
+            # Format symbol for NSE
+            # NOTE: Updated to use the public method name 'format_symbol'
+            formatted_symbol = self.format_symbol(symbol, exchange)
+            
+            url = f"{self.api_base_url}/dart/v1/placeorder"
+            headers = {
+                "Authorization": self.access_token,
+                "Content-Type": "application/json"
+            }
+            
+            payload = {
+                "exchange": exchange,
+                "tradingsymbol": formatted_symbol,
+                "order_type": side,
+                "quantity": str(quantity),
+                "product_type": product,
+                "price_type": order_type,
+                "price": str(price) if order_type == "LIMIT" else "0",
+                "validity": "DAY"
+            }
+            
+            st.info(f"📤 Sending: {side} {quantity} x {formatted_symbol}")
+            st.json({"Payload": payload})
+            
+            response = requests.post(url, json=payload, headers=headers, timeout=15)
+            
+            try:
+                data = response.json()
+            except:
+                data = {"error": "Invalid response", "status_code": response.status_code}
+            
+            st.json({"Response": data})
+            
+            if response.status_code == 200 and data.get('status') == 'SUCCESS':
+                return data, f"✅ Order {data.get('order_id')} placed!"
+            else:
+                return data, f"❌ Failed: {data.get('message', 'Unknown error')}"
         
-        # --- API Call Simulation & Local Logging ---
-        order_id = generate_order_id()
-
-        # Simulate API request/response
-        # In a real app, this would be the actual request and we'd check the status code
-        status = 'SUCCESS' # Assume success for simulation
-        message = f"Order {order_id} placed successfully."
-
-        # Log to Order Book
-        order_log = {
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'order_id': order_id,
-            'symbol': symbol,
-            'formatted_symbol': formatted_symbol,
-            'side': side,
-            'quantity': quantity,
-            'exchange': exchange,
-            'product': product,
-            'order_type': order_type,
-            'price': price,
-            'status': 'FILLED', # Assume market order is instantly filled for simplicity
-            'fill_price': -1, # To be updated by Strategy/Position Manager using LTP
-            'is_exit': is_exit,
-            'position_id': position_id if is_exit else None,
-            'message': message,
-        }
-        
-        st.session_state.order_book = pd.concat([st.session_state.order_book, pd.DataFrame([order_log])], ignore_index=True)
-
-        # Simulate API response
-        data = {'status': status, 'message': message, 'order_id': order_id}
-
-        return data, message
+        except Exception as e:
+            return None, f"❌ Exception: {str(e)}"
     
+    # Renamed from _format_symbol to format_symbol to avoid AttributeError
     def format_symbol(self, symbol, exchange):
         """Format trading symbol for API"""
         clean = symbol.replace("-EQ", "").strip()
@@ -320,558 +302,8 @@ class DefinedgeAPI:
         
         return clean
 
-# ==================== TRADING STRATEGY AND MANAGEMENT ====================
-class EnhancedTradingStrategy:
-    """Manages signals, positions, and automatically places entry/exit orders."""
-    
-    def is_trading_time(self):
-        now = datetime.now().time()
-        return dt_time(9, 25) <= now <= dt_time(14, 30)
-
-    def filter_by_traded_value(self, df):
-        if df.empty:
-            return df
-        return df[df['tradedValue'] > df['prevTradedValue']].copy()
-    
-    def is_already_in_position(self, symbol):
-        """Check if an open position exists for the given symbol."""
-        if st.session_state.open_positions.empty:
-            return False
-        return symbol in st.session_state.open_positions['symbol'].tolist()
-        
-    def record_signal(self, signal):
-        """Record the signal generation event."""
-        log_entry = signal.copy()
-        log_entry['signal_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        st.session_state.signals_log = pd.concat([st.session_state.signals_log, pd.DataFrame([log_entry])], ignore_index=True)
-
-    def generate_signals(self, df_all):
-        signals = []
-        
-        if df_all.empty:
-            return signals, pd.DataFrame(), pd.DataFrame()
-        
-        df_filtered = self.filter_by_traded_value(df_all)
-        
-        df_gainers = df_filtered[df_filtered['pChange'] > 0].copy().sort_values('tradedValue', ascending=False)
-        df_losers = df_filtered[df_filtered['pChange'] < 0].copy().sort_values('tradedValue', ascending=False)
-        
-        is_trading_time = self.is_trading_time()
-        
-        # BUY signals - day high breakout
-        for _, stock in df_gainers.iterrows():
-            if stock['ltp'] >= stock['high']:
-                signals.append({
-                    'symbol': stock['symbol'],
-                    'type': 'BUY',
-                    'ltp': float(stock['ltp']),
-                    'open': float(stock['open']),
-                    'target': float(stock['open']),
-                    'initial_stop_loss': float(stock['low']),
-                    'sl_distance': float(stock['ltp'] - stock['low']),
-                    'pct_change': float(stock['pChange']),
-                    'traded_value': float(stock['tradedValue']),
-                    'can_trade': is_trading_time,
-                    'breakout_type': 'Day High Breakout'
-                })
-        
-        # SELL signals - day low breakdown
-        for _, stock in df_losers.iterrows():
-            if stock['ltp'] <= stock['low']:
-                signals.append({
-                    'symbol': stock['symbol'],
-                    'type': 'SELL',
-                    'ltp': float(stock['ltp']),
-                    'open': float(stock['open']),
-                    'target': float(stock['open']),
-                    'initial_stop_loss': float(stock['high']),
-                    'sl_distance': float(stock['high'] - stock['ltp']),
-                    'pct_change': float(stock['pChange']),
-                    'traded_value': float(stock['tradedValue']),
-                    'can_trade': is_trading_time,
-                    'breakout_type': 'Day Low Breakdown'
-                })
-        
-        return signals, df_gainers, df_losers
-
-    def check_and_manage_positions(self, df_ltp, api):
-        """Check all open positions for SL/Target hit and place exit orders."""
-        if st.session_state.open_positions.empty or df_ltp.empty:
-            return
-
-        exit_orders = []
-        df_positions = st.session_state.open_positions.copy()
-        
-        # Merge current LTP into positions dataframe
-        df_positions = df_positions.merge(df_ltp[['symbol', 'ltp']], on='symbol', how='left')
-        df_positions.rename(columns={'ltp': 'current_ltp'}, inplace=True)
-        
-        for index, pos in df_positions.iterrows():
-            symbol = pos['symbol']
-            current_ltp = pos['current_ltp']
-
-            if pd.isna(current_ltp):
-                continue
-
-            exit_side = 'SELL' if pos['entry_side'] == 'BUY' else 'BUY'
-            
-            # Check for Exit Condition (SL or Target)
-            hit_sl = False
-            hit_target = False
-
-            if pos['entry_side'] == 'BUY':
-                if current_ltp <= pos['stop_loss']:
-                    hit_sl = True
-                if current_ltp >= pos['target']:
-                    hit_target = True
-            
-            if pos['entry_side'] == 'SELL':
-                if current_ltp >= pos['stop_loss']:
-                    hit_sl = True
-                if current_ltp <= pos['target']:
-                    hit_target = True
-
-            exit_reason = None
-            if hit_sl:
-                exit_reason = "SL Hit"
-            elif hit_target:
-                exit_reason = "Target Hit"
-            
-            if exit_reason:
-                # Place Exit Order (always MARKET for SL/Target hit)
-                st.info(f"🚨 Exiting {symbol} ({exit_reason}) at {current_ltp:.2f}")
-                
-                if api and hasattr(api, 'place_order'):
-                    data, msg = api.place_order(
-                        symbol=symbol,
-                        side=exit_side,
-                        quantity=int(pos['quantity']),
-                        is_exit=True,
-                        position_id=pos['position_id']
-                    )
-                    
-                    if data and data.get('status') == 'SUCCESS':
-                        pos_data = pos.to_dict()
-                        pos_data['status'] = 'CLOSED'
-                        pos_data['exit_reason'] = exit_reason
-                        pos_data['exit_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        pos_data['exit_order_id'] = data['order_id']
-                        exit_orders.append(pos_data)
-                    else:
-                        st.error(f"Failed to place exit order for {symbol}: {msg}")
-        
-        # Now update the position and trade books based on successful exit order placement
-        self.update_books_after_exit(exit_orders, df_ltp)
-
-    def update_books_after_exit(self, exited_positions_data, df_ltp):
-        """Finalize positions and update the trade book after an exit order is executed."""
-        
-        positions_to_remove = []
-        new_trade_entries = []
-
-        for pos_data in exited_positions_data:
-            symbol = pos_data['symbol']
-            
-            current_ltp = df_ltp.loc[df_ltp['symbol'] == symbol, 'ltp'].iloc[0] if symbol in df_ltp['symbol'].tolist() else None
-            
-            if current_ltp is None:
-                continue
-
-            # Update Order Book (simulate filled order with exit price)
-            st.session_state.order_book.loc[
-                st.session_state.order_book['order_id'] == pos_data['exit_order_id'], 
-                ['status', 'fill_price']
-            ] = ['FILLED', current_ltp]
-
-            # Calculate PNL
-            entry_price = pos_data['entry_price']
-            exit_price = current_ltp
-            quantity = pos_data['quantity']
-            
-            if pos_data['entry_side'] == 'BUY':
-                pnl = (exit_price - entry_price) * quantity
-            else:
-                pnl = (entry_price - exit_price) * quantity
-
-            # Record final trade
-            trade_entry = {
-                'trade_id': generate_trade_id(),
-                'symbol': symbol,
-                'entry_timestamp': pos_data['entry_timestamp'],
-                'entry_side': pos_data['entry_side'],
-                'entry_price': entry_price,
-                'exit_timestamp': pos_data['exit_timestamp'],
-                'exit_price': exit_price,
-                'quantity': quantity,
-                'pnl': pnl,
-                'exit_reason': pos_data['exit_reason'],
-            }
-            new_trade_entries.append(trade_entry)
-            positions_to_remove.append(pos_data['position_id'])
-
-        # Update Trade Book
-        if new_trade_entries:
-            st.session_state.trade_book = pd.concat([st.session_state.trade_book, pd.DataFrame(new_trade_entries)], ignore_index=True)
-        
-        # Remove positions from Open Positions
-        if positions_to_remove:
-            st.session_state.open_positions = st.session_state.open_positions[
-                ~st.session_state.open_positions['position_id'].isin(positions_to_remove)
-            ]
-
-    def calculate_current_pnl(self, df_ltp):
-        """Calculate current PNL for all open positions."""
-        if st.session_state.open_positions.empty or df_ltp.empty:
-            return st.session_state.open_positions.copy()
-        
-        df_pos = st.session_state.open_positions.copy()
-        df_pos = df_pos.merge(df_ltp[['symbol', 'ltp']], on='symbol', how='left')
-        
-        df_pos['current_ltp'] = df_pos['ltp'].fillna(df_pos['entry_price'])
-        
-        def calculate_pnl(row):
-            if row['entry_side'] == 'BUY':
-                return (row['current_ltp'] - row['entry_price']) * row['quantity']
-            else: # SELL
-                return (row['entry_price'] - row['current_ltp']) * row['quantity']
-
-        df_pos['current_pnl'] = df_pos.apply(calculate_pnl, axis=1)
-        df_pos['pnl_pct'] = (df_pos['current_pnl'] / (df_pos['entry_price'] * df_pos['quantity'])).replace([np.inf, -np.inf], 0) * 100
-        
-        return df_pos.drop(columns=['ltp'])
-
-# ==================== SIGNAL DISPLAY AND EXECUTION ====================
-def display_signals_table(signals, title, api, total_risk, auto_trade_enabled):
-    if not signals:
-        st.info(f"No {title.lower()} found")
-        return
-    
-    st.markdown(f"### {title}")
-    
-    now = datetime.now().time()
-    is_trading_time = dt_time(9, 25) <= now <= dt_time(14, 30)
-    is_api_connected = (api is not None)
-    
-    if is_trading_time:
-        st.success(f"✅ Trading Active ({datetime.now().strftime('%H:%M:%S')})")
-    else:
-        st.warning(f"⚠️ Outside Hours | Current: {datetime.now().strftime('%H:%M:%S')}")
-    
-    st.markdown("---")
-    
-    strategy = EnhancedTradingStrategy()
-    
-    # --- AUTO TRADING EXECUTION BLOCK ---
-    if auto_trade_enabled and is_api_connected and is_trading_time:
-        
-        st.subheader("🤖 Automatic Execution Status")
-        
-        for signal in signals:
-            symbol = signal['symbol']
-            
-            if not strategy.is_already_in_position(symbol):
-                # 1. Calculate Quantity
-                risk_per_share = signal['sl_distance']
-                qty = int(total_risk / risk_per_share) if risk_per_share > 0 else 1
-                qty = max(1, qty)
-                
-                # 2. Place Order (Entry)
-                formatted_sym = api.format_symbol(symbol, "NSE")
-                
-                with st.spinner(f"🤖 Placing {signal['type']} order for {symbol} (Qty: {qty})..."):
-                    data, msg = api.place_order(
-                        symbol=symbol,
-                        side=signal['type'],
-                        quantity=int(qty),
-                        exchange="NSE",
-                        is_exit=False
-                    )
-                
-                if data and data.get('status') == 'SUCCESS':
-                    st.success(f"✅ Auto Order for {symbol} placed: {msg}")
-                    
-                    # 3. Add to Open Positions (Simulate fill immediately at LTP)
-                    position_id = generate_position_id()
-                    
-                    new_pos = {
-                        'position_id': position_id,
-                        'symbol': symbol,
-                        'entry_timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                        'entry_side': signal['type'],
-                        'entry_price': signal['ltp'], # Entry at signal LTP
-                        'quantity': qty,
-                        'stop_loss': signal['initial_stop_loss'],
-                        'target': signal['target'],
-                        'initial_risk': signal['sl_distance'] * qty,
-                        'status': 'OPEN',
-                        'entry_order_id': data['order_id']
-                    }
-                    st.session_state.open_positions = pd.concat([st.session_state.open_positions, pd.DataFrame([new_pos])], ignore_index=True)
-                    
-                    # 4. Record Signal
-                    strategy.record_signal(signal)
-
-                else:
-                    st.error(f"❌ Auto Order Failed for {symbol}: {msg}")
-            else:
-                st.info(f"⏭️ Skipping {symbol}. Position already open.")
-                
-        st.markdown("---")
-        st.success(f"🤖 Auto Trading Cycle Complete for {title}. See Positions tab.")
-        
-    # --- MANUAL TRADING EXECUTION BLOCK ---
-    else:
-        for i, signal in enumerate(signals[:30]):
-            symbol = signal['symbol']
-            is_open = strategy.is_already_in_position(symbol)
-            status = "🟢" if signal['can_trade'] else "🔴"
-            
-            with st.expander(
-                f"{status} {symbol} | ₹{signal['ltp']:.2f} | {signal['pct_change']:.2f}% | {signal['breakout_type']}",
-                expanded=(i < 3 and not is_open)
-            ):
-                col1, col2, col3, col4 = st.columns(4)
-                
-                # Metrics
-                with col1: st.metric("LTP", f"₹{signal['ltp']:.2f}")
-                with col2: st.metric("Target (Open)", f"₹{signal['target']:.2f}")
-                with col3: st.metric("Stop Loss", f"₹{signal['initial_stop_loss']:.2f}")
-                with col4: st.metric("% Change", f"{signal['pct_change']:.2f}%")
-                
-                st.markdown("---")
-                
-                # Calculate quantity
-                risk_per_share = signal['sl_distance']
-                calc_qty = int(total_risk / risk_per_share) if risk_per_share > 0 else 1
-                qty_default = max(1, calc_qty)
-                
-                st.subheader(f"🚀 Execute Trade (Manual)")
-                
-                if api and hasattr(api, 'format_symbol'):
-                    formatted_sym = api.format_symbol(symbol, "NSE")
-                else:
-                    formatted_sym = f"{symbol}-EQ"
-                
-                st.info(f"📋 **API Format:** `{formatted_sym}`")
-                
-                col_qty, col_btn = st.columns([1, 1])
-                
-                with col_qty:
-                    qty = st.number_input(
-                        f"Quantity (Risk: ₹{total_risk})",
-                        key=f"q{i}",
-                        min_value=1,
-                        value=qty_default,
-                        help=f"Auto: ₹{total_risk} ÷ ₹{risk_per_share:.2f}"
-                    )
-                
-                with col_btn:
-                    st.write("") # Spacing
-                    st.write("")
-                    disabled = not signal['can_trade'] or is_open or not is_api_connected
-                    
-                    button_text = f"Already OPEN" if is_open else f"Execute {signal['type']}"
-                    
-                    if st.button(button_text, key=f"b{i}", type="primary", disabled=disabled):
-                        
-                        if is_api_connected:
-                            with st.spinner(f"Placing {signal['type']} manually..."):
-                                data, msg = api.place_order(
-                                    symbol=formatted_sym,
-                                    side=signal['type'],
-                                    quantity=int(qty),
-                                    exchange="NSE",
-                                    is_exit=False
-                                )
-                                
-                                if data and data.get('status') == 'SUCCESS':
-                                    st.success(f"✅ Manual Order for {symbol} placed: {msg}")
-                                    
-                                    # Add to Open Positions (Simulate fill immediately at LTP)
-                                    position_id = generate_position_id()
-                                    new_pos = {
-                                        'position_id': position_id,
-                                        'symbol': symbol,
-                                        'entry_timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                                        'entry_side': signal['type'],
-                                        'entry_price': signal['ltp'],
-                                        'quantity': qty,
-                                        'stop_loss': signal['initial_stop_loss'],
-                                        'target': signal['target'],
-                                        'initial_risk': signal['sl_distance'] * qty,
-                                        'status': 'OPEN',
-                                        'entry_order_id': data['order_id']
-                                    }
-                                    st.session_state.open_positions = pd.concat([st.session_state.open_positions, pd.DataFrame([new_pos])], ignore_index=True)
-                                    strategy.record_signal(signal)
-                                    st.rerun() # Refresh to update status
-                                else:
-                                    st.error(f"❌ Manual Order Failed: {msg}")
-                        else:
-                            st.error("Cannot place orders in Demo Mode.")
-
-
-# ==================== MAIN DASHBOARD ====================
-def show_trading_dashboard():
-    api = st.session_state.api_instance
-    
-    # Header
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        user = st.session_state.api_credentials.get('user_id', 'DEMO')
-        st.success(f"🟢 {user}")
-    with col3:
-        if st.button("🚪 Logout", use_container_width=True):
-            for key in ['authenticated', 'otp_sent', 'api_credentials', 'api_instance', 'access_token']:
-                st.session_state[key] = False if 'authenticated' in key or 'otp_sent' in key else {} if 'credentials' in key else None
-            st.rerun()
-    
-    st.title("📊 NSE Automated Trading Strategy")
-    st.markdown("**Breakout Strategy | Value-Based | F&O Securities**")
-    
-    # Sidebar
-    with st.sidebar:
-        st.header("⚙️ Settings")
-        
-        auto_trade_enabled = st.checkbox("🤖 Enable Auto Trading", value=False, help="Automatically place entry orders for new signals and exit orders when SL/Target is hit.")
-        
-        st.markdown("---")
-        st.metric("Time", datetime.now().strftime('%H:%M:%S'))
-        
-        now = datetime.now().time()
-        if dt_time(9, 25) <= now <= dt_time(14, 30):
-            st.success("✅ Trading Hours")
-        else:
-            st.error("❌ Outside Hours")
-        
-        st.markdown("---")
-        max_signals = st.slider("Max Signals", 10, 100, 30)
-        total_risk = st.number_input("Risk/Trade (₹)", 10, 10000, 100, 10)
-        
-        st.markdown("---")
-        auto_refresh = st.checkbox("Auto Refresh (30s)", value=True)
-        scan = st.button("🔍 Fetch Live / Run Cycle", use_container_width=True, type="primary")
-        demo = st.button("🧪 Demo Data", use_container_width=True)
-    
-    # Fetch data
-    if scan or auto_refresh or demo:
-        with st.spinner("Fetching..."):
-            if demo:
-                data = generate_demo_data()
-                fetcher = NSEDataFetcher()
-                df_all = fetcher.parse_nse_data(data)
-            else:
-                fetcher = NSEDataFetcher()
-                data = fetcher.fetch_all_securities()
-                if data is None:
-                    st.error("❌ Failed. Try demo mode.")
-                    st.stop()
-                df_all = fetcher.parse_nse_data(data)
-    else:
-        st.info("👆 Click 'Fetch Live / Run Cycle' or 'Demo Data' to start")
-        st.stop()
-    
-    # Generate signals
-    strategy = EnhancedTradingStrategy()
-    signals, gainers, losers = strategy.generate_signals(df_all)
-    
-    # --- POSITION MANAGEMENT AND EXIT LOGIC ---
-    if not df_all.empty and auto_trade_enabled and api is not None:
-        strategy.check_and_manage_positions(df_all, api)
-        
-    # --- PNL Calculation for Display ---
-    current_positions_df = strategy.calculate_current_pnl(df_all)
-    
-    buy_signals = [s for s in signals if s['type'] == 'BUY'][:max_signals]
-    sell_signals = [s for s in signals if s['type'] == 'SELL'][:max_signals]
-    
-    # Metrics
-    col1, col2, col3, col4, col5, col6, col7 = st.columns(7) 
-    col1.metric("Total Stocks", len(df_all))
-    col2.metric("Filtered", len(df_all[df_all['tradedValue'] > df_all['prevTradedValue']]))
-    col3.metric("Gainers", len(gainers))
-    col4.metric("Losers", len(losers))
-    col5.metric("Buy Signals", len(buy_signals))
-    col6.metric("Open Positions", len(current_positions_df))
-
-    total_pnl = current_positions_df['current_pnl'].sum() if not current_positions_df.empty else 0
-    pnl_color = 'green' if total_pnl >= 0 else 'red'
-    col7.metric("Total Open PNL", f"₹{total_pnl:.2f}", delta_color=pnl_color)
-    
-    st.markdown("---")
-    
-    # Tabs
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🟢 Buy Signals", "🔴 Sell Signals", "📋 Open Positions", "📜 Trade Book", "📒 Order Book"]) 
-    
-    with tab1:
-        display_signals_table(buy_signals, "🟢 Long (Day High Breakout)", api, total_risk, auto_trade_enabled)
-    
-    with tab2:
-        display_signals_table(sell_signals, "🔴 Short (Day Low Breakdown)", api, total_risk, auto_trade_enabled)
-
-    # --- NEW TABS FOR TRADING DATA ---
-    with tab3:
-        st.subheader("📋 Open Positions (Real-time PNL)")
-        if current_positions_df.empty:
-            st.info("No open positions.")
-        else:
-            display_df = current_positions_df[[
-                'symbol', 'entry_side', 'quantity', 'entry_price', 'current_ltp', 
-                'stop_loss', 'target', 'current_pnl', 'pnl_pct', 'entry_timestamp', 'position_id'
-            ]].copy()
-            
-            # Formatting
-            for col in ['entry_price', 'current_ltp', 'stop_loss', 'target', 'current_pnl']:
-                display_df[col] = display_df[col].apply(lambda x: f"₹{x:.2f}")
-            display_df['pnl_pct'] = display_df['pnl_pct'].apply(lambda x: f"{x:.2f}%")
-
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-    with tab4:
-        st.subheader("📜 Trade Book (Closed Positions)")
-        if st.session_state.trade_book.empty:
-            st.info("No closed trades recorded.")
-        else:
-            display_df = st.session_state.trade_book[[
-                'trade_id', 'symbol', 'entry_side', 'quantity', 'entry_price', 
-                'exit_price', 'pnl', 'exit_reason', 'entry_timestamp', 'exit_timestamp'
-            ]].copy()
-            
-            # Formatting
-            for col in ['entry_price', 'exit_price', 'pnl']:
-                display_df[col] = display_df[col].apply(lambda x: f"₹{x:.2f}")
-
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-    with tab5:
-        st.subheader("📒 Order Book (All Orders)")
-        if st.session_state.order_book.empty:
-            st.info("No orders recorded.")
-        else:
-            st.dataframe(st.session_state.order_book[[
-                'timestamp', 'order_id', 'symbol', 'side', 'quantity', 
-                'order_type', 'status', 'fill_price', 'is_exit'
-            ]], use_container_width=True, hide_index=True)
-    
-    # Auto refresh
-    if auto_refresh:
-        time.sleep(30)
-        st.rerun()
-    
-    # Footer
-    st.markdown("---")
-    st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | NSE India | Definedge Securities")
-    st.caption("⚠️ Educational purposes only. Not financial advice. Trade simulation relies on local data updates.")
-
-# ==================== MAIN ====================
-def main():
-    if not st.session_state.get('authenticated', False):
-        show_authentication_page()
-    else:
-        show_trading_dashboard()
-
+# ==================== AUTHENTICATION UI ====================
 def show_authentication_page():
-    # (Authentication page remains unchanged)
     st.title("🔐 Definedge Securities Login")
     
     col1, col2 = st.columns([1, 1])
@@ -959,6 +391,328 @@ def show_authentication_page():
                         st.error(f"❌ {token}")
                 else:
                     st.error("Enter 6-digit OTP")
+
+# ==================== TRADING STRATEGY ====================
+class EnhancedTradingStrategy:
+    def __init__(self):
+        self.positions = []
+        self.trailing_stops = {}
+    
+    def is_trading_time(self):
+        now = datetime.now().time()
+        return dt_time(9, 25) <= now <= dt_time(14, 30)
+    
+    def filter_by_traded_value(self, df):
+        if df.empty:
+            return df
+        return df[df['tradedValue'] > df['prevTradedValue']].copy()
+    
+    def generate_signals(self, df_all):
+        signals = []
+        
+        if df_all.empty:
+            return signals, pd.DataFrame(), pd.DataFrame()
+        
+        df_filtered = self.filter_by_traded_value(df_all)
+        
+        if df_filtered.empty:
+            st.warning("⚠️ No stocks meet criteria")
+            return signals, pd.DataFrame(), pd.DataFrame()
+        
+        df_gainers = df_filtered[df_filtered['pChange'] > 0].copy().sort_values('tradedValue', ascending=False)
+        df_losers = df_filtered[df_filtered['pChange'] < 0].copy().sort_values('tradedValue', ascending=False)
+        
+        is_trading_time = self.is_trading_time()
+        
+        # BUY signals - day high breakout
+        for _, stock in df_gainers.iterrows():
+            if stock['ltp'] >= stock['high']:
+                signals.append({
+                    'symbol': stock['symbol'],
+                    'type': 'BUY',
+                    'ltp': float(stock['ltp']),
+                    'open': float(stock['open']),
+                    'target': float(stock['open']),
+                    'initial_stop_loss': float(stock['low']),
+                    'current_stop_loss': float(stock['low']),
+                    'sl_distance': float(stock['ltp'] - stock['low']),
+                    'day_low': float(stock['low']),
+                    'day_high': float(stock['high']),
+                    'pct_change': float(stock['pChange']),
+                    'traded_value': float(stock['tradedValue']),
+                    'prev_traded_value': float(stock['prevTradedValue']),
+                    'traded_value_change': ((stock['tradedValue'] - stock['prevTradedValue']) / stock['prevTradedValue']) * 100,
+                    'can_trade': is_trading_time,
+                    'breakout_type': 'Day High Breakout'
+                })
+        
+        # SELL signals - day low breakdown
+        for _, stock in df_losers.iterrows():
+            if stock['ltp'] <= stock['low']:
+                signals.append({
+                    'symbol': stock['symbol'],
+                    'type': 'SELL',
+                    'ltp': float(stock['ltp']),
+                    'open': float(stock['open']),
+                    'target': float(stock['open']),
+                    'initial_stop_loss': float(stock['high']),
+                    'current_stop_loss': float(stock['high']),
+                    'sl_distance': float(stock['high'] - stock['ltp']),
+                    'day_low': float(stock['low']),
+                    'day_high': float(stock['high']),
+                    'pct_change': float(stock['pChange']),
+                    'traded_value': float(stock['tradedValue']),
+                    'prev_traded_value': float(stock['prevTradedValue']),
+                    'traded_value_change': ((stock['tradedValue'] - stock['prevTradedValue']) / stock['prevTradedValue']) * 100,
+                    'can_trade': is_trading_time,
+                    'breakout_type': 'Day Low Breakdown'
+                })
+        
+        return signals, df_gainers, df_losers
+
+# ==================== SIGNAL DISPLAY (MODIFIED) ====================
+def display_signals_table(signals, title, api, total_risk):
+    if not signals:
+        st.info(f"No {title.lower()} found")
+        return
+    
+    st.markdown(f"### {title}")
+    
+    now = datetime.now().time()
+    is_trading_time = dt_time(9, 25) <= now <= dt_time(14, 30)
+    
+    if is_trading_time:
+        st.success(f"✅ Trading Active ({datetime.now().strftime('%H:%M:%S')})")
+    else:
+        st.warning(f"⚠️ Outside Hours | Current: {datetime.now().strftime('%H:%M:%S')}")
+    
+    st.markdown("---")
+    
+    is_api_connected = (api is not None)
+    
+    for i, signal in enumerate(signals[:30]):
+        status = "🟢" if signal['can_trade'] else "🔴"
+        
+        with st.expander(
+            f"{status} {signal['symbol']} | ₹{signal['ltp']:.2f} | {signal['pct_change']:.2f}% | {signal['breakout_type']}",
+            expanded=(i < 5)
+        ):
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("LTP", f"₹{signal['ltp']:.2f}")
+                st.metric("% Change", f"{signal['pct_change']:.2f}%")
+            
+            with col2:
+                st.metric("Target (Open)", f"₹{signal['open']:.2f}")
+                target_pct = abs(signal['ltp'] - signal['open']) / signal['ltp'] * 100
+                st.metric("Target Dist", f"{target_pct:.2f}%")
+            
+            with col3:
+                st.metric("Stop Loss", f"₹{signal['initial_stop_loss']:.2f}")
+                sl_pct = signal['sl_distance'] / signal['ltp'] * 100
+                st.metric("SL Dist", f"{sl_pct:.2f}%")
+            
+            with col4:
+                st.metric("Traded Value", f"₹{signal['traded_value']/1e7:.2f} Cr")
+                st.metric("Value Δ", f"{signal['traded_value_change']:.2f}%")
+            
+            st.markdown("---")
+            
+            # Calculate quantity
+            risk_per_share = signal['sl_distance']
+            calc_qty = int(total_risk / risk_per_share) if risk_per_share > 0 else 1
+            calc_qty = max(1, calc_qty)
+            
+            st.subheader(f"🚀 Execute Trade")
+            
+            # Use the API's internal formatting to display the expected symbol
+            if api:
+                # Updated method call
+                formatted_sym = api.format_symbol(signal['symbol'], "NSE") 
+            else:
+                # Fallback heuristic for demo mode when API object is None
+                formatted_sym = f"{signal['symbol']}-EQ" if not any(c.isdigit() for c in signal['symbol']) else signal['symbol']
+            
+            # Display the API-ready symbol, removing the need for manual override
+            st.info(f"📋 Original: `{signal['symbol']}` → **API Format: `{formatted_sym}`** (Used for Order)")
+            
+            if not is_api_connected:
+                st.warning("⚠️ Demo Mode - Trading disabled")
+            else:
+                # MODIFIED: Removed the manual override (col_manual) and its logic
+                col_qty, col_btn = st.columns([1, 1])
+                
+                with col_qty:
+                    qty = st.number_input(
+                        f"Qty (Risk: ₹{total_risk})",
+                        key=f"q{i}",
+                        min_value=1,
+                        value=calc_qty,
+                        help=f"Auto: ₹{total_risk} ÷ ₹{risk_per_share:.2f}"
+                    )
+                
+                with col_btn:
+                    st.write("")  # Spacing
+                    st.write("")
+                    disabled = not signal['can_trade']
+                    
+                    if st.button(f"Execute {signal['type']}", key=f"b{i}", type="primary", disabled=disabled):
+                        # MODIFIED: Automatically use the correctly formatted symbol
+                        # Updated method call
+                        sym_to_use = api.format_symbol(signal['symbol'], "NSE")
+                        
+                        with st.spinner(f"Placing {signal['type']}..."):
+                            data, msg = api.place_order(
+                                symbol=sym_to_use, # Use the correctly formatted symbol
+                                side=signal['type'],
+                                quantity=int(qty),
+                                exchange="NSE"
+                            )
+                            
+                            if data and data.get('status') == 'SUCCESS':
+                                st.success(msg)
+                            else:
+                                st.error(msg)
+                                st.warning("""
+                                **Troubleshooting:**
+                                - Check master file: NSE equity = `SYMBOL-EQ`
+                                - Verify symbol is tradeable in your account
+                                """)
+
+# ==================== MAIN DASHBOARD ====================
+def show_trading_dashboard():
+    api = st.session_state.api_instance
+    
+    # Header
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        user = st.session_state.api_credentials.get('user_id', 'DEMO')
+        st.success(f"🟢 {user}")
+    with col3:
+        if st.button("🚪 Logout", use_container_width=True):
+            for key in ['authenticated', 'otp_sent', 'api_credentials', 'api_instance', 'access_token']:
+                st.session_state[key] = False if 'authenticated' in key or 'otp_sent' in key else {} if 'credentials' in key else None
+            st.rerun()
+    
+    st.title("📊 NSE Enhanced Trading Strategy")
+    st.markdown("**Breakout Strategy | Value-Based | F&O Securities**")
+    
+    # Sidebar
+    with st.sidebar:
+        st.header("⚙️ Settings")
+        
+        st.markdown("""
+        ### Strategy
+        - Entry: LTP crosses day high/low
+        - Target: Open price
+        - Stop: Day low/high
+        - Trailing: Every 2x SL distance
+        """)
+        
+        st.markdown("---")
+        st.metric("Time", datetime.now().strftime('%H:%M:%S'))
+        
+        now = datetime.now().time()
+        if dt_time(9, 25) <= now <= dt_time(14, 30):
+            st.success("✅ Trading Hours")
+        else:
+            st.error("❌ Outside Hours")
+        
+        st.markdown("---")
+        max_signals = st.slider("Max Signals", 10, 100, 30)
+        total_risk = st.number_input("Risk/Trade (₹)", 10, 10000, 100, 10)
+        
+        st.markdown("---")
+        auto_refresh = st.checkbox("Auto Refresh (30s)")
+        scan = st.button("🔍 Fetch Live", use_container_width=True, type="primary")
+        demo = st.button("🧪 Demo Data", use_container_width=True)
+    
+    # Fetch data
+    if scan or auto_refresh or demo:
+        with st.spinner("Fetching..."):
+            if demo:
+                data = generate_demo_data()
+                fetcher = NSEDataFetcher()
+                df_all = fetcher.parse_nse_data(data)
+            else:
+                fetcher = NSEDataFetcher()
+                data = fetcher.fetch_all_securities()
+                if data is None:
+                    st.error("❌ Failed. Try demo mode.")
+                    st.stop()
+                df_all = fetcher.parse_nse_data(data)
+    else:
+        st.info("👆 Click 'Fetch Live' or 'Demo Data' to start")
+        st.stop()
+    
+    # Generate signals
+    strategy = EnhancedTradingStrategy()
+    signals, gainers, losers = strategy.generate_signals(df_all)
+    
+    buy_signals = [s for s in signals if s['type'] == 'BUY'][:max_signals]
+    sell_signals = [s for s in signals if s['type'] == 'SELL'][:max_signals]
+    
+    # Metrics
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    col1.metric("Total", len(df_all))
+    col2.metric("Filtered", len(df_all[df_all['tradedValue'] > df_all['prevTradedValue']]))
+    col3.metric("Gainers", len(gainers))
+    col4.metric("Losers", len(losers))
+    col5.metric("Buy", len(buy_signals))
+    col6.metric("Sell", len(sell_signals))
+    
+    st.markdown("---")
+    
+    # Tabs
+    tab1, tab2, tab3 = st.tabs(["🟢 Buy", "🔴 Sell", "📊 Overview"])
+    
+    with tab1:
+        display_signals_table(buy_signals, "🟢 Long (Day High Breakout)", api, total_risk)
+    
+    with tab2:
+        display_signals_table(sell_signals, "🔴 Short (Day Low Breakdown)", api, total_risk)
+    
+    with tab3:
+        st.subheader("📊 Market Overview")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("### 🟢 Top Gainers")
+            if not gainers.empty:
+                display_df = gainers[['symbol', 'ltp', 'pChange', 'tradedValue']].head(20).copy()
+                display_df['ltp'] = display_df['ltp'].apply(lambda x: f"₹{x:.2f}")
+                display_df['pChange'] = display_df['pChange'].apply(lambda x: f"{x:.2f}%")
+                display_df['tradedValue'] = display_df['tradedValue'].apply(lambda x: f"₹{x/1e7:.2f} Cr")
+                display_df.columns = ['Symbol', 'LTP', 'Change %', 'Value']
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+        
+        with col2:
+            st.markdown("### 🔴 Top Losers")
+            if not losers.empty:
+                display_df = losers[['symbol', 'ltp', 'pChange', 'tradedValue']].head(20).copy()
+                display_df['ltp'] = display_df['ltp'].apply(lambda x: f"₹{x:.2f}")
+                display_df['pChange'] = display_df['pChange'].apply(lambda x: f"{x:.2f}%")
+                display_df['tradedValue'] = display_df['tradedValue'].apply(lambda x: f"₹{x/1e7:.2f} Cr")
+                display_df.columns = ['Symbol', 'LTP', 'Change %', 'Value']
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+    
+    # Auto refresh
+    if auto_refresh:
+        time.sleep(30)
+        st.rerun()
+    
+    # Footer
+    st.markdown("---")
+    st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | NSE India | Definedge Securities")
+    st.caption("⚠️ Educational purposes only. Not financial advice.")
+
+# ==================== MAIN ====================
+def main():
+    if not st.session_state.get('authenticated', False):
+        show_authentication_page()
+    else:
+        show_trading_dashboard()
 
 if __name__ == "__main__":
     main()
