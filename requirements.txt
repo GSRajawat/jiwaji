@@ -11,6 +11,10 @@ plotly
 yfinance
 pytz
 flattrade-api
+uuid
+json
+numpy
+
 
 
 
