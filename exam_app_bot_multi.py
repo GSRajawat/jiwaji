@@ -14,17 +14,12 @@ from supabase import create_client, Client
 # Create a free account at: https://supabase.com/
 # Create a new project and get these credentials
 
-# Supabase Project URL
-SUPABASE_URL = "https://zybakxpyibubzjhzdcwl.supabase.co"
-
-# Supabase Anon/Public Key
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp5YmFreHB5aWJ1YnpqaHpkY3dsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQ4OTQyMDgsImV4cCI6MjA3MDQ3MDIwOH0.8ZqreKy5zg_M-B1uH79T6lQXn62eRvvouo_OiMjwqGU"
-
 try:
+    SUPABASE_URL = st.secrets["SUPABASE_URL"]
+    SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    st.success("✅ Connected to Supabase DB")
-except Exception as e:
-    st.error(f"❌ Failed to connect to Supabase: {e}")
+except KeyError:
+    st.error("❌ Supabase credentials not found. Please set SUPABASE_URL and SUPABASE_KEY in Streamlit's secrets.")
     supabase = None
 
 # ==================== CONFIGURATION ====================
