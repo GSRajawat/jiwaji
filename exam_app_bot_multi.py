@@ -7,12 +7,18 @@ import time
 import json
 import os
 from supabase import create_client, Client
+from datetime import timedelta
+from datetime import timezone
+
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 # ==========================================
 # SUPABASE DATABASE CREDENTIALS
 # ==========================================
 # Create a free account at: https://supabase.com/
 # Create a new project and get these credentials
+
 
 try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
@@ -21,7 +27,6 @@ try:
 except KeyError:
     st.error("❌ Supabase credentials not found. Please set SUPABASE_URL and SUPABASE_KEY in Streamlit's secrets.")
     supabase = None
-
 # ==================== CONFIGURATION ====================
 st.set_page_config(
     page_title="NSE Enhanced Trading Strategy",
@@ -536,7 +541,7 @@ def monitor_and_exit_positions(api, reports):
                     entry_order_id=entry_order_id,
                     exit_order_id=exit_order_id,
                     exit_price=ltp,
-                    exit_time=datetime.now().isoformat(),
+                    exit_time=datetime.now(IST).isoformat(),
                     pnl=pnl
                 )
                 
@@ -644,7 +649,7 @@ class EnhancedTradingStrategy:
         self.trailing_stops = {}
     
     def is_trading_time(self):
-        now = datetime.now().time()
+        now = datetime.now(IST).time()
         return dt_time(9, 15) <= now <= dt_time(23, 59)
     
     def filter_by_traded_value(self, df, min_value_cr):
@@ -751,13 +756,13 @@ def display_signals_table(signals, title, api, reports, total_risk, auto_entry):
     
     st.markdown(f"### {title}")
     
-    now = datetime.now().time()
+    now = datetime.now(IST).time()
     is_trading_time = dt_time(9, 15) <= now <= dt_time(23, 59)
     
     if is_trading_time:
-        st.success(f"✅ Trading Active ({datetime.now().strftime('%H:%M:%S')})")
+        st.success(f"✅ Trading Active ({datetime.now(IST).strftime('%H:%M:%S')})")
     else:
-        st.warning(f"⚠️ Outside Hours | Current: {datetime.now().strftime('%H:%M:%S')}")
+        st.warning(f"⚠️ Outside Hours | Current: {datetime.now(IST).strftime('%H:%M:%S')}")
     
     st.markdown("---")
     
@@ -835,7 +840,7 @@ def display_signals_table(signals, title, api, reports, total_risk, auto_entry):
                                 'entry_price': exec_price if exec_price > 0 else signal['ltp'],
                                 'target_price': signal['target'],
                                 'stop_loss': signal['initial_stop_loss'],
-                                'entry_time': datetime.now().isoformat(),
+                                'entry_time': datetime.now(IST).isoformat(),
                                 'status': 'OPEN'
                             }
                             
@@ -924,7 +929,7 @@ def display_signals_table(signals, title, api, reports, total_risk, auto_entry):
                                     'entry_price': exec_price if exec_price > 0 else signal['ltp'],
                                     'target_price': target_price,
                                     'stop_loss': sl_price,
-                                    'entry_time': datetime.now().isoformat(),
+                                    'entry_time': datetime.now(IST).isoformat(),
                                     'status': 'OPEN'
                                 }
                                 
@@ -975,7 +980,7 @@ def display_signals_table(signals, title, api, reports, total_risk, auto_entry):
                                 entry_order_id=trade_row['entry_order_id'],
                                 exit_order_id=data.get('order_id'),
                                 exit_price=exit_price,
-                                exit_time=datetime.now().isoformat(),
+                                exit_time=datetime.now(IST).isoformat(),
                                 pnl=pnl
                             )
                             st.info(f"💰 P&L: ₹{pnl:.2f}")
@@ -1037,9 +1042,9 @@ def show_trading_dashboard():
             st.warning("Unable to fetch limits")
         
         st.markdown("---")
-        st.metric("Time", datetime.now().strftime('%H:%M:%S'))
+        st.metric("Time", datetime.now(IST).strftime('%H:%M:%S'))
         
-        now = datetime.now().time()
+        now = datetime.now(IST).time()
         if dt_time(9, 15) <= now <= dt_time(23, 59):
             st.success("✅ Trading Hours")
         else:
@@ -1461,7 +1466,7 @@ def show_trading_dashboard():
                                 entry_order_id=trade_to_exit,
                                 exit_order_id=data.get('order_id'),
                                 exit_price=exit_price,
-                                exit_time=datetime.now().isoformat(),
+                                exit_time=datetime.now(IST).isoformat(),
                                 pnl=pnl
                             )
                             
@@ -1487,7 +1492,7 @@ def show_trading_dashboard():
         st.rerun()
     
     st.markdown("---")
-    st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | NSE India | Definedge Securities")
+    st.caption(f"Last updated: {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')} | NSE India | Definedge Securities")
     st.caption("⚠️ Educational purposes only. Not financial advice.")
 
 # ==================== MAIN ====================
