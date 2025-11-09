@@ -1,20 +1,25 @@
-requests
-websocket_client
-./dist/NorenRestApi-0.0.29-py3-none-any.whl
-pyyaml
+#requests
+#websocket_client
+#./dist/NorenRestApi-0.0.29-py3-none-any.whl
+#pyyaml
+#streamlit
+#pandas
+#supabase
+#requests
+#python-dotenv
+#plotly
+#yfinance
+#pytz
+#flattrade-api
+#uuid
+#json
+#numpy
+#StringIO
 streamlit
 pandas
-supabase
-requests
-python-dotenv
-plotly
-yfinance
-pytz
-flattrade-api
-uuid
-json
 numpy
-StringIO
+requests
+supabase
 
 
 
