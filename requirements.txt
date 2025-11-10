@@ -4,7 +4,7 @@ numpy
 requests
 supabase
 yfinance
-NSEDataFetcher
+
 
 
 
