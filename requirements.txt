@@ -4,6 +4,8 @@ numpy
 requests
 supabase
 yfinance
+plotly
+
 
 
 
