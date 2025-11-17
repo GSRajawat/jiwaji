@@ -6,6 +6,7 @@ supabase
 yfinance
 plotly
 NorenRestApiPy
+websocket
 
 
 
