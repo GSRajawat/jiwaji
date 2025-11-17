@@ -1,1506 +1,1142 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests
-from datetime import datetime, time as dt_time
-import time
-import json
 import os
+import sys
+import logging
+from datetime import datetime, time, timedelta
+import time as time_module
 from supabase import create_client, Client
-from datetime import timedelta
-from datetime import timezone
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import json
 
+# Add the parent directory to the path to import api_helper
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from api_helper import NorenApiPy
 
-IST = timezone(timedelta(hours=5, minutes=30))
+# --- Configuration ---
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# ==========================================
-# SUPABASE DATABASE CREDENTIALS
-# ==========================================
-# Create a free account at: https://supabase.com/
-# Create a new project and get these credentials
+# --- Flattrade API Credentials ---
+USER_SESSION = "1878b2bdbf1b6e9c.2edd1a66c9b6b5aceef0008eb034076b6ef281ffa68b22fcb500ff4cca1caa3a"
+USER_ID = "FZ03508"
+FLATTRADE_PASSWORD = "Shubhi@3"
 
+# --- Supabase Credentials ---
+SUPABASE_URL = "https://zybakxpyibubzjhzdcwl.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp5YmFreHB5aWJ1YnpqaHpkY3dsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQ4OTQyMDgsImV4cCI6MjA3MDQ3MDIwOH0.8ZqreKy5zg_M-B1uH79T6lQXn62eRvvouo_OiMjwqGU"
 
-try:
-    SUPABASE_URL = st.secrets["SUPABASE_URL"]
-    SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-except KeyError:
-    st.error("❌ Supabase credentials not found. Please set SUPABASE_URL and SUPABASE_KEY in Streamlit's secrets.")
-    supabase = None
-# ==================== CONFIGURATION ====================
-st.set_page_config(
-    page_title="NSE Enhanced Trading Strategy",
-    page_icon="📊",
-    layout="wide"
-)
+# Initialize Supabase client
+@st.cache_resource
+def init_supabase():
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ==================== CSV FALLBACK PATH ====================
-# Used for downloading/uploading
-LOCAL_CSV_FILE = "trades_database.csv"
+# Initialize Flattrade API
+@st.cache_resource
+def init_flattrade_api():
+    api = NorenApiPy()
+    api.set_session(userid=USER_ID, usertoken=USER_SESSION, password=FLATTRADE_PASSWORD)
+    return api
 
-# ==================== SUPABASE DB FUNCTIONS ====================
-
-def save_trade_to_db(trade_data):
-    """Save a new trade to the Supabase database"""
-    if supabase is None:
-        st.error("Supabase client not initialized.")
-        return
-
-    # Ensure nullable fields are None, not NaN
-    for key in ['exit_order_id', 'exit_price', 'exit_time', 'pnl']:
-        if key not in trade_data:
-            trade_data[key] = None
-    
-    try:
-        response = supabase.table("trades").insert(trade_data).execute()
-        if len(response.data) == 0:
-            st.error(f"Failed to save trade: {response}")
-    except Exception as e:
-        st.error(f"Error saving trade to Supabase: {e}")
-
-def update_trade_exit(entry_order_id, exit_order_id, exit_price, exit_time, pnl):
-    """Update trade with exit information in Supabase"""
-    if supabase is None:
-        st.error("Supabase client not initialized.")
-        return
-
-    update_data = {
-        'exit_order_id': exit_order_id,
-        'exit_price': exit_price,
-        'exit_time': exit_time,
-        'pnl': pnl,
-        'status': 'CLOSED'
-    }
-    
-    try:
-        response = supabase.table("trades").update(update_data).eq("entry_order_id", entry_order_id).execute()
-        if len(response.data) == 0:
-            st.warning(f"Trade {entry_order_id} not found or failed to update.")
-    except Exception as e:
-        st.error(f"Error updating trade in Supabase: {e}")
-
-def get_open_trades():
-    """Get all open trades from Supabase"""
-    if supabase is None:
-        st.error("Supabase client not initialized.")
-        return pd.DataFrame()
-
-    try:
-        response = supabase.table("trades").select("*").eq("status", "OPEN").execute()
-        if response.data:
-            return pd.DataFrame(response.data)
-        return pd.DataFrame()
-    except Exception as e:
-        st.error(f"Error fetching open trades: {e}")
-        return pd.DataFrame()
-
-def get_all_trades():
-    """Get all trades from Supabase"""
-    if supabase is None:
-        st.error("Supabase client not initialized.")
-        return pd.DataFrame()
-
-    try:
-        response = supabase.table("trades").select("*").order("entry_time", desc=True).execute()
-        if response.data:
-            return pd.DataFrame(response.data)
-        return pd.DataFrame()
-    except Exception as e:
-        st.error(f"Error fetching all trades: {e}")
-        return pd.DataFrame()
-
-# ==================== SESSION STATE ====================
-if 'authenticated' not in st.session_state:
-    st.session_state.authenticated = False
-if 'otp_sent' not in st.session_state:
-    st.session_state.otp_sent = False
-if 'api_credentials' not in st.session_state:
-    st.session_state.api_credentials = {}
-if 'api_instance' not in st.session_state:
-    st.session_state.api_instance = None
-if 'access_token' not in st.session_state:
-    st.session_state.access_token = None
-if 'positions' not in st.session_state:
-    st.session_state.positions = []
-if 'trailing_stops' not in st.session_state:
-    st.session_state.trailing_stops = {}
-if 'last_data' not in st.session_state:
-    st.session_state.last_data = pd.DataFrame()
-if 'auto_exit_enabled' not in st.session_state:
-    st.session_state.auto_exit_enabled = False
-if 'auto_entry_enabled' not in st.session_state:
-    st.session_state.auto_entry_enabled = False
-if 'min_traded_value_cr' not in st.session_state:
-    st.session_state.min_traded_value_cr = 500
-
-# ==================== NSE DATA FETCHER ====================
-class NSEDataFetcher:
-    """Fetch live data from NSE India"""
-    
+class FnOBreakoutStrategy:
     def __init__(self):
-        self.base_url = "https://www.nseindia.com"
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive'
+        self.stop_loss_pct = 0.01  # 1% stop loss
+        self.target_pct = 0.03  # 3% target
+        self.trailing_stop_pct = 0.01  # 1% trailing stop
+        
+        self.entry_price = None
+        self.current_position = None  # 'long' or 'short'
+        self.position_size = 0
+        self.stop_loss = None
+        self.target = None
+        self.day_high = None
+        self.day_low = None
+        self.trailing_stop = None
+        self.position_symbol = None  # Track which stock has position
+        
+        self.screened_stocks = []
+        self.current_date = None
+        self.avg_vol_opening = None
+        
+    def reset_daily_data(self, current_date):
+        """Reset daily data for new trading day"""
+        if self.current_date != current_date:
+            self.current_date = current_date
+            self.screened_stocks = []
+            self.day_high = None
+            self.day_low = None
+    
+    def calculate_opening_candle_metrics(self, df):
+        """
+        Calculate metrics for 9:15 to 9:29 period
+        Returns: avg_volume_opening, trade_value, is_big_body, opening_candle_data
+        """
+        # Filter data for 9:15 to 9:29
+        opening_data = df[(df.index.time >= time(9, 15)) & (df.index.time <= time(9, 29))]
+        
+        if len(opening_data) == 0:
+            return None, None, None, None
+        
+        # Calculate average volume for opening period
+        avg_volume_opening = opening_data['Volume'].mean()
+        
+        # Calculate trade value (price * volume)
+        opening_data_copy = opening_data.copy()
+        opening_data_copy['TradeValue'] = opening_data_copy['Close'] * opening_data_copy['Volume']
+        total_trade_value = opening_data_copy['TradeValue'].sum()
+        trade_value_crores = total_trade_value / 10000000  # Convert to crores
+        
+        # Create 15-min candle (9:15 to 9:29)
+        opening_candle = {
+            'Open': opening_data['Open'].iloc[0],
+            'High': opening_data['High'].max(),
+            'Low': opening_data['Low'].min(),
+            'Close': opening_data['Close'].iloc[-1],
+            'Volume': opening_data['Volume'].sum()
         }
-        self.session = requests.Session()
-        self.session.headers.update(self.headers)
+        
+        # Check if body is big (at least 0.5% of open price)
+        body_size = abs(opening_candle['Close'] - opening_candle['Open'])
+        body_pct = (body_size / opening_candle['Open']) * 100
+        is_big_body = body_pct >= 0.5
+        
+        return avg_volume_opening, trade_value_crores, is_big_body, opening_candle
     
-    def get_cookies(self):
-        try:
-            response = self.session.get(self.base_url, timeout=10)
-            return response.status_code == 200
-        except:
+    def check_gap(self, df):
+        """
+        Check if stock has gap up or gap down
+        Compare today's open with previous day's close
+        """
+        if len(df) < 2:
             return False
+        
+        # Get previous day's last candle
+        today = df.index[-1].date()
+        yesterday_data = df[df.index.date < today]
+        
+        if len(yesterday_data) == 0:
+            return True  # No previous day data, assume no gap
+        
+        prev_close = yesterday_data['Close'].iloc[-1]
+        today_open = df[df.index.date == today]['Open'].iloc[0]
+        
+        gap_pct = abs((today_open - prev_close) / prev_close) * 100
+        
+        # No gap if difference is less than 0.5%
+        return gap_pct < 0.5
     
-    def fetch_all_securities(self):
-        try:
-            self.get_cookies()
-            time.sleep(1)
-            
-            url = f"{self.base_url}/api/equity-stockIndices?index=SECURITIES%20IN%20F%26O"
-            response = self.session.get(url, timeout=15)
-            
-            if response.status_code == 200:
-                st.success("✅ Fetched F&O securities from NSE")
-                return response.json()
-            
-            st.error(f"❌ API failed ({response.status_code})")
-            return None
-        except Exception as e:
-            st.error(f"Error: {str(e)}")
-            return None
+    def screen_stock(self, df):
+        """
+        Screen stock based on Stage A criteria
+        Returns: (passed, reason, metrics)
+        """
+        if len(df) < 300:
+            return False, "Insufficient data", None
+        
+        # Check for gap
+        no_gap = self.check_gap(df)
+        if not no_gap:
+            return False, "Stock has gap", None
+        
+        # Get opening candle metrics
+        avg_vol_opening, trade_value, big_body, opening_candle = self.calculate_opening_candle_metrics(df)
+        
+        if avg_vol_opening is None:
+            return False, "No opening period data", None
+        
+        # Calculate average volume of last 300 candles
+        avg_vol_300 = df['Volume'].tail(300).mean()
+        
+        # Screening criteria
+        volume_check = avg_vol_opening > (5 * avg_vol_300)
+        trade_value_check = trade_value > 20  # 20 crores
+        
+        metrics = {
+            'avg_vol_opening': avg_vol_opening,
+            'avg_vol_300': avg_vol_300,
+            'trade_value': trade_value,
+            'body_pct': (abs(opening_candle['Close'] - opening_candle['Open']) / opening_candle['Open']) * 100
+        }
+        
+        reasons = []
+        if not volume_check:
+            reasons.append(f"Volume: {avg_vol_opening:.0f} vs {5*avg_vol_300:.0f}")
+        if not trade_value_check:
+            reasons.append(f"Trade Value: ₹{trade_value:.2f}Cr vs ₹20Cr")
+        if not big_body:
+            reasons.append("Body not big enough")
+        
+        passed = volume_check and trade_value_check and big_body
+        
+        reason = "Passed all criteria" if passed else ", ".join(reasons)
+        
+        return passed, reason, metrics
     
-    def parse_nse_data(self, nse_data):
-        try:
-            if not nse_data:
-                return pd.DataFrame()
-            
-            df = pd.DataFrame(nse_data.get('data', []))
-            
-            if df.empty:
-                st.warning("⚠️ No data in response")
-                return pd.DataFrame()
-            
-            column_mapping = {
-                'lastPrice': 'ltp',
-                'previousClose': 'prev_close',
-                'dayHigh': 'high',
-                'dayLow': 'low',
-                'totalTradedValue': 'tradedValue',
-                'perChange': 'pChange'
-            }
-            df = df.rename(columns=column_mapping)
-            
-            required = ['symbol', 'ltp', 'open', 'high', 'low', 'tradedValue']
-            for col in required:
-                if col not in df.columns:
-                    if col == 'open' and 'previousClose' in df.columns:
-                        df['open'] = df['previousClose']
-                    elif col not in df.columns:
-                        st.error(f"❌ Missing column: {col}")
-                        return pd.DataFrame()
-            
-            numeric_cols = ['ltp', 'open', 'high', 'low', 'tradedValue']
-            for col in numeric_cols:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-            if 'pChange' not in df.columns and 'prev_close' in df.columns:
-                df['prev_close'] = pd.to_numeric(df['prev_close'], errors='coerce')
-                df['pChange'] = ((df['ltp'] - df['prev_close']) / df['prev_close']) * 100
-            elif 'pChange' not in df.columns:
-                df['pChange'] = ((df['ltp'] - df['open']) / df['open']) * 100
-            else:
-                df['pChange'] = pd.to_numeric(df['pChange'], errors='coerce')
-            
-            df = df.dropna(subset=['ltp', 'open', 'high', 'low', 'tradedValue'])
-            df = df[df['ltp'] > 0]
-            df = df[df['tradedValue'] > 0]
-            df['pChange'] = df['pChange'].fillna(0)
-            
-            st.success(f"✅ Parsed {len(df)} stocks from NSE")
-            return df
-            
-        except Exception as e:
-            st.error(f"❌ Parsing error: {str(e)}")
-            return pd.DataFrame()
-
-# ==================== DEFINEDGE API ====================
-class DefinedgeAPI:
-    """Definedge Securities API Wrapper"""
-    
-    def __init__(self):
-        self.auth_base_url = "https://signin.definedgesecurities.com/auth/realms/debroking/dsbpkc"
-        self.api_base_url = "https://integrate.definedgesecurities.com"
-        self.user_id = None
-        self.api_token = None
-        self.api_secret = None
-        self.otp_token = None
-        self.access_token = None
-    
-    def set_credentials(self, user_id, api_token, api_secret):
-        self.user_id = user_id
-        self.api_token = api_token
-        self.api_secret = api_secret
-    
-    def generate_otp(self):
-        try:
-            url = f"{self.auth_base_url}/login/{self.api_token}"
-            headers = {
-                "api_secret": self.api_secret,
-                "Content-Type": "application/json"
-            }
-            
-            response = requests.get(url, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                self.otp_token = data.get('otp_token')
-                message = data.get('message', 'OTP sent')
-                
-                if self.otp_token:
-                    return True, message, self.otp_token
-                return False, "OTP token not found", None
-            return False, f"Error {response.status_code}", None
-        except Exception as e:
-            return False, f"Error: {str(e)}", None
-    
-    def verify_otp_and_authenticate(self, otp, otp_token):
-        try:
-            url = f"{self.auth_base_url}/token"
-            headers = {"Content-Type": "application/json"}
-            payload = {"otp_token": otp_token, "otp": otp}
-            
-            response = requests.post(url, json=payload, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                self.access_token = data.get('api_session_key') or data.get('susertoken')
-                
-                if self.access_token:
-                    return True, self.access_token
-                return False, "Session key not found"
-            return False, f"Error {response.status_code}"
-        except Exception as e:
-            return False, f"Error: {str(e)}"
-    
-    def get_quotes(self, symbols):
-        """Get live quotes from Definedge API"""
-        if not self.access_token:
+    def check_breakout_entry(self, current_candle, day_high, day_low, avg_vol_opening):
+        """
+        Check for breakout entry signals (Stage B)
+        Returns: signal_type ('BUY', 'SELL', or None)
+        """
+        current_volume = current_candle['Volume']
+        current_high = current_candle['High']
+        current_low = current_candle['Low']
+        
+        # Volume must be greater than average opening volume
+        if current_volume <= avg_vol_opening:
             return None
         
-        try:
-            url = f"{self.api_base_url}/dart/v1/quotes"
-            headers = {
-                "Authorization": self.access_token,
-                "Content-Type": "application/json"
-            }
+        # Buy signal: breakout above day high
+        if current_high > day_high:
+            return 'BUY'
+        
+        # Sell signal: breakdown below day low
+        if current_low < day_low:
+            return 'SELL'
+        
+        return None
+    
+    def update_trailing_stop(self, current_price, current_day_high, current_day_low):
+        """
+        Update trailing stop loss based on day high/low
+        """
+        if self.current_position == 'long':
+            # Trailing stop: 1% down from day high
+            new_trailing = current_day_high * (1 - self.trailing_stop_pct)
+            if self.trailing_stop is None or new_trailing > self.trailing_stop:
+                self.trailing_stop = new_trailing
+        
+        elif self.current_position == 'short':
+            # Trailing stop: 1% up from day low
+            new_trailing = current_day_low * (1 + self.trailing_stop_pct)
+            if self.trailing_stop is None or new_trailing < self.trailing_stop:
+                self.trailing_stop = new_trailing
+    
+    def check_exit_conditions(self, current_price, current_day_high, current_day_low):
+        """
+        Check exit conditions (Stage C)
+        Returns: (should_exit, reason)
+        """
+        if not self.current_position:
+            return False, None
+        
+        # Update trailing stop
+        self.update_trailing_stop(current_price, current_day_high, current_day_low)
+        
+        if self.current_position == 'long':
+            # Check target
+            if current_price >= self.target:
+                return True, "Target hit"
             
-            formatted_symbols = [self._format_symbol(s, "NSE") for s in symbols]
+            # Check stop loss
+            if current_price <= self.stop_loss:
+                return True, "Stop loss hit"
             
-            payload = {
-                "exchange": "NSE",
-                "tradingsymbols": formatted_symbols
-            }
+            # Check trailing stop
+            if self.trailing_stop and current_price <= self.trailing_stop:
+                return True, "Trailing stop hit"
+        
+        elif self.current_position == 'short':
+            # Check target
+            if current_price <= self.target:
+                return True, "Target hit"
             
-            response = requests.post(url, json=payload, headers=headers, timeout=15)
+            # Check stop loss
+            if current_price >= self.stop_loss:
+                return True, "Stop loss hit"
             
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('status') == 'SUCCESS':
-                    return data.get('quotes', [])
+            # Check trailing stop
+            if self.trailing_stop and current_price >= self.trailing_stop:
+                return True, "Trailing stop hit"
+        
+        return False, None
+    
+    def enter_position(self, signal_type, entry_price, day_high, day_low, quantity, symbol):
+        """
+        Enter a position
+        """
+        self.current_position = 'long' if signal_type == 'BUY' else 'short'
+        self.entry_price = entry_price
+        self.position_size = quantity
+        self.day_high = day_high
+        self.day_low = day_low
+        self.trailing_stop = None
+        self.position_symbol = symbol
+        
+        if self.current_position == 'long':
+            # Stop loss: max of 1% or day low
+            stop_loss_pct = entry_price * (1 - self.stop_loss_pct)
+            self.stop_loss = max(stop_loss_pct, day_low)
             
+            # Target: 3%
+            self.target = entry_price * (1 + self.target_pct)
+        
+        else:  # short
+            # Stop loss: min of 1% or day high
+            stop_loss_pct = entry_price * (1 + self.stop_loss_pct)
+            self.stop_loss = min(stop_loss_pct, day_high)
+            
+            # Target: 3%
+            self.target = entry_price * (1 - self.target_pct)
+    
+    def exit_position(self):
+        """
+        Exit current position
+        """
+        self.current_position = None
+        self.entry_price = None
+        self.position_size = 0
+        self.stop_loss = None
+        self.target = None
+        self.trailing_stop = None
+        self.position_symbol = None
+
+def get_fno_stocks_list():
+    """
+    Get list of FnO stocks from CSV
+    """
+    try:
+        # Load from CSV
+        equity_df = load_nse_equity_data()
+        if equity_df is not None:
+            # Try to identify symbol column
+            possible_cols = ['Symbol', 'Tradingsymbol', 'Trading Symbol', 'symbol', 'tradingsymbol']
+            symbol_col = None
+            
+            for col in possible_cols:
+                if col in equity_df.columns:
+                    symbol_col = col
+                    break
+            
+            if symbol_col:
+                # Get unique symbols, limit to first 50 for performance
+                fno_stocks = equity_df[symbol_col].dropna().unique().tolist()[:50]
+                return fno_stocks
+        
+        # Fallback to sample FnO stocks
+        fno_stocks = [
+            'RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'ICICIBANK',
+            'SBIN', 'BHARTIARTL', 'ITC', 'HINDUNILVR', 'LT',
+            'AXISBANK', 'KOTAKBANK', 'BAJFINANCE', 'ASIANPAINT', 'MARUTI'
+        ]
+        return fno_stocks
+    except Exception as e:
+        logging.error(f"Error loading FnO stocks: {e}")
+        # Return sample list as fallback
+        return ['RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'ICICIBANK']
+
+def load_nse_equity_data():
+    """Load NSE Equity CSV file with ISIN data"""
+    try:
+        equity_df = pd.read_csv('NSE_Equity.csv')
+        return equity_df
+    except Exception as e:
+        logging.error(f"Error loading NSE_Equity.csv: {e}")
+        return None
+
+def get_token_from_isin(api, symbol, exchange="NSE"):
+    """Get token for the symbol using ISIN from CSV"""
+    try:
+        # First try to load from CSV
+        equity_df = load_nse_equity_data()
+        
+        if equity_df is not None:
+            # Search for symbol in CSV
+            # Try different column names that might contain the symbol
+            possible_cols = ['Symbol', 'Tradingsymbol', 'Trading Symbol', 'symbol', 'tradingsymbol']
+            symbol_col = None
+            
+            for col in possible_cols:
+                if col in equity_df.columns:
+                    symbol_col = col
+                    break
+            
+            if symbol_col:
+                # Find the row with matching symbol
+                mask = equity_df[symbol_col].str.upper() == symbol.upper()
+                if mask.any():
+                    row = equity_df[mask].iloc[0]
+                    
+                    # Check for ISIN column
+                    isin_cols = ['ISIN', 'Isin', 'isin']
+                    isin = None
+                    for col in isin_cols:
+                        if col in equity_df.columns:
+                            isin = row[col]
+                            break
+                    
+                    # Check for Token column (if available)
+                    token_cols = ['Token', 'token', 'ScripCode', 'token_number']
+                    for col in token_cols:
+                        if col in equity_df.columns and pd.notna(row[col]):
+                            return str(row[col])
+                    
+                    # If ISIN is available, search using it
+                    if isin and pd.notna(isin):
+                        result = api.searchscrip(exchange=exchange, searchtext=isin)
+                        if result and 'values' in result and len(result['values']) > 0:
+                            return result['values'][0].get('token')
+        
+        # Fallback: Search directly using symbol
+        result = api.searchscrip(exchange=exchange, searchtext=symbol)
+        if result and 'values' in result and len(result['values']) > 0:
+            for item in result['values']:
+                if item.get('tsym') == f"{symbol}-EQ":
+                    return item.get('token')
+            return result['values'][0].get('token')
+        
+        return None
+    except Exception as e:
+        logging.error(f"Error getting token for {symbol}: {e}")
+        return None
+
+def load_market_data(api, symbol, exchange="NSE"):
+    """Load real market data from Flattrade API"""
+    try:
+        token = get_token_from_isin(api, symbol, exchange)
+        if not token:
+            logging.error(f"Could not find token for {symbol}")
             return None
-        except Exception as e:
-            st.error(f"Error fetching quotes: {str(e)}")
-            return None
-    
-    def place_order(self, symbol, side, quantity, exchange="NSE", product="INTRADAY", order_type="MARKET", price=0, trigger_price=0):
-        """Place order with proper symbol formatting"""
-        if not self.access_token:
-            return None, "❌ Not authenticated"
         
-        try:
-            formatted_symbol = self._format_symbol(symbol, exchange)
-            
-            url = f"{self.api_base_url}/dart/v1/placeorder"
-            headers = {
-                "Authorization": self.access_token,
-                "Content-Type": "application/json"
-            }
-            
-            payload = {
-                "exchange": exchange,
-                "tradingsymbol": formatted_symbol,
-                "order_type": side,
-                "quantity": str(quantity),
-                "product_type": product,
-                "price_type": order_type,
-                "price": str(price) if order_type in ["LIMIT", "SL-LIMIT"] else "0",
-                "validity": "DAY"
-            }
-            
-            if order_type in ["SL-LIMIT", "SL-MARKET"]:
-                payload["trigger_price"] = str(trigger_price)
-            
-            response = requests.post(url, json=payload, headers=headers, timeout=15)
-            
-            try:
-                data = response.json()
-            except:
-                data = {"error": "Invalid response", "status_code": response.status_code}
-            
-            if response.status_code == 200 and data.get('status') == 'SUCCESS':
-                return data, f"✅ Order {data.get('order_id')} placed!"
-            else:
-                return data, f"❌ Failed: {data.get('message', 'Unknown error')}"
+        # Get historical data - last 400 minutes to have enough data
+        end_date = datetime.now()
+        start_date = end_date - timedelta(minutes=400)
         
-        except Exception as e:
-            return None, f"❌ Exception: {str(e)}"
-    
-    def _format_symbol(self, symbol, exchange):
-        """Format trading symbol for API"""
-        clean = symbol.replace("-EQ", "").strip()
+        start_time = start_date.strftime("%d-%m-%Y") + " 09:15:00"
+        end_time = end_date.strftime("%d-%m-%Y") + " " + end_date.strftime("%H:%M:%S")
         
-        if exchange == "NSE":
-            is_derivative = any(x in clean.upper() for x in ["FUT", "CE", "PE"]) or any(c.isdigit() for c in clean)
-            
-            if not is_derivative:
-                return f"{clean}-EQ"
-        
-        return clean
-
-# ==================== DEFINEDGE REPORTS ====================
-class DefinedgeReports:
-    """Handles fetching orders, trades, and positions"""
-    
-    def __init__(self, access_token, api_base_url):
-        self.access_token = access_token
-        self.api_base_url = api_base_url
-
-    def orders(self):
-        """Fetches the Order Book"""
-        if not self.access_token:
-            return False, "Not authenticated"
-        
-        try:
-            url = f"{self.api_base_url}/dart/v1/orders"
-            headers = {"Authorization": self.access_token}
-            response = requests.get(url, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('status') == 'SUCCESS':
-                    return True, data.get('orders', [])
-                else:
-                    return False, f"API Error: {data.get('message', 'Unknown error')}"
-            else:
-                return False, f"HTTP Error {response.status_code}: {response.text}"
-        except Exception as e:
-            return False, f"Exception: {str(e)}"
-
-    def trades(self):
-        """Fetches the Trade Book"""
-        if not self.access_token:
-            return False, "Not authenticated"
-        
-        try:
-            url = f"{self.api_base_url}/dart/v1/trades"
-            headers = {"Authorization": self.access_token}
-            response = requests.get(url, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('status') == 'SUCCESS':
-                    return True, data.get('trades', [])
-                else:
-                    return False, f"API Error: {data.get('message', 'Unknown error')}"
-            else:
-                return False, f"HTTP Error {response.status_code}: {response.text}"
-        except Exception as e:
-            return False, f"Exception: {str(e)}"
-
-    def positions(self):
-        """Fetches current open Positions"""
-        if not self.access_token:
-            return False, "Not authenticated"
-        
-        try:
-            url = f"{self.api_base_url}/dart/v1/positions"
-            headers = {"Authorization": self.access_token}
-            response = requests.get(url, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('status') == 'SUCCESS':
-                    return True, data.get('positions', [])
-                else:
-                    return False, f"API Error: {data.get('message', 'Unknown error')}"
-            else:
-                return False, f"HTTP Error {response.status_code}: {response.text}"
-        except Exception as e:
-            return False, f"Exception: {str(e)}"
-    
-    def limits(self):
-        """Fetches fund and margin limits"""
-        if not self.access_token:
-            return False, "Not authenticated"
-        
-        try:
-            url = f"{self.api_base_url}/dart/v1/limits"
-            headers = {"Authorization": self.access_token}
-            response = requests.get(url, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('status') == 'SUCCESS':
-                    return True, data
-                else:
-                    return False, f"API Error: {data.get('message', 'Unknown error')}"
-            else:
-                return False, f"HTTP Error {response.status_code}: {response.text}"
-        except Exception as e:
-            return False, f"Exception: {str(e)}"
-
-# ==================== AUTO EXIT MONITOR ====================
-def monitor_and_exit_positions(api, reports):
-    """Monitor open positions and exit based on target/stop loss"""
-    if not st.session_state.auto_exit_enabled:
-        return
-    
-    open_trades = get_open_trades()
-    
-    if open_trades.empty:
-        return
-    
-    success, positions = reports.positions()
-    
-    if not success or not positions:
-        return
-    
-    position_dict = {}
-    for pos in positions:
-        symbol = pos.get('tradingsymbol', '')
-        ltp = float(pos.get('ltp', 0))
-        qty = int(pos.get('net_quantity', 0))
-        position_dict[symbol] = {'ltp': ltp, 'qty': qty}
-    
-    for idx, trade in open_trades.iterrows():
-        symbol = trade['symbol']
-        side = trade['side']
-        target = float(trade['target_price'])
-        stop_loss = float(trade['stop_loss'])
-        entry_price = float(trade['entry_price'])
-        quantity = int(trade['quantity'])
-        entry_order_id = trade['entry_order_id']
-        
-        pos_data = position_dict.get(symbol, {})
-        ltp = pos_data.get('ltp', 0)
-        pos_qty = pos_data.get('qty', 0)
-        
-        if ltp == 0 or pos_qty == 0:
-            continue
-        
-        should_exit = False
-        exit_reason = ""
-        
-        if side == 'BUY':
-            if ltp >= target:
-                should_exit = True
-                exit_reason = "Target Hit"
-            elif ltp <= stop_loss:
-                should_exit = True
-                exit_reason = "Stop Loss Hit"
-        else:
-            if ltp <= target:
-                should_exit = True
-                exit_reason = "Target Hit"
-            elif ltp >= stop_loss:
-                should_exit = True
-                exit_reason = "Stop Loss Hit"
-        
-        if should_exit:
-            exit_side = 'SELL' if side == 'BUY' else 'BUY'
-            
-            data, msg = api.place_order(
-                symbol=symbol,
-                side=exit_side,
-                quantity=quantity,
-                exchange="NSE",
-                order_type="MARKET"
-            )
-            
-            if data and data.get('status') == 'SUCCESS':
-                exit_order_id = data.get('order_id')
-                pnl = (ltp - entry_price) * quantity if side == 'BUY' else (entry_price - ltp) * quantity
-                
-                update_trade_exit(
-                    entry_order_id=entry_order_id,
-                    exit_order_id=exit_order_id,
-                    exit_price=ltp,
-                    exit_time=datetime.now(IST).isoformat(),
-                    pnl=pnl
-                )
-                
-                st.success(f"🎯 Auto Exit: {symbol} - {exit_reason} | Order: {exit_order_id} | P&L: ₹{pnl:.2f}")
-
-def check_order_executed(reports, order_id):
-    """Check if order is executed"""
-    success, trades = reports.trades()
-    
-    if not success or not trades:
-        return False, 0
-    
-    for trade in trades:
-        if trade.get('order_id') == order_id:
-            return True, float(trade.get('fill_price', 0))
-    
-    return False, 0
-
-# ==================== AUTHENTICATION UI ====================
-def show_authentication_page():
-    st.title("🔐 Definedge Securities Login")
-    
-    col1, col2 = st.columns([1, 1])
-    
-    with col1:
-        st.markdown("""
-        ### Quick Start
-        1. Enter API credentials
-        2. Generate OTP
-        3. Enter OTP and login
-        """)
-    
-    with col2:
-        with st.form("creds"):
-            st.markdown("### 📋 API Credentials")
-            user_id = st.text_input("User ID")
-            api_token = st.text_input("API Token", type="password")
-            api_secret = st.text_input("API Secret", type="password")
-            
-            if st.form_submit_button("💾 Save"):
-                if user_id and api_token and api_secret:
-                    st.session_state.api_credentials = {
-                        'user_id': user_id,
-                        'api_token': api_token,
-                        'api_secret': api_secret
-                    }
-                    st.success("✅ Saved! Generate OTP below.")
-                else:
-                    st.error("Fill all fields")
-    
-    if st.session_state.api_credentials and not st.session_state.otp_sent:
-        st.markdown("---")
-        if st.button("📤 Generate OTP", use_container_width=True, type="primary"):
-            api = DefinedgeAPI()
-            api.set_credentials(
-                st.session_state.api_credentials['user_id'],
-                st.session_state.api_credentials['api_token'],
-                st.session_state.api_credentials['api_secret']
-            )
-            
-            success, message, token = api.generate_otp()
-            if success:
-                st.session_state.otp_sent = True
-                st.session_state.temp_otp_token = token
-                st.success(f"✅ {message}")
-                st.rerun()
-            else:
-                st.error(f"❌ {message}")
-    
-    if st.session_state.otp_sent:
-        st.markdown("---")
-        with st.form("otp"):
-            st.markdown("### 🔒 Enter OTP")
-            otp = st.text_input("6-digit OTP")
-            
-            if st.form_submit_button("✅ Verify & Login", use_container_width=True):
-                if otp and len(str(otp)) >= 4:
-                    api = DefinedgeAPI()
-                    api.set_credentials(
-                        st.session_state.api_credentials['user_id'],
-                        st.session_state.api_credentials['api_token'],
-                        st.session_state.api_credentials['api_secret']
-                    )
-                    
-                    success, token = api.verify_otp_and_authenticate(otp, st.session_state.temp_otp_token)
-                    
-                    if success:
-                        st.session_state.authenticated = True
-                        st.session_state.access_token = token
-                        api.access_token = token
-                        st.session_state.api_instance = api
-                        st.session_state.otp_sent = False
-                        st.success("✅ Logged in!")
-                        time.sleep(1)
-                        st.rerun()
-                    else:
-                        st.error(f"❌ {token}")
-                else:
-                    st.error("Enter a valid OTP")
-
-# ==================== TRADING STRATEGY ====================
-class EnhancedTradingStrategy:
-    def __init__(self):
-        self.positions = []
-        self.trailing_stops = {}
-    
-    def is_trading_time(self):
-        now = datetime.now(IST).time()
-        return dt_time(9, 15) <= now <= dt_time(23, 59)
-    
-    def filter_by_traded_value(self, df, min_value_cr):
-        if df.empty:
-            return df
-        min_value = min_value_cr * 1e7
-        return df[df['tradedValue'] > min_value].copy()
-    
-    def generate_signals(self, df_nse, api, min_traded_value_cr):
-        """Generate signals using NSE data for filtering and Definedge for prices"""
-        signals = []
-        
-        if df_nse.empty:
-            return signals, pd.DataFrame(), pd.DataFrame()
-        
-        df_filtered = self.filter_by_traded_value(df_nse, min_traded_value_cr)
-        
-        if df_filtered.empty:
-            st.warning(f"⚠️ No stocks with traded value > {min_traded_value_cr} crore")
-            return signals, pd.DataFrame(), pd.DataFrame()
-        
-        symbols = df_filtered['symbol'].tolist()
-        quotes = api.get_quotes(symbols)
-        
-        if not quotes:
-            st.warning("⚠️ Could not fetch live prices from Definedge API")
-            return signals, pd.DataFrame(), pd.DataFrame()
-        
-        price_dict = {}
-        for quote in quotes:
-            symbol = quote.get('tradingsymbol', '').replace('-EQ', '')
-            price_dict[symbol] = {
-                'ltp': float(quote.get('ltp', 0)),
-                'open': float(quote.get('open', 0)),
-                'high': float(quote.get('high', 0)),
-                'low': float(quote.get('low', 0))
-            }
-        
-        for idx, stock in df_filtered.iterrows():
-            symbol = stock['symbol']
-            prices = price_dict.get(symbol)
-            
-            if not prices or prices['ltp'] == 0:
-                continue
-            
-            stock['ltp'] = prices['ltp']
-            stock['open'] = prices['open']
-            stock['high'] = prices['high']
-            stock['low'] = prices['low']
-            stock['pChange'] = ((stock['ltp'] - stock['open']) / stock['open']) * 100 if stock['open'] > 0 else 0
-            
-            df_filtered.loc[idx] = stock
-        
-        df_gainers = df_filtered[df_filtered['pChange'] > 0].copy().sort_values('tradedValue', ascending=False)
-        df_losers = df_filtered[df_filtered['pChange'] < 0].copy().sort_values('tradedValue', ascending=False)
-        
-        is_trading_time = self.is_trading_time()
-        
-        for _, stock in df_gainers.iterrows():
-            if stock['ltp'] >= stock['high']:
-                signals.append({
-                    'symbol': stock['symbol'],
-                    'type': 'BUY',
-                    'ltp': float(stock['ltp']),
-                    'open': float(stock['open']),
-                    'target': float(stock['open']),
-                    'initial_stop_loss': float(stock['low']),
-                    'current_stop_loss': float(stock['low']),
-                    'sl_distance': float(stock['ltp'] - stock['low']),
-                    'day_low': float(stock['low']),
-                    'day_high': float(stock['high']),
-                    'pct_change': float(stock['pChange']),
-                    'traded_value': float(stock['tradedValue']),
-                    'can_trade': is_trading_time,
-                    'breakout_type': 'Day High Breakout'
-                })
-        
-        for _, stock in df_losers.iterrows():
-            if stock['ltp'] <= stock['low']:
-                signals.append({
-                    'symbol': stock['symbol'],
-                    'type': 'SELL',
-                    'ltp': float(stock['ltp']),
-                    'open': float(stock['open']),
-                    'target': float(stock['open']),
-                    'initial_stop_loss': float(stock['high']),
-                    'current_stop_loss': float(stock['high']),
-                    'sl_distance': float(stock['high'] - stock['ltp']),
-                    'day_low': float(stock['low']),
-                    'day_high': float(stock['high']),
-                    'pct_change': float(stock['pChange']),
-                    'traded_value': float(stock['tradedValue']),
-                    'can_trade': is_trading_time,
-                    'breakout_type': 'Day Low Breakdown'
-                })
-        
-        return signals, df_gainers, df_losers
-
-# ==================== SIGNAL DISPLAY ====================
-def display_signals_table(signals, title, api, reports, total_risk, auto_entry):
-    if not signals:
-        st.info(f"No {title.lower()} found")
-        return
-    
-    st.markdown(f"### {title}")
-    
-    now = datetime.now(IST).time()
-    is_trading_time = dt_time(9, 15) <= now <= dt_time(23, 59)
-    
-    if is_trading_time:
-        st.success(f"✅ Trading Active ({datetime.now(IST).strftime('%H:%M:%S')})")
-    else:
-        st.warning(f"⚠️ Outside Hours | Current: {datetime.now(IST).strftime('%H:%M:%S')}")
-    
-    st.markdown("---")
-    
-    success_pos, positions = reports.positions()
-    position_dict = {}
-    if success_pos and positions:
-        for pos in positions:
-            symbol = pos.get('tradingsymbol', '')
-            qty = int(pos.get('net_quantity', 0))
-            position_dict[symbol] = qty
-    
-    open_trades = get_open_trades()
-    
-    for i, signal in enumerate(signals[:30]):
-        status = "🟢" if signal['can_trade'] else "🔴"
-        
-        with st.expander(
-            f"{status} {signal['symbol']} | ₹{signal['ltp']:.2f} | {signal['pct_change']:.2f}% | {signal['breakout_type']}",
-            expanded=(i < 5)
-        ):
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                st.metric("LTP", f"₹{signal['ltp']:.2f}")
-                st.metric("% Change", f"{signal['pct_change']:.2f}%")
-            
-            with col2:
-                st.metric("Target (Open)", f"₹{signal['open']:.2f}")
-                target_pct = abs(signal['ltp'] - signal['open']) / signal['ltp'] * 100
-                st.metric("Target Dist", f"{target_pct:.2f}%")
-            
-            with col3:
-                st.metric("Stop Loss", f"₹{signal['initial_stop_loss']:.2f}")
-                sl_pct = signal['sl_distance'] / signal['ltp'] * 100
-                st.metric("SL Dist", f"{sl_pct:.2f}%")
-            
-            with col4:
-                st.metric("Traded Value", f"₹{signal['traded_value']/1e7:.2f} Cr")
-            
-            st.markdown("---")
-            
-            risk_per_share = signal['sl_distance']
-            calc_qty = int(total_risk / risk_per_share) if risk_per_share > 0 else 1
-            calc_qty = max(1, calc_qty)
-            
-            formatted_sym = api._format_symbol(signal['symbol'], "NSE")
-            
-            if auto_entry and signal['can_trade']:
-                symbol_in_db = False
-                if not open_trades.empty:
-                    symbol_in_db = any(open_trades['symbol'] == formatted_sym)
-                
-                if not symbol_in_db:
-                    st.info(f"🤖 Auto-entry enabled. Placing order...")
-                    
-                    data, msg = api.place_order(
-                        symbol=signal['symbol'],
-                        side=signal['type'],
-                        quantity=calc_qty,
-                        exchange="NSE"
-                    )
-                    
-                    if data and data.get('status') == 'SUCCESS':
-                        entry_order_id = data.get('order_id')
-                        
-                        time.sleep(2)
-                        is_executed, exec_price = check_order_executed(reports, entry_order_id)
-                        
-                        if is_executed:
-                            trade_data = {
-                                'entry_order_id': entry_order_id,
-                                'symbol': formatted_sym,
-                                'side': signal['type'],
-                                'quantity': calc_qty,
-                                'entry_price': exec_price if exec_price > 0 else signal['ltp'],
-                                'target_price': signal['target'],
-                                'stop_loss': signal['initial_stop_loss'],
-                                'entry_time': datetime.now(IST).isoformat(),
-                                'status': 'OPEN'
-                            }
-                            
-                            save_trade_to_db(trade_data)
-                            st.success(f"✅ {msg} - Trade executed and saved to database!")
-                        else:
-                            st.warning(f"⏳ Order {entry_order_id} placed but not yet executed")
-                    else:
-                        st.error(f"❌ Auto-entry failed: {msg}")
-            
-            st.subheader(f"🚀 Manual Trade Controls")
-            
-            st.info(f"📋 Symbol: `{signal['symbol']}` → API Format: `{formatted_sym}`")
-            
-            col_qty, col_manual = st.columns([1, 2])
-            
-            with col_qty:
-                qty = st.number_input(
-                    f"Qty (Risk: ₹{total_risk})",
-                    key=f"q_{title}_{i}",
-                    min_value=1,
-                    value=calc_qty,
-                    help=f"Auto: ₹{total_risk} ÷ ₹{risk_per_share:.2f}"
-                )
-            
-            with col_manual:
-                manual = st.checkbox("Override Symbol", key=f"m_{title}_{i}")
-                if manual:
-                    custom_sym = st.text_input(
-                        "Trading Symbol",
-                        value=formatted_sym,
-                        key=f"s_{title}_{i}",
-                        help="Exact symbol from Definedge master file"
-                    )
-                else:
-                    custom_sym = None
-            
-            col_target, col_sl = st.columns(2)
-            with col_target:
-                target_price = st.number_input(
-                    "Target Price",
-                    key=f"tgt_{title}_{i}",
-                    value=float(signal['target']),
-                    step=0.05,
-                    format="%.2f"
-                )
-            
-            with col_sl:
-                sl_price = st.number_input(
-                    "Stop Loss",
-                    key=f"sl_{title}_{i}",
-                    value=float(signal['initial_stop_loss']),
-                    step=0.05,
-                    format="%.2f"
-                )
-            
-            col_btn1, col_btn2 = st.columns(2)
-            
-            with col_btn1:
-                disabled = not signal['can_trade']
-                
-                if st.button(f"📤 Place Entry Order", key=f"b_{title}_{i}", type="primary", disabled=disabled, use_container_width=True):
-                    sym_to_use = custom_sym if manual and custom_sym else signal['symbol']
-                    
-                    with st.spinner(f"Placing {signal['type']} order..."):
-                        data, msg = api.place_order(
-                            symbol=sym_to_use,
-                            side=signal['type'],
-                            quantity=int(qty),
-                            exchange="NSE"
-                        )
-                        
-                        if data and data.get('status') == 'SUCCESS':
-                            entry_order_id = data.get('order_id')
-                            st.success(f"✅ {msg}")
-                            
-                            time.sleep(2)
-                            is_executed, exec_price = check_order_executed(reports, entry_order_id)
-                            
-                            if is_executed:
-                                trade_data = {
-                                    'entry_order_id': entry_order_id,
-                                    'symbol': formatted_sym,
-                                    'side': signal['type'],
-                                    'quantity': qty,
-                                    'entry_price': exec_price if exec_price > 0 else signal['ltp'],
-                                    'target_price': target_price,
-                                    'stop_loss': sl_price,
-                                    'entry_time': datetime.now(IST).isoformat(),
-                                    'status': 'OPEN'
-                                }
-                                
-                                save_trade_to_db(trade_data)
-                                st.info(f"📊 Trade executed and saved! Auto-exit enabled for Target: ₹{target_price:.2f} | SL: ₹{sl_price:.2f}")
-                            else:
-                                st.warning(f"⏳ Order placed but not yet executed. Check order book.")
-                        else:
-                            st.error(msg)
-            
-            with col_btn2:
-                sym_to_check = custom_sym if manual and custom_sym else formatted_sym
-                has_position = position_dict.get(sym_to_check, 0) > 0
-                
-                has_db_entry = False
-                if not open_trades.empty:
-                    has_db_entry = any(open_trades['symbol'] == sym_to_check)
-                
-                can_exit = has_position and has_db_entry
-                
-                if st.button(
-                    f"🔥 Place Exit Order", 
-                    key=f"exit_{title}_{i}", 
-                    type="secondary", 
-                    disabled=not can_exit, 
-                    use_container_width=True,
-                    help="Exit enabled only for traded positions in database"
-                ):
-                    sym_to_use = custom_sym if manual and custom_sym else signal['symbol']
-                    exit_side = 'SELL' if signal['type'] == 'BUY' else 'BUY'
-                    
-                    with st.spinner(f"Placing {exit_side} order..."):
-                        data, msg = api.place_order(
-                            symbol=sym_to_use,
-                            side=exit_side,
-                            quantity=int(qty),
-                            exchange="NSE"
-                        )
-                        
-                        if data and data.get('status') == 'SUCCESS':
-                            st.success(f"✅ Exit {msg}")
-                            
-                            trade_row = open_trades[open_trades['symbol'] == sym_to_check].iloc[0]
-                            exit_price = signal['ltp']
-                            pnl = (exit_price - trade_row['entry_price']) * trade_row['quantity'] if trade_row['side'] == 'BUY' else (trade_row['entry_price'] - exit_price) * trade_row['quantity']
-                            
-                            update_trade_exit(
-                                entry_order_id=trade_row['entry_order_id'],
-                                exit_order_id=data.get('order_id'),
-                                exit_price=exit_price,
-                                exit_time=datetime.now(IST).isoformat(),
-                                pnl=pnl
-                            )
-                            st.info(f"💰 P&L: ₹{pnl:.2f}")
-                        else:
-                            st.error(msg)
-
-# ==================== MAIN DASHBOARD ====================
-def show_trading_dashboard():
-    api = st.session_state.api_instance
-    
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        user = st.session_state.api_credentials.get('user_id', 'User')
-        st.success(f"🟢 Logged in as: {user}")
-    with col3:
-        if st.button("🚪 Logout", use_container_width=True):
-            keys_to_clear = list(st.session_state.keys())
-            for key in keys_to_clear:
-                del st.session_state[key]
-            st.rerun()
-    
-    st.title("📊 NSE Enhanced Trading Strategy")
-    st.markdown("**Breakout Strategy | Auto Entry/Exit | Value-Based | F&O Securities**")
-    
-    if api is None:
-        st.error("API instance not initialized. Please log in.")
-        return
-    
-    if supabase is None:
-        st.error("Supabase client not initialized. Check credentials.")
-        return
-        
-    reports = DefinedgeReports(api.access_token, api.api_base_url)
-    
-    with st.sidebar:
-        st.header("⚙️ Settings")
-        
-        st.markdown("""
-        ### Strategy
-        - Entry: LTP crosses day high/low
-        - Target: Open price (editable)
-        - Stop: Day low/high (editable)
-        - Auto Exit: Monitors positions
-        """)
-        
-        st.markdown("---")
-        
-        st.subheader("💰 Funds & Margin")
-        success, limits_data = reports.limits()
-        if success:
-            cash = limits_data.get('cash', 0)
-            margin_used = limits_data.get('margin_used', 0)
-            margin_available = limits_data.get('margin_available', 0)
-            
-            st.metric("Available Cash", f"₹{float(cash):,.2f}")
-            st.metric("Margin Used", f"₹{float(margin_used):,.2f}")
-            st.metric("Margin Available", f"₹{float(margin_available):,.2f}")
-        else:
-            st.warning("Unable to fetch limits")
-        
-        st.markdown("---")
-        st.metric("Time", datetime.now(IST).strftime('%H:%M:%S'))
-        
-        now = datetime.now(IST).time()
-        if dt_time(9, 15) <= now <= dt_time(23, 59):
-            st.success("✅ Trading Hours")
-        else:
-            st.error("❌ Outside Hours")
-        
-        st.markdown("---")
-        
-        st.subheader("📊 Filters")
-        min_traded_value = st.number_input(
-            "Min Traded Value (Crore)", 
-            min_value=10, 
-            max_value=5000, 
-            value=st.session_state.min_traded_value_cr,
-            step=50
+        hist_data = api.get_time_price_series(
+            exchange=exchange,
+            token=token,
+            starttime=start_time,
+            endtime=end_time,
+            interval='1'  # 1-minute interval
         )
-        st.session_state.min_traded_value_cr = min_traded_value
         
-        st.markdown("---")
+        if not hist_data:
+            return None
         
-        st.subheader("🤖 Auto Entry")
-        auto_entry = st.checkbox("Enable Auto Entry", value=st.session_state.auto_entry_enabled)
-        st.session_state.auto_entry_enabled = auto_entry
+        data_list = []
+        for item in hist_data:
+            data_list.append({
+                'Date': pd.to_datetime(item['time'], format='%d-%m-%Y %H:%M:%S'),
+                'Open': float(item['into']),
+                'High': float(item['inth']),
+                'Low': float(item['intl']),
+                'Close': float(item['intc']),
+                'Volume': int(item.get('intv', 0))
+            })
         
-        if auto_entry:
-            st.success("✅ Auto-entry enabled")
-            st.warning("⚠️ Orders will be placed automatically for new signals")
-        else:
-            st.info("ℹ️ Manual entry mode")
+        if not data_list:
+            return None
         
-        st.markdown("---")
+        df = pd.DataFrame(data_list)
+        df.set_index('Date', inplace=True)
+        df = df.sort_index()
         
-        st.subheader("🤖 Auto Exit")
-        auto_exit = st.checkbox("Enable Auto Exit", value=st.session_state.auto_exit_enabled)
-        st.session_state.auto_exit_enabled = auto_exit
+        return df
         
-        if auto_exit:
-            st.success("✅ Auto-exit monitoring enabled")
-        else:
-            st.warning("⚠️ Auto-exit disabled")
-        
-        st.markdown("---")
-        max_signals = st.slider("Max Signals", 10, 100, 30)
-        total_risk = st.number_input("Risk/Trade (₹)", 10, 10000, 100, 10)
-        
-        st.markdown("---")
-        auto_refresh = st.checkbox("Auto Refresh (30s)")
-        scan = st.button("🔍 Fetch Live", use_container_width=True, type="primary")
-    
-    if st.session_state.auto_exit_enabled:
-        monitor_and_exit_positions(api, reports)
-    
-    df_all = st.session_state.last_data
+    except Exception as e:
+        logging.error(f"Error loading data for {symbol}: {e}")
+        return None
 
-    if scan or auto_refresh:
-        with st.spinner("Fetching from NSE..."):
-            fetcher = NSEDataFetcher()
-            data = fetcher.fetch_all_securities()
-            if data is None:
-                st.error("❌ Failed to fetch from NSE.")
-                new_df_all = pd.DataFrame()
-            else:
-                new_df_all = fetcher.parse_nse_data(data)
+def get_live_price(api, symbol, exchange="NSE"):
+    """Get current live price"""
+    try:
+        token = get_token_from_isin(api, symbol, exchange)
+        if not token:
+            return None
         
-        if not new_df_all.empty:
-            st.session_state.last_data = new_df_all
-            df_all = new_df_all
-        else:
-            st.warning("New fetch returned no data.")
+        live_data = api.get_quotes(exchange=exchange, token=token)
+        if live_data and live_data.get('stat') == 'Ok':
+            return float(live_data.get('lp', 0))
+        
+        return None
+    except Exception as e:
+        logging.error(f"Error getting live price for {symbol}: {e}")
+        return None
 
-    if df_all.empty:
-        if not (scan or auto_refresh):
-            st.info("👆 Click 'Fetch Live' to start the analysis.")
+def execute_trade(api, signal_type, quantity, symbol):
+    """Execute trade through Flattrade API"""
+    try:
+        buy_or_sell = 'B' if signal_type == 'BUY' else 'S'
+        
+        result = api.place_order(
+            buy_or_sell=buy_or_sell,
+            product_type='C',
+            exchange='NSE',
+            tradingsymbol=f"{symbol}-EQ",
+            quantity=quantity,
+            discloseqty=0,
+            price_type='MKT',
+            retention='DAY'
+        )
+        
+        return result
+    except Exception as e:
+        logging.error(f"Error executing trade: {e}")
+        return None
+
+def check_and_sync_positions(api, strategy):
+    """
+    Check API for existing positions and sync with strategy
+    Returns: (has_position, position_details)
+    """
+    try:
+        positions = api.get_positions()
+        if positions and len(positions) > 0:
+            # Filter for open positions (netqty != 0)
+            for pos in positions:
+                netqty = int(pos.get('netqty', 0))
+                if netqty != 0:
+                    # Found an open position
+                    symbol = pos.get('tsym', '').replace('-EQ', '')
+                    avg_price = float(pos.get('netavgprc', 0))
+                    
+                    # Determine position type
+                    position_type = 'long' if netqty > 0 else 'short'
+                    
+                    # Sync with strategy if not already tracked
+                    if strategy.position_symbol != symbol:
+                        st.warning(f"⚠️ Detected existing {position_type.upper()} position in {symbol}")
+                        
+                        # Load data to get day high/low
+                        df = load_market_data(api, symbol)
+                        if df is not None and len(df) > 0:
+                            today_data = df[df.index.date == datetime.now().date()]
+                            if len(today_data) > 0:
+                                day_high = today_data['High'].max()
+                                day_low = today_data['Low'].min()
+                                
+                                # Set position in strategy
+                                strategy.position_symbol = symbol
+                                strategy.current_position = position_type
+                                strategy.entry_price = avg_price
+                                strategy.position_size = abs(netqty)
+                                strategy.day_high = day_high
+                                strategy.day_low = day_low
+                                
+                                # Set stop loss and target
+                                if position_type == 'long':
+                                    stop_loss_pct = avg_price * (1 - strategy.stop_loss_pct)
+                                    strategy.stop_loss = max(stop_loss_pct, day_low)
+                                    strategy.target = avg_price * (1 + strategy.target_pct)
+                                else:
+                                    stop_loss_pct = avg_price * (1 + strategy.stop_loss_pct)
+                                    strategy.stop_loss = min(stop_loss_pct, day_high)
+                                    strategy.target = avg_price * (1 - strategy.target_pct)
+                                
+                                st.success(f"✅ Position synced: {symbol} - {position_type.upper()} - Qty: {abs(netqty)}")
+                    
+                    return True, {
+                        'symbol': symbol,
+                        'type': position_type,
+                        'qty': abs(netqty),
+                        'avg_price': avg_price
+                    }
+        
+        return False, None
+    except Exception as e:
+        logging.error(f"Error checking positions: {e}")
+        return False, None
+    """Save trade data to Supabase"""
+    try:
+        result = supabase.table('trades').insert(trade_data).execute()
+        return result
+    except Exception as e:
+        st.error(f"Error saving trade to database: {e}")
+        return None
+
+def create_chart(df, entry_point=None, stop_loss=None, target=None, trailing_stop=None, signals_df=None):
+    """Create candlestick chart with levels and signals"""
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.1,
+                        subplot_titles=('Price & Trading Levels', 'Volume'),
+                        row_heights=[0.8, 0.2])
+    
+    # Candlestick
+    fig.add_trace(go.Candlestick(x=df.index,
+                                open=df['Open'],
+                                high=df['High'],
+                                low=df['Low'],
+                                close=df['Close'],
+                                name='Price'), row=1, col=1)
+    
+    # Volume bars
+    colors = ['red' if df['Close'].iloc[i] < df['Open'].iloc[i] else 'green' 
+              for i in range(len(df))]
+    fig.add_trace(go.Bar(x=df.index, y=df['Volume'],
+                        name='Volume',
+                        marker_color=colors), row=2, col=1)
+    
+    # Add entry/exit levels if position exists
+    if entry_point:
+        fig.add_hline(y=entry_point, line_dash="dash", line_color="blue",
+                     annotation_text="Entry", row=1, col=1)
+    if stop_loss:
+        fig.add_hline(y=stop_loss, line_dash="dash", line_color="red",
+                     annotation_text="Stop Loss", row=1, col=1)
+    if target:
+        fig.add_hline(y=target, line_dash="dash", line_color="green",
+                     annotation_text="Target", row=1, col=1)
+    if trailing_stop:
+        fig.add_hline(y=trailing_stop, line_dash="dot", line_color="orange",
+                     annotation_text="Trailing Stop", row=1, col=1)
+    
+    # Add buy/sell signals if provided
+    if signals_df is not None and len(signals_df) > 0:
+        buy_signals = signals_df[signals_df['Signal'] == 'BUY']
+        sell_signals = signals_df[signals_df['Signal'] == 'SELL']
+        
+        if len(buy_signals) > 0:
+            fig.add_trace(go.Scatter(x=buy_signals['Time'], y=buy_signals['Price'],
+                                   mode='markers', name='Buy Signal',
+                                   marker=dict(color='green', size=10, symbol='triangle-up')),
+                         row=1, col=1)
+        
+        if len(sell_signals) > 0:
+            fig.add_trace(go.Scatter(x=sell_signals['Time'], y=sell_signals['Price'],
+                                   mode='markers', name='Sell Signal',
+                                   marker=dict(color='red', size=10, symbol='triangle-down')),
+                         row=1, col=1)
+    
+    fig.update_layout(title='FnO Breakout Trading Strategy - Live Data',
+                     xaxis_rangeslider_visible=False,
+                     height=800)
+    
+    return fig
+
+def main():
+    st.set_page_config(page_title="FnO Breakout Trading App", layout="wide")
+    
+    st.title("FnO Breakout Trading Strategy App - Live Data")
+    
+    # Initialize connections
+    try:
+        supabase = init_supabase()
+        api = init_flattrade_api()
+        
+        # Initialize strategy in session state
+        if 'strategy' not in st.session_state:
+            st.session_state.strategy = FnOBreakoutStrategy()
+        
+        strategy = st.session_state.strategy
+        
+        # Test API connection
+        try:
+            api_status = api.get_limits()
+            if api_status and api_status.get('stat') != 'Ok':
+                st.error("Failed to connect to Flattrade API. Please check credentials.")
+                return
+        except Exception as e:
+            st.error(f"API connection failed: {e}")
+            return
+            
+    except Exception as e:
+        st.error(f"Error initializing APIs: {e}")
         return
-
-    strategy = EnhancedTradingStrategy()
-    signals, gainers, losers = strategy.generate_signals(df_all, api, st.session_state.min_traded_value_cr)
     
-    buy_signals = [s for s in signals if s['type'] == 'BUY'][:max_signals]
-    sell_signals = [s for s in signals if s['type'] == 'SELL'][:max_signals]
-
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
-    
-    col1.metric("Total Stocks", len(df_all))
-    col2.metric("Value Filtered", len(strategy.filter_by_traded_value(df_all, st.session_state.min_traded_value_cr)))
-    col3.metric("Gainers", len(gainers))
-    col4.metric("Losers", len(losers))
-    col5.metric("Buy Signals", len(buy_signals))
-    col6.metric("Sell Signals", len(sell_signals))
+    # Sidebar for controls
+    with st.sidebar:
+        st.header("Trading Controls")
         
-    st.markdown("---")
-
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "🟢 Buy", 
-        "🔴 Sell", 
-        "📊 Overview", 
-        "📜 Order Book", 
-        "📈 Trade Book", 
-        "💼 Positions",
-        "🗄️ Trade Database"
-    ])
-    
-    with tab1:
-        display_signals_table(buy_signals, "🟢 Long (Day High Breakout)", api, reports, total_risk, st.session_state.auto_entry_enabled)
-    
-    with tab2:
-        display_signals_table(sell_signals, "🔴 Short (Day Low Breakdown)", api, reports, total_risk, st.session_state.auto_entry_enabled)
-    
-    with tab3:
-        st.subheader("📊 Market Overview (NSE Data)")
+        # Trading parameters
+        st.subheader("Strategy Parameters")
+        stop_loss_pct = st.slider("Stop Loss (%)", 0.5, 2.0, 1.0, 0.1)
+        target_pct = st.slider("Target (%)", 1.0, 5.0, 3.0, 0.5)
+        trailing_stop_pct = st.slider("Trailing Stop (%)", 0.5, 2.0, 1.0, 0.1)
+        
+        strategy.stop_loss_pct = stop_loss_pct / 100
+        strategy.target_pct = target_pct / 100
+        strategy.trailing_stop_pct = trailing_stop_pct / 100
+        
+        # Position sizing
+        st.subheader("Position Sizing")
+        sizing_mode = st.radio("Quantity Mode", ["Fixed Quantity", "Fixed Amount"])
+        
+        if sizing_mode == "Fixed Quantity":
+            quantity = st.number_input("Quantity", min_value=1, value=1)
+            trade_amount = None
+        else:
+            trade_amount = st.number_input("Trade Amount (₹)", min_value=1000, value=10000, step=1000)
+            quantity = None
+        
+        # Scanning options
+        st.subheader("📊 Scanning Options")
+        
+        # Number of stocks to scan
+        num_stocks_to_scan = st.number_input("Number of Stocks to Scan", min_value=5, max_value=100, value=20, step=5)
+        
+        # Continuous scanning toggle
+        continuous_scan = st.toggle("Continuous Scanning", False)
+        
+        if continuous_scan:
+            scan_interval = st.slider("Scan Interval (seconds)", 30, 300, 60, 30)
+        
+        # Manual scan button
+        if st.button("🔍 Run Screening Now", type="primary"):
+            st.session_state.run_screening = True
+        
+        # Auto-trading toggle
+        auto_trading = st.toggle("Enable Auto Trading", False)
+        
+        # Manual trade buttons section
+        st.subheader("Manual Trading")
+        
+        # Show dropdown only if stocks are screened
+        if len(strategy.screened_stocks) > 0:
+            manual_trade_symbol = st.selectbox("Select Stock", strategy.screened_stocks, key="manual_trade_stock")
+        else:
+            manual_trade_symbol = None
+            st.info("Run screening first")
+        
         col1, col2 = st.columns(2)
         
         with col1:
-            st.markdown("### 🟢 Top Gainers")
-            if not gainers.empty:
-                display_df = gainers[['symbol', 'ltp', 'pChange', 'tradedValue']].head(20).copy()
-                display_df['ltp'] = display_df['ltp'].apply(lambda x: f"₹{x:.2f}")
-                display_df['pChange'] = display_df['pChange'].apply(lambda x: f"{x:.2f}%")
-                display_df['tradedValue'] = display_df['tradedValue'].apply(lambda x: f"₹{x/1e7:.2f} Cr")
-                display_df.columns = ['Symbol', 'LTP', 'Change %', 'Value']
-                st.dataframe(display_df, use_container_width=True, hide_index=True)
-            else:
-                st.info("No gainers to show.")
+            if st.button("🔴 Manual Sell", type="secondary", disabled=(strategy.current_position is not None or manual_trade_symbol is None)):
+                if auto_trading and manual_trade_symbol:
+                    # Calculate quantity if using amount mode
+                    if sizing_mode == "Fixed Amount":
+                        live_price = get_live_price(api, manual_trade_symbol)
+                        if live_price:
+                            calc_quantity = int(trade_amount / live_price)
+                        else:
+                            st.error("Could not get live price")
+                            calc_quantity = None
+                    else:
+                        calc_quantity = quantity
+                    
+                    if calc_quantity:
+                        result = execute_trade(api, 'SELL', calc_quantity, manual_trade_symbol)
+                        if result and result.get('stat') == 'Ok':
+                            live_price = get_live_price(api, manual_trade_symbol)
+                            df = load_market_data(api, manual_trade_symbol)
+                            if df is not None and len(df) > 0:
+                                today_data = df[df.index.date == datetime.now().date()]
+                                day_high = today_data['High'].max()
+                                day_low = today_data['Low'].min()
+                                current_price = live_price if live_price else df['Close'].iloc[-1]
+                                strategy.enter_position('SELL', current_price, day_high, day_low, calc_quantity, manual_trade_symbol)
+                            st.success(f"Sell order placed: {result.get('norenordno')}")
+                        else:
+                            st.error("Failed to place sell order")
+                else:
+                    st.warning("Enable auto-trading first")
         
         with col2:
-            st.markdown("### 🔴 Top Losers")
-            if not losers.empty:
-                display_df = losers[['symbol', 'ltp', 'pChange', 'tradedValue']].head(20).copy()
-                display_df['ltp'] = display_df['ltp'].apply(lambda x: f"₹{x:.2f}")
-                display_df['pChange'] = display_df['pChange'].apply(lambda x: f"{x:.2f}%")
-                display_df['tradedValue'] = display_df['tradedValue'].apply(lambda x: f"₹{x/1e7:.2f} Cr")
-                display_df.columns = ['Symbol', 'LTP', 'Change %', 'Value']
-                st.dataframe(display_df, use_container_width=True, hide_index=True)
-            else:
-                st.info("No losers to show.")
-
-    with tab4:
-        st.header("📜 Order Book")
-        st.caption("All orders placed today")
-        if st.button("Refresh Order Book", key="refresh_orders"):
-            st.rerun()
-            
-        success, data = reports.orders()
-        if success:
-            if data:
-                df = pd.DataFrame(data)
-                
-                def style_status(s):
-                    if s == 'COMPLETE':
-                        return 'background-color: #28a745; color: white;'
-                    elif s == 'OPEN':
-                        return 'background-color: #ffc107; color: black;'
-                    elif s == 'REJECTED':
-                        return 'background-color: #dc3545; color: white;'
-                    elif s == 'CANCELLED':
-                        return 'background-color: #6c757d; color: white;'
-                    return ''
-                
-                if 'order_status' in df.columns:
-                    st.dataframe(
-                        df.style.applymap(style_status, subset=['order_status']),
-                        use_container_width=True, 
-                        hide_index=True
-                    )
-                else:
-                    st.dataframe(df, use_container_width=True, hide_index=True)
-            else:
-                st.info("Order book is empty.")
-        else:
-            st.error(f"Failed to load order book: {data}")
-
-    with tab5:
-        st.header("📈 Trade Book")
-        st.caption("All executed trades for today")
-        if st.button("Refresh Trade Book", key="refresh_trades"):
-            st.rerun()
-
-        success, data = reports.trades()
-        if success:
-            if data:
-                df = pd.DataFrame(data)
-                
-                def style_side(s):
-                    return 'color: green' if s == 'BUY' else 'color: red'
-                
-                if 'order_type' in df.columns:
-                    st.dataframe(
-                        df.style.applymap(style_side, subset=['order_type']),
-                        use_container_width=True, 
-                        hide_index=True
-                    )
-                else:
-                    st.dataframe(df, use_container_width=True, hide_index=True)
-            else:
-                st.info("Trade book is empty.")
-        else:
-            st.error(f"Failed to load trade book: {data}")
-
-    with tab6:
-        st.header("💼 Positions")
-        st.caption("Your current open positions")
-        if st.button("Refresh Positions", key="refresh_positions"):
-            st.rerun()
-
-        success, data = reports.positions()
-        if success:
-            if data:
-                df = pd.DataFrame(data)
-                
-                try:
-                    mtm_col = None
-                    for col in ['mtm', 'unrealized_pnl', 'pnl']:
-                        if col in df.columns:
-                            mtm_col = col
-                            break
-                    
-                    if mtm_col:
-                        df[mtm_col] = pd.to_numeric(df[mtm_col], errors='coerce').fillna(0)
-                        total_mtm = df[mtm_col].sum()
-                        
-                        st.metric("Total MTM", f"₹{total_mtm:,.2f}")
-                        
-                        def style_mtm(v):
-                            try:
-                                val = float(v)
-                                color = 'green' if val > 0 else 'red' if val < 0 else 'black'
-                                return f'color: {color}'
-                            except:
-                                return ''
-                        
-                        st.dataframe(
-                            df.style.applymap(style_mtm, subset=[mtm_col]),
-                            use_container_width=True, 
-                            hide_index=True
-                        )
+            if st.button("🟢 Manual Buy", type="primary", disabled=(strategy.current_position is not None or manual_trade_symbol is None)):
+                if auto_trading and manual_trade_symbol:
+                    # Calculate quantity if using amount mode
+                    if sizing_mode == "Fixed Amount":
+                        live_price = get_live_price(api, manual_trade_symbol)
+                        if live_price:
+                            calc_quantity = int(trade_amount / live_price)
+                        else:
+                            st.error("Could not get live price")
+                            calc_quantity = None
                     else:
-                        st.dataframe(df, use_container_width=True, hide_index=True)
-                except Exception as e:
-                    st.error(f"Error processing position data: {e}")
-                    st.dataframe(df, use_container_width=True, hide_index=True)
-            else:
-                st.info("No open positions.")
-        else:
-            st.error(f"Failed to load positions: {data}")
-    
-    with tab7:
-        st.header("🗄️ Trade Database (Supabase)")
-        st.caption("All trades with entry/exit tracking from cloud DB")
-        
-        st.markdown("### DB Management")
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            if st.button("🔄 Refresh DB", key="refresh_db", use_container_width=True):
-                st.rerun()
-        
-        with col2:
-            if st.button(f"⬇️ Download to CSV", key="download_db", use_container_width=True):
-                with st.spinner("Fetching data..."):
-                    all_trades_df = get_all_trades()
-                    if not all_trades_df.empty:
-                        all_trades_df.to_csv(LOCAL_CSV_FILE, index=False)
-                        st.success(f"Data saved to {LOCAL_CSV_FILE}")
-                    else:
-                        st.warning("No data in Supabase to download.")
-
-        with col3:
-            if st.button(f"⬆️ Upload CSV to DB", key="upload_db", use_container_width=True):
-                if not os.path.exists(LOCAL_CSV_FILE):
-                    st.error(f"{LOCAL_CSV_FILE} not found. Download first or create one.")
+                        calc_quantity = quantity
+                    
+                    if calc_quantity:
+                        result = execute_trade(api, 'BUY', calc_quantity, manual_trade_symbol)
+                        if result and result.get('stat') == 'Ok':
+                            live_price = get_live_price(api, manual_trade_symbol)
+                            df = load_market_data(api, manual_trade_symbol)
+                            if df is not None and len(df) > 0:
+                                today_data = df[df.index.date == datetime.now().date()]
+                                day_high = today_data['High'].max()
+                                day_low = today_data['Low'].min()
+                                current_price = live_price if live_price else df['Close'].iloc[-1]
+                                strategy.enter_position('BUY', current_price, day_high, day_low, calc_quantity, manual_trade_symbol)
+                            st.success(f"Buy order placed: {result.get('norenordno')}")
+                        else:
+                            st.error("Failed to place buy order")
                 else:
-                    with st.spinner(f"Uploading {LOCAL_CSV_FILE}..."):
-                        try:
-                            df = pd.read_csv(LOCAL_CSV_FILE)
-                            
-                            # Clean data for Supabase
-                            df['entry_time'] = pd.to_datetime(df['entry_time']).apply(lambda x: x.isoformat() if pd.notnull(x) else None)
-                            df['exit_time'] = pd.to_datetime(df['exit_time']).apply(lambda x: x.isoformat() if pd.notnull(x) else None)
-                            
-                            # Convert Pandas NaT/NaN to None
-                            df = df.where(pd.notnull(df), None)
-                            
-                            records = df.to_dict('records')
-                            
-                            if records:
-                                # Upsert records based on primary key
-                                response = supabase.table('trades').upsert(
-                                    records, 
-                                    on_conflict='entry_order_id'
-                                ).execute()
-                                
-                                st.success(f"Successfully uploaded/updated {len(response.data)} records.")
-                            else:
-                                st.warning("CSV is empty.")
-                        except Exception as e:
-                            st.error(f"Upload failed: {e}")
-
-        with col4:
-            st.warning("Reset DB (Careful!)")
-            confirm_reset = st.checkbox("Confirm Delete All", key="confirm_reset")
-            
-            if st.button("🔥 RESET DB", key="reset_db", use_container_width=True, disabled=not confirm_reset):
-                with st.spinner("Deleting all records..."):
-                    try:
-                        # Delete all rows. `gt('quantity', -999999)` is a trick to delete all rows.
-                        response = supabase.table("trades").delete().gt("quantity", -9999999).execute()
-                        st.success(f"Successfully deleted {len(response.data)} records.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Failed to reset DB: {e}")
+                    st.warning("Enable auto-trading first")
         
-        st.markdown("---")
-        
-        st.markdown("### Trade History")
-        all_trades = get_all_trades()
-        
-        if not all_trades.empty:
-            col1, col2, col3, col4 = st.columns(4)
-            
-            open_trades = all_trades[all_trades['status'] == 'OPEN']
-            closed_trades = all_trades[all_trades['status'] == 'CLOSED']
-            
-            col1.metric("Total Trades", len(all_trades))
-            col2.metric("Open Trades", len(open_trades))
-            col3.metric("Closed Trades", len(closed_trades))
-            
-            if not closed_trades.empty:
-                try:
-                    total_pnl = closed_trades['pnl'].astype(float).sum()
-                    col4.metric("Total P&L", f"₹{total_pnl:,.2f}")
-                except:
-                    col4.metric("Total P&L", "N/A")
-            else:
-                col4.metric("Total P&L", "₹0.00")
-            
-            st.markdown("---")
-            
-            filter_option = st.selectbox("Filter", ["All", "Open", "Closed"])
-            
-            if filter_option == "Open":
-                display_trades = open_trades
-            elif filter_option == "Closed":
-                display_trades = closed_trades
-            else:
-                display_trades = all_trades
-            
-            if not display_trades.empty:
-                def style_pnl(v):
-                    try:
-                        if pd.isna(v):
-                            return ''
-                        val = float(v)
-                        color = 'green' if val > 0 else 'red' if val < 0 else 'black'
-                        return f'color: {color}; font-weight: bold'
-                    except:
-                        return ''
-                
-                def style_status(s):
-                    if s == 'OPEN':
-                        return 'background-color: #ffc107; color: black; font-weight: bold'
-                    elif s == 'CLOSED':
-                        return 'background-color: #28a745; color: white; font-weight: bold'
-                    return ''
-                
-                styled_df = display_trades.style.applymap(style_status, subset=['status'])
-                
-                if 'pnl' in display_trades.columns:
-                    styled_df = styled_df.applymap(style_pnl, subset=['pnl'])
-                
-                st.dataframe(
-                    styled_df,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "entry_price": st.column_config.NumberColumn(format="₹%.2f"),
-                        "target_price": st.column_config.NumberColumn(format="₹%.2f"),
-                        "stop_loss": st.column_config.NumberColumn(format="₹%.2f"),
-                        "exit_price": st.column_config.NumberColumn(format="₹%.2f"),
-                        "pnl": st.column_config.NumberColumn(format="₹%.2f"),
-                        "entry_time": st.column_config.DatetimeColumn(format="DD-MM-YYYY HH:mm:ss"),
-                        "exit_time": st.column_config.DatetimeColumn(format="DD-MM-YYYY HH:mm:ss"),
-                    }
-                )
-                
-                if filter_option == "Open" and not open_trades.empty:
-                    st.markdown("---")
-                    st.subheader("🔥 Manual Exit")
-                    
-                    trade_to_exit = st.selectbox(
-                        "Select trade to exit",
-                        open_trades['entry_order_id'].tolist(),
-                        format_func=lambda x: f"{x} - {open_trades[open_trades['entry_order_id']==x]['symbol'].values[0]}"
-                    )
-                    
-                    if st.button("Exit Selected Trade", type="primary"):
-                        trade_row = open_trades[open_trades['entry_order_id'] == trade_to_exit].iloc[0]
-                        
-                        exit_side = 'SELL' if trade_row['side'] == 'BUY' else 'BUY'
-                        
-                        data, msg = api.place_order(
-                            symbol=trade_row['symbol'],
-                            side=exit_side,
-                            quantity=int(trade_row['quantity']),
-                            exchange="NSE"
-                        )
-                        
-                        if data and data.get('status') == 'SUCCESS':
-                            success, positions = reports.positions()
-                            exit_price = trade_row['entry_price']
-                            
-                            if success and positions:
-                                for pos in positions:
-                                    if pos.get('tradingsymbol') == trade_row['symbol']:
-                                        exit_price = float(pos.get('ltp', exit_price))
-                                        break
-                            
-                            pnl = (exit_price - trade_row['entry_price']) * trade_row['quantity'] if trade_row['side'] == 'BUY' else (trade_row['entry_price'] - exit_price) * trade_row['quantity']
-                            
-                            update_trade_exit(
-                                entry_order_id=trade_to_exit,
-                                exit_order_id=data.get('order_id'),
-                                exit_price=exit_price,
-                                exit_time=datetime.now(IST).isoformat(),
-                                pnl=pnl
-                            )
-                            
-                            st.success(f"✅ {msg} | P&L: ₹{pnl:.2f}")
+        # Close position button
+        if strategy.current_position:
+            if st.button("❌ Close Position", type="secondary"):
+                if auto_trading:
+                    exit_signal = 'SELL' if strategy.current_position == 'long' else 'BUY'
+                    # Use the tracked position symbol
+                    close_symbol = strategy.position_symbol
+                    if close_symbol:
+                        result = execute_trade(api, exit_signal, strategy.position_size, close_symbol)
+                        if result and result.get('stat') == 'Ok':
+                            strategy.exit_position()
+                            st.success("✅ Position closed!")
                             st.rerun()
                         else:
-                            st.error(msg)
-            else:
-                st.info(f"No {filter_option.lower()} trades found.")
-        else:
-            st.info("🔭 No trades in database yet. Place your first trade to start tracking!")
-            st.markdown("""
-            **How it works:**
-            1. Go to Buy/Sell tabs
-            2. Enable Auto Entry or click "Place Entry Order"
-            3. Trade is saved to database only when executed
-            4. Enable "Auto Exit" in sidebar to automatically exit at target/SL
-            5. View all trades history here
-            """)
+                            st.error("Failed to close position")
+                else:
+                    st.warning("Enable auto-trading first")
     
-    if auto_refresh:
-        time.sleep(30)
+    # Main content area
+    current_date = datetime.now().date()
+    current_time = datetime.now().time()
+    strategy.reset_daily_data(current_date)
+    
+    # Check for existing positions from API and sync
+    has_existing_position, position_details = check_and_sync_positions(api, strategy)
+    
+    if has_existing_position:
+        st.info(f"📍 Active Position Detected: {position_details['symbol']} - {position_details['type'].upper()} - Qty: {position_details['qty']}")
+    
+    # Check trading hours
+    if current_time < time(9, 15) or current_time > time(15, 30):
+        st.warning("⏰ Outside Trading Hours (9:15 AM - 3:30 PM)")
+    
+    # Screening Section - Only run if no open position
+    if 'run_screening' in st.session_state and st.session_state.run_screening:
+        if strategy.current_position:
+            st.warning("⚠️ Screening disabled - Close existing position first")
+            st.session_state.run_screening = False
+        else:
+            st.header("📋 Stage A: Stock Screening Results")
+        
+        with st.spinner("Screening FnO stocks..."):
+            stocks_to_screen = get_fno_stocks_list()[:num_stocks_to_scan]
+            
+            screening_results = []
+            
+            progress_bar = st.progress(0)
+            for idx, stock in enumerate(stocks_to_screen):
+                df = load_market_data(api, stock)
+                
+                if df is not None and len(df) >= 300:
+                    passed, reason, metrics = strategy.screen_stock(df)
+                    
+                    result_data = {
+                        'Symbol': stock,
+                        'Status': '✅ Passed' if passed else '❌ Failed',
+                        'Reason': reason,
+                        'Current Price': f"₹{df['Close'].iloc[-1]:.2f}" if len(df) > 0 else 'N/A'
+                    }
+                    
+                    if metrics:
+                        result_data['Avg Vol (9:15-9:29)'] = f"{metrics['avg_vol_opening']:.0f}"
+                        result_data['Trade Value (Cr)'] = f"₹{metrics['trade_value']:.2f}"
+                    
+                    screening_results.append(result_data)
+                    
+                    if passed:
+                        strategy.screened_stocks.append(stock)
+                
+                progress_bar.progress((idx + 1) / len(stocks_to_screen))
+            
+            # Display results
+            if screening_results:
+                results_df = pd.DataFrame(screening_results)
+                st.dataframe(results_df, use_container_width=True)
+            
+            if len(strategy.screened_stocks) > 0:
+                st.success(f"✅ {len(strategy.screened_stocks)} stocks passed screening: {', '.join(strategy.screened_stocks)}")
+            else:
+                st.info("No stocks passed the screening criteria")
+        
+            st.session_state.run_screening = False
+    
+    # Continuous scanning - Only if no open position
+    if continuous_scan and len(strategy.screened_stocks) == 0 and not strategy.current_position:
+        st.info(f"🔄 Continuous scanning active - Running every {scan_interval} seconds")
+        time_module.sleep(scan_interval)
+        st.session_state.run_screening = True
         st.rerun()
     
+    # Trading Section
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.subheader("📈 Live Market Data & Signals")
+        
+        # If position exists, monitor that stock
+        if strategy.current_position and strategy.position_symbol:
+            st.info(f"🔒 Monitoring active position: {strategy.position_symbol}")
+            selected_stock = strategy.position_symbol
+            
+            # Also show screened stocks in sidebar info
+            if len(strategy.screened_stocks) > 0:
+                st.success(f"✅ {len(strategy.screened_stocks)} other stocks screened and ready: {', '.join(strategy.screened_stocks)}")
+        # Otherwise, select from screened stocks
+        elif len(strategy.screened_stocks) > 0:
+            selected_stock = st.selectbox("Select Screened Stock to Monitor", strategy.screened_stocks, key="monitor_stock")
+            st.session_state.selected_stock = selected_stock
+        else:
+            st.info("👆 Run screening to find trading opportunities")
+            selected_stock = None
+        
+        if selected_stock:
+            # Load and display market data
+            with st.spinner(f"Loading live market data for {selected_stock}..."):
+                df = load_market_data(api, selected_stock)
+            
+            if df is not None and len(df) > 0:
+                # Calculate day high/low
+                today_data = df[df.index.date == current_date]
+                
+                if len(today_data) > 0:
+                    day_high = today_data['High'].max()
+                    day_low = today_data['Low'].min()
+                    
+                    # Get opening period metrics
+                    avg_vol_opening, trade_value, big_body, opening_candle = strategy.calculate_opening_candle_metrics(df)
+                    
+                    if avg_vol_opening:
+                        strategy.avg_vol_opening = avg_vol_opening
+                    
+                    # Get current candle
+                    current_candle = {
+                        'Open': df['Open'].iloc[-1],
+                        'High': df['High'].iloc[-1],
+                        'Low': df['Low'].iloc[-1],
+                        'Close': df['Close'].iloc[-1],
+                        'Volume': df['Volume'].iloc[-1]
+                    }
+                    
+                    # Get live price
+                    live_price = get_live_price(api, selected_stock)
+                    current_price = live_price if live_price else current_candle['Close']
+                    
+                    # Display current signals
+                    signal_col1, signal_col2, signal_col3, signal_col4 = st.columns(4)
+                    
+                    with signal_col1:
+                        st.metric("Live Price", f"₹{current_price:.2f}")
+                    with signal_col2:
+                        st.metric("Day High", f"₹{day_high:.2f}")
+                    with signal_col3:
+                        st.metric("Day Low", f"₹{day_low:.2f}")
+                    with signal_col4:
+                        st.metric("Volume", f"{current_candle['Volume']:,}")
+                    
+                    # Check for entry signals if no position
+                    if not strategy.current_position and strategy.avg_vol_opening and time(9, 30) <= current_time <= time(15, 20):
+                        signal = strategy.check_breakout_entry(
+                            current_candle, day_high, day_low, strategy.avg_vol_opening
+                        )
+                        
+                        if signal:
+                            if signal == 'BUY':
+                                st.success("🟢 BUY SIGNAL ACTIVE - Breakout above day high!")
+                            else:
+                                st.error("🔴 SELL SIGNAL ACTIVE - Breakdown below day low!")
+                            
+                            if auto_trading:
+                                # Calculate quantity based on mode
+                                if sizing_mode == "Fixed Amount":
+                                    calc_quantity = int(trade_amount / current_price)
+                                else:
+                                    calc_quantity = quantity
+                                
+                                result = execute_trade(api, signal, calc_quantity, selected_stock)
+                                if result and result.get('stat') == 'Ok':
+                                    strategy.enter_position(signal, current_price, day_high, day_low, calc_quantity, selected_stock)
+                                    st.success(f"✅ Auto {signal} Order Executed! Qty: {calc_quantity}")
+                                    st.rerun()
+                        else:
+                            st.info("⚪ No Entry Signal - Waiting for breakout")
+                    elif strategy.current_position:
+                        st.info(f"🔒 Position already open in {strategy.position_symbol} - Monitoring for exit")
+                    
+                    # Check for exit signals if position exists
+                    if strategy.current_position:
+                        should_exit, reason = strategy.check_exit_conditions(
+                            current_price, day_high, day_low
+                        )
+                        
+                        if should_exit:
+                            st.warning(f"⚠️ Exit Signal: {reason}")
+                            
+                            if auto_trading:
+                                exit_signal = 'SELL' if strategy.current_position == 'long' else 'BUY'
+                                result = execute_trade(api, exit_signal, strategy.position_size, selected_stock)
+                                if result and result.get('stat') == 'Ok':
+                                    strategy.exit_position()
+                                    st.success(f"✅ Position Closed: {reason}")
+                                    st.rerun()
+                    
+                    # Create and display chart
+                    chart = create_chart(
+                        df.tail(100),
+                        strategy.entry_price,
+                        strategy.stop_loss,
+                        strategy.target,
+                        strategy.trailing_stop
+                    )
+                    st.plotly_chart(chart, use_container_width=True)
+                    
+                    # Display latest data
+                    st.subheader("📊 Latest OHLC Data")
+                    st.dataframe(df.tail(10), use_container_width=True)
+                
+                else:
+                    st.warning("No data available for today")
+            
+            else:
+                st.error(f"Failed to load market data for {selected_stock}")
+    
+    with col2:
+        st.subheader("📊 Position & Status")
+        
+        # Current position status
+        if strategy.current_position:
+            position_type = strategy.current_position.upper()
+            st.info(f"**Position:** {position_type}")
+            st.info(f"**Symbol:** {strategy.position_symbol}")
+            st.info(f"**Size:** {strategy.position_size}")
+            st.info(f"**Entry:** ₹{strategy.entry_price:.2f}")
+            
+            # Display stop loss and target
+            if strategy.stop_loss:
+                st.info(f"**Stop Loss:** ₹{strategy.stop_loss:.2f}")
+            if strategy.target:
+                st.info(f"**Target:** ₹{strategy.target:.2f}")
+            if strategy.trailing_stop:
+                st.info(f"**Trailing Stop:** ₹{strategy.trailing_stop:.2f}")
+            
+            # Calculate current P&L for the position symbol
+            if strategy.position_symbol:
+                live_price = get_live_price(api, strategy.position_symbol)
+                position_df = load_market_data(api, strategy.position_symbol)
+                
+                if position_df is not None and len(position_df) > 0:
+                    current_price = live_price if live_price else position_df['Close'].iloc[-1]
+                    
+                    if strategy.current_position == 'long':
+                        pnl = (current_price - strategy.entry_price) * strategy.position_size
+                        pnl_pct = ((current_price - strategy.entry_price) / strategy.entry_price) * 100
+                    else:
+                        pnl = (strategy.entry_price - current_price) * strategy.position_size
+                        pnl_pct = ((strategy.entry_price - current_price) / strategy.entry_price) * 100
+                    
+                    if pnl >= 0:
+                        st.success(f"**Current P&L:** +₹{pnl:.2f} ({pnl_pct:.2f}%)")
+                    else:
+                        st.error(f"**Current P&L:** ₹{pnl:.2f} ({pnl_pct:.2f}%)")
+        else:
+            st.info("No Open Position")
+        
+        # Account status
+        st.subheader("💰 Account Status")
+        try:
+            account_details = api.get_limits()
+            if account_details and account_details.get('stat') == 'Ok':
+                cash = account_details.get('cash', 'N/A')
+                margin_used = account_details.get('marginused', 'N/A')
+                
+                st.info(f"**Cash Available:** ₹{cash}")
+                st.info(f"**Margin Used:** ₹{margin_used}")
+            else:
+                st.warning("Could not fetch account details")
+        except Exception as e:
+            st.warning(f"Could not fetch account details")
+        
+        # Open Positions from API
+        st.subheader("📍 Open Positions")
+        try:
+            positions = api.get_positions()
+            if positions and len(positions) > 0:
+                positions_df = pd.DataFrame(positions)
+                display_cols = ['tsym', 'netqty', 'netavgprc', 'lp', 'rpnl', 'upnl']
+                available_cols = [col for col in display_cols if col in positions_df.columns]
+                
+                if available_cols:
+                    st.dataframe(positions_df[available_cols], use_container_width=True)
+                else:
+                    st.dataframe(positions_df, use_container_width=True)
+            else:
+                st.info("No open positions from API")
+        except Exception as e:
+            st.info("No open positions")
+        
+        # Recent orders - Order Book
+        st.subheader("📋 Order Book")
+        try:
+            orders = api.get_order_book()
+            if orders and len(orders) > 0:
+                orders_df = pd.DataFrame(orders)
+                display_cols = ['tsym', 'trantype', 'qty', 'prc', 'avgprc', 'status', 'rejreason']
+                available_cols = [col for col in display_cols if col in orders_df.columns]
+                
+                if available_cols:
+                    st.dataframe(orders_df[available_cols].head(10), use_container_width=True)
+                else:
+                    st.dataframe(orders_df.head(10), use_container_width=True)
+            else:
+                st.info("No recent orders")
+        except Exception as e:
+            st.info("No recent orders")
+        
+        # Trade Book
+        st.subheader("📒 Trade Book")
+        try:
+            trades = api.get_trade_book()
+            if trades and len(trades) > 0:
+                trades_df = pd.DataFrame(trades)
+                display_cols = ['tsym', 'trantype', 'qty', 'prc', 'flqty']
+                available_cols = [col for col in display_cols if col in trades_df.columns]
+                
+                if available_cols:
+                    st.dataframe(trades_df[available_cols].head(10), use_container_width=True)
+                else:
+                    st.dataframe(trades_df.head(10), use_container_width=True)
+            else:
+                st.info("No trades today")
+        except Exception as e:
+            st.info("No trades today")
+        
+        # Refresh button
+        if st.button("🔄 Refresh Data", type="secondary"):
+            st.rerun()
+    
+    # Footer with strategy info
     st.markdown("---")
-    st.caption(f"Last updated: {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')} | NSE India | Definedge Securities")
-    st.caption("⚠️ Educational purposes only. Not financial advice.")
-
-# ==================== MAIN ====================
-def main():
-    if not st.session_state.get('authenticated', False):
-        show_authentication_page()
-    else:
-        show_trading_dashboard()
+    with st.expander("ℹ️ Strategy Information & Rules"):
+        st.markdown(f"""
+        ### 📋 Stage A - Stock Screening Criteria
+        1. **Volume Check:** Average volume (9:15-9:29) must be > 5x average of last 300 candles
+        2. **Trade Value:** Total trade value till 9:29 must be > ₹20 Crores
+        3. **No Gap:** Stock should not gap up or gap down (< 0.5% from previous close)
+        4. **Big Body:** Opening 15-min candle (9:15-9:29) should have body ≥ 0.5%
+        
+        ### 📈 Stage B - Entry Conditions
+        1. **Buy Signal:** Price breaks above day high with volume > avg opening volume (9:15-9:29)
+        2. **Sell Signal:** Price breaks below day low with volume > avg opening volume (9:15-9:29)
+        
+        ### 🎯 Stage C - Exit Strategy
+        1. **Stop Loss:** Better of 1% or day low/high
+           - Long: Max(Entry × 0.99, Day Low)
+           - Short: Min(Entry × 1.01, Day High)
+        2. **Target:** {target_pct}% profit from entry
+        3. **Trailing Stop:** {trailing_stop_pct}% from day high (long) or day low (short)
+           - Long: Day High × (1 - {trailing_stop_pct/100})
+           - Short: Day Low × (1 + {trailing_stop_pct/100})
+        
+        ### ⚙️ Current Settings
+        - Stop Loss: {stop_loss_pct}%
+        - Target: {target_pct}%
+        - Trailing Stop: {trailing_stop_pct}%
+        - Position Sizing: {sizing_mode}
+        - {"Quantity: " + str(quantity) if sizing_mode == "Fixed Quantity" else "Amount: ₹" + str(trade_amount)}
+        - Stocks to Scan: {num_stocks_to_scan}
+        - Continuous Scanning: {'✅ Enabled (' + str(scan_interval) + 's interval)' if continuous_scan else '❌ Disabled'}
+        - Auto Trading: {'✅ Enabled' if auto_trading else '❌ Disabled'}
+        
+        ### 🕐 Trading Hours
+        - Screening: Before 9:30 AM (using 9:15-9:29 data)
+        - Entry: 9:30 AM - 3:20 PM
+        - Exit: Anytime during market hours
+        
+        ### 📍 Position Management
+        - When a position is open, screening continues but **excludes that stock**
+        - Continuous scanning works even with open positions
+        - New entries are only taken from newly screened stocks
+        - Position stock is automatically monitored for exit conditions
+        - Only one position allowed at a time
+        
+        **Note:** Enable auto-trading to execute trades automatically based on signals. Otherwise, use manual buy/sell buttons.
+        """)
 
 if __name__ == "__main__":
-    main()  
+    main()
