@@ -665,7 +665,7 @@ def main():
         st.subheader("📊 Scanning Options")
         
         # Number of stocks to scan
-        num_stocks_to_scan = st.number_input("Number of Stocks to Scan", min_value=5, max_value=100, value=20, step=5)
+        num_stocks_to_scan = st.number_input("Number of Stocks to Scan", min_value=5, max_value=250, value=20, step=5)
         
         # Continuous scanning toggle
         continuous_scan = st.toggle("Continuous Scanning", False)
