@@ -5,6 +5,8 @@ requests
 supabase
 yfinance
 plotly
+NorenRestApiPy
+
 
 
 
