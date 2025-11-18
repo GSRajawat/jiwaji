@@ -911,7 +911,7 @@ def main():
                         st.metric("Volume", f"{current_candle['Volume']:,}")
                     
                     # Check for entry signals if no position
-                    if not strategy.current_position and strategy.avg_vol_opening and time(9, 30) <= current_time <= time(15, 20):
+                    if not strategy.current_position and strategy.avg_vol_opening and time(1, 30) <= current_time <= time(23, 20):
                         signal = strategy.check_breakout_entry(
                             current_candle, day_high, day_low, strategy.avg_vol_opening
                         )
