@@ -784,7 +784,7 @@ def main():
         st.info(f"📍 Active Position Detected: {position_details['symbol']} - {position_details['type'].upper()} - Qty: {position_details['qty']}")
     
     # Check trading hours
-    if current_time < time(9, 15) or current_time > time(23, 30):
+    if current_time < time(1, 15) or current_time > time(23, 30):
         st.warning("⏰ Outside Trading Hours (9:15 AM - 3:30 PM)")
     
     # Screening Section - Only run if no open position
