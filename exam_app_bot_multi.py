@@ -19,7 +19,7 @@ from api_helper import NorenApiPy
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Flattrade API Credentials ---
-USER_SESSION = "08d6e04927a8f6f8783e9a0de663baf7ad9d227d0708098a02d7c0ef3336a206"
+USER_SESSION = "6ed8329ebb7240e901c3d35a035b53ab9573c6d312a71363b2e2b5eeb96067ca"
 USER_ID = "FZ03508"
 FLATTRADE_PASSWORD = "Shubhi@3"
 
@@ -131,7 +131,8 @@ class FnOBreakoutStrategy:
         Screen stock based on Stage A criteria
         Returns: (passed, reason, metrics)
         """
-        if len(df) < 300:
+        # Need enough data for prev 60 candles + current opening 15 candles
+        if len(df) < 75:
             return False, "Insufficient data", None
         
         # Check for gap
@@ -139,29 +140,43 @@ class FnOBreakoutStrategy:
         if not no_gap:
             return False, "Stock has gap", None
         
-        # Get opening candle metrics
+        # Get opening candle metrics (Current Day 9:15-9:29)
         avg_vol_opening, trade_value, big_body, opening_candle = self.calculate_opening_candle_metrics(df)
         
         if avg_vol_opening is None:
             return False, "No opening period data", None
         
-        # Calculate average volume of last 300 candles
-        avg_vol_300 = df['Volume'].tail(300).mean()
+        # --- NEW LOGIC START ---
+        # Calculate average volume of the PREVIOUS 60 candles (before today's open)
         
-        # Screening criteria
-        volume_check = avg_vol_opening > (5 * avg_vol_300)
+        # 1. Identify Today's date from the data
+        today_date = df.index[-1].date()
+        
+        # 2. Filter data to get everything STRICTLY BEFORE today
+        prev_data = df[df.index.date < today_date]
+        
+        if len(prev_data) < 60:
+            return False, "Insufficient previous day data", None
+            
+        # 3. Calculate Mean Volume of the last 60 candles of the previous session
+        avg_vol_prev_60 = prev_data['Volume'].tail(60).mean()
+        
+        # 4. Screening criteria: Opening Volume > 5x Previous 60 Avg
+        volume_check = avg_vol_opening > (5 * avg_vol_prev_60)
+        # --- NEW LOGIC END ---
+        
         trade_value_check = trade_value > 20  # 20 crores
         
         metrics = {
             'avg_vol_opening': avg_vol_opening,
-            'avg_vol_300': avg_vol_300,
+            'avg_vol_prev_60': avg_vol_prev_60,
             'trade_value': trade_value,
             'body_pct': (abs(opening_candle['Close'] - opening_candle['Open']) / opening_candle['Open']) * 100
         }
         
         reasons = []
         if not volume_check:
-            reasons.append(f"Volume: {avg_vol_opening:.0f} vs {5*avg_vol_300:.0f}")
+            reasons.append(f"Volume: {avg_vol_opening:.0f} vs {5*avg_vol_prev_60:.0f} (Required > 5x Prev 60)")
         if not trade_value_check:
             reasons.append(f"Trade Value: ₹{trade_value:.2f}Cr vs ₹20Cr")
         if not big_body:
@@ -398,9 +413,9 @@ def load_market_data(api, symbol, exchange="NSE"):
             logging.error(f"Could not find token for {symbol}")
             return None
         
-        # Get historical data - last 400 minutes to have enough data
+        # UPDATED: Fetch last 5 days to ensure we have previous day's data for comparison
         end_date = datetime.now()
-        start_date = end_date - timedelta(minutes=400)
+        start_date = end_date - timedelta(days=5)
         
         start_time = start_date.strftime("%d-%m-%Y") + " 09:15:00"
         end_time = end_date.strftime("%d-%m-%Y") + " " + end_date.strftime("%H:%M:%S")
@@ -547,6 +562,93 @@ def check_and_sync_positions(api, strategy):
         st.error(f"Error saving trade to database: {e}")
         return None
 
+def get_top_losers(api, limit=5):
+    """
+    Get Top 5 Losers from the FNO list
+    """
+    try:
+        # Reuse the existing list logic
+        stock_list = get_fno_stocks_list()[:30] 
+        
+        losers_data = []
+        
+        for symbol in stock_list:
+            token = get_token_from_isin(api, symbol)
+            if token:
+                quote = api.get_quotes(exchange='NSE', token=token)
+                if quote and quote.get('stat') == 'Ok':
+                    lp = float(quote.get('lp', 0))
+                    prev_close = float(quote.get('c', 0))
+                    
+                    if prev_close > 0:
+                        p_change = ((lp - prev_close) / prev_close) * 100
+                        
+                        # Only add negative changes (Losers)
+                        if p_change < 0:
+                            losers_data.append({
+                                'Symbol': symbol,
+                                'LTP': f"₹{lp:.2f}",
+                                'Change': p_change
+                            })
+        
+        # Sort by Change ascending (e.g., -5% comes before -1%)
+        losers_data.sort(key=lambda x: x['Change'])
+        
+        # Return top N and format Change for display
+        top_losers = losers_data[:limit]
+        for item in top_losers:
+            item['Change'] = f"{item['Change']:.2f}%"
+            
+        return top_losers
+        
+    except Exception as e:
+        logging.error(f"Error fetching top losers: {e}")
+        return []
+
+def get_top_gainers(api, limit=10):
+    """
+    Get Top 5 Gainers from the FNO list
+    """
+    try:
+        # Get list of stocks (using your existing function)
+        # limiting scan to first 30 to keep app fast
+        stock_list = get_fno_stocks_list()[:30] 
+        
+        gainers_data = []
+        
+        for symbol in stock_list:
+            token = get_token_from_isin(api, symbol)
+            if token:
+                quote = api.get_quotes(exchange='NSE', token=token)
+                if quote and quote.get('stat') == 'Ok':
+                    lp = float(quote.get('lp', 0)) # Last Price
+                    prev_close = float(quote.get('c', 0)) # Previous Close
+                    
+                    if prev_close > 0:
+                        p_change = ((lp - prev_close) / prev_close) * 100
+                        
+                        # Only add positive gainers
+                        if p_change > 0:
+                            gainers_data.append({
+                                'Symbol': symbol,
+                                'LTP': f"₹{lp:.2f}",
+                                'Change': p_change
+                            })
+        
+        # Sort by Change % descending
+        gainers_data.sort(key=lambda x: x['Change'], reverse=True)
+        
+        # Return top N and format Change for display
+        top_gainers = gainers_data[:limit]
+        for item in top_gainers:
+            item['Change'] = f"+{item['Change']:.2f}%"
+            
+        return top_gainers
+        
+    except Exception as e:
+        logging.error(f"Error fetching top gainers: {e}")
+        return []
+    
 def create_chart(df, entry_point=None, stop_loss=None, target=None, trailing_stop=None, signals_df=None):
     """Create candlestick chart with levels and signals"""
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
@@ -636,6 +738,62 @@ def main():
         st.error(f"Error initializing APIs: {e}")
         return
     
+    # ... inside main() ...
+    
+    # Sidebar for controls
+    with st.sidebar:
+        st.title("🚀 Market Movers")
+        
+        # Create tabs for cleaner UI
+        tab1, tab2 = st.tabs(["📈 Gainers", "📉 Losers"])
+        
+        # Button to refresh both
+        if st.button("🔄 Refresh Market Data"):
+            st.session_state.gainers = get_top_gainers(api)
+            st.session_state.losers = get_top_losers(api)
+            
+        # Initialize session state if empty
+        if 'gainers' not in st.session_state:
+            st.session_state.gainers = get_top_gainers(api)
+        if 'losers' not in st.session_state:
+            st.session_state.losers = get_top_losers(api)
+            
+        # --- Gainers Tab ---
+        with tab1:
+            if st.session_state.gainers:
+                st.dataframe(
+                    pd.DataFrame(st.session_state.gainers), 
+                    hide_index=True, 
+                    use_container_width=True,
+                    column_config={
+                        "Symbol": "Stock",
+                        "LTP": "Price",
+                        "Change": "Change %"
+                    }
+                )
+            else:
+                st.info("No gainers found")
+
+        # --- Losers Tab ---
+        with tab2:
+            if st.session_state.losers:
+                st.dataframe(
+                    pd.DataFrame(st.session_state.losers), 
+                    hide_index=True, 
+                    use_container_width=True,
+                    column_config={
+                        "Symbol": "Stock",
+                        "LTP": "Price",
+                        "Change": "Change %"
+                    }
+                )
+            else:
+                st.info("No losers found")
+            
+        st.markdown("---")
+        
+        st.header("Trading Controls")
+        # ... rest of your existing sidebar code ...
     # Sidebar for controls
     with st.sidebar:
         st.header("Trading Controls")
