@@ -801,7 +801,7 @@ def main():
         # Trading parameters
         st.subheader("Strategy Parameters")
         stop_loss_pct = st.slider("Stop Loss (%)", 0.5, 2.0, 1.0, 0.1)
-        target_pct = st.slider("Target (%)", .6, 5.0, 3.0, 0.5)
+        target_pct = st.slider("Target (%)", 0.2, 5.0, 1.0, 0.1)
         trailing_stop_pct = st.slider("Trailing Stop (%)", 0.5, 2.0, 1.0, 0.1)
         
         strategy.stop_loss_pct = stop_loss_pct / 100
