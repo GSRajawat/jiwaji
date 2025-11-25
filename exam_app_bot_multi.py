@@ -19,7 +19,7 @@ from api_helper import NorenApiPy
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Flattrade API Credentials ---
-USER_SESSION = "368b75b27845ccb54bfab8732261c2cb25e9dfeaffc4f03e44441cfc532f2c28"
+USER_SESSION = "df24a9522687879f168b54077701691ecf23e1020703248688e90324fcba2d6b"
 USER_ID = "FZ03508"
 FLATTRADE_PASSWORD = "Shubhi@3"
 
@@ -791,8 +791,8 @@ def main():
         
         # Trading parameters
         st.subheader("Strategy Parameters")
-        stop_loss_pct = st.slider("Stop Loss (%)", 0.5, 2.0, 1.0, 0.1)
-        target_pct = st.slider("Target (%)", 1.0, 5.0, 3.0, 0.5)
+        stop_loss_pct = st.slider("Stop Loss (%)", 0.1, 2.0, 0.1, 0.1)
+        target_pct = st.slider("Target (%)", 0.1, 5.0, 0.1, 0.1)
         trailing_stop_pct = st.slider("Trailing Stop (%)", 0.5, 2.0, 1.0, 0.1)
         
         strategy.stop_loss_pct = stop_loss_pct / 100
@@ -1193,22 +1193,119 @@ def main():
             st.warning(f"Could not fetch account details")
         
         # Open Positions from API
-        st.subheader("📍 Open Positions")
+        # ---------------------------------------------------------
+        # REPLACEMENT CODE FOR "📍 Open Positions" SECTION
+        # ---------------------------------------------------------
+        st.subheader("📍 Open Positions & Auto-Monitor")
+        
         try:
             positions = api.get_positions()
-            if positions and len(positions) > 0:
-                positions_df = pd.DataFrame(positions)
-                display_cols = ['tsym', 'netqty', 'netavgprc', 'lp', 'rpnl', 'upnl']
-                available_cols = [col for col in display_cols if col in positions_df.columns]
+            
+            # Filter for only open positions (Net Qty != 0)
+            open_positions = [p for p in positions if int(p.get('netqty', 0)) != 0] if positions else []
+            
+            if len(open_positions) > 0:
+                monitor_data = []
                 
-                if available_cols:
-                    st.dataframe(positions_df[available_cols], use_container_width=True)
-                else:
-                    st.dataframe(positions_df, use_container_width=True)
+                for pos in open_positions:
+                    # Extract Position Details
+                    symbol = pos.get('tsym')
+                    netqty = int(pos.get('netqty', 0))
+                    avg_price = float(pos.get('netavgprc', 0))
+                    product_type = pos.get('prd', 'C')
+                    
+                    # Get LTP (Live Price) - Try from position data first, else fetch quote
+                    ltp = float(pos.get('lp', 0))
+                    if ltp == 0:
+                        # Fallback if position data doesn't have LTP
+                        ltp = get_live_price(api, symbol.replace('-EQ', '')) or avg_price
+
+                    # Determine Position Type
+                    is_long = netqty > 0
+                    
+                    # --- CALCULATE DYNAMIC TARGET & STOP LOSS ---
+                    # Uses the sliders from the sidebar
+                    current_sl_pct = strategy.stop_loss_pct
+                    current_target_pct = strategy.target_pct
+                    
+                    if is_long:
+                        calc_sl = avg_price * (1 - current_sl_pct)
+                        calc_target = avg_price * (1 + current_target_pct)
+                        pnl = (ltp - avg_price) * abs(netqty)
+                        # Exit Condition
+                        hit_target = ltp >= calc_target
+                        hit_sl = ltp <= calc_sl
+                    else: # Short
+                        calc_sl = avg_price * (1 + current_sl_pct)
+                        calc_target = avg_price * (1 - current_target_pct)
+                        pnl = (avg_price - ltp) * abs(netqty)
+                        # Exit Condition
+                        hit_target = ltp <= calc_target
+                        hit_sl = ltp >= calc_sl
+
+                    # --- DISPLAY DATA PREP ---
+                    monitor_data.append({
+                        "Symbol": symbol,
+                        "Side": "BUY" if is_long else "SELL",
+                        "Qty": netqty,
+                        "Avg Price": f"₹{avg_price:.2f}",
+                        "LTP": f"₹{ltp:.2f}",
+                        "🛑 Stop Loss": f"₹{calc_sl:.2f}",
+                        "🎯 Target": f"₹{calc_target:.2f}",
+                        "P&L": f"₹{pnl:.2f}",
+                        "Product": product_type
+                    })
+
+                    # --- AUTO EXIT LOGIC ---
+                    if auto_trading:
+                        exit_reason = None
+                        if hit_target:
+                            exit_reason = "Target Hit"
+                        elif hit_sl:
+                            exit_reason = "Stop Loss Hit"
+                        
+                        if exit_reason:
+                            st.warning(f"⚡ Triggering Auto-Exit for {symbol}: {exit_reason}")
+                            
+                            # Determine opposite transaction type
+                            trans_type = 'SELL' if is_long else 'BUY'
+                            
+                            # Place Order
+                            # Note: We use the exact symbol and product type from the position to ensure it closes correctly
+                            res = api.place_order(
+                                buy_or_sell='S' if trans_type == 'SELL' else 'B',
+                                product_type=product_type,
+                                exchange='NSE',
+                                tradingsymbol=symbol,
+                                quantity=abs(netqty),
+                                discloseqty=0,
+                                price_type='MKT',
+                                retention='DAY'
+                            )
+                            
+                            if res and res.get('stat') == 'Ok':
+                                st.toast(f"✅ Position Closed for {symbol} ({exit_reason})")
+                                time_module.sleep(1) # Brief pause
+                                st.rerun()
+                            else:
+                                st.error(f"❌ Failed to Close {symbol}: {res}")
+
+                # --- RENDER DATAFRAME ---
+                if monitor_data:
+                    st.dataframe(
+                        pd.DataFrame(monitor_data),
+                        column_config={
+                            "🛑 Stop Loss": st.column_config.TextColumn("Stop Loss", help="Calculated based on sidebar settings"),
+                            "🎯 Target": st.column_config.TextColumn("Target", help="Calculated based on sidebar settings"),
+                        },
+                        use_container_width=True,
+                        hide_index=True
+                    )
             else:
-                st.info("No open positions from API")
+                st.info("No open positions found.")
+                
         except Exception as e:
-            st.info("No open positions")
+            st.error(f"Error monitoring positions: {e}")
         
         # Recent orders - Order Book
         st.subheader("📋 Order Book")
