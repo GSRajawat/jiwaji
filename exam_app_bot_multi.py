@@ -84,9 +84,13 @@ class FnOBreakoutStrategy:
     def check_breakout_entry(self, df, current_candle, day_high, day_low, symbol):
         """
         Check for breakout entry signals based on Gainers (High) and Losers (Low)
-        Returns: signal_type ('BUY', 'SELL', or None)
+        Updated Logic:
+        1. Heavy Volume: > 5x of 20-period Moving Average
+        2. Big Move: Candle Body > 2x of 20-period Average Body
+        3. Breakout: Price breaks previous Day High/Low
         """
-        if len(df) < 20:
+        # We need at least 21 candles (20 previous + 1 current) for MA calculation
+        if len(df) < 22:
             return None
         
         # Determine Bias (Direction) based on screening (Gainer vs Loser)
@@ -94,29 +98,72 @@ class FnOBreakoutStrategy:
         if not bias:
             return None
 
+        # --- DATA PREPARATION ---
+        # Get the previous 20 candles (excluding the current one)
+        prev_20_candles = df.iloc[-21:-1]
+        
+        # Calculate Averages (Volume & Body)
+        avg_volume_20 = prev_20_candles['Volume'].mean()
+        
+        # Body size = abs(Close - Open)
+        prev_bodies = (prev_20_candles['Close'] - prev_20_candles['Open']).abs()
+        avg_body_20 = prev_bodies.mean()
+        
+        # --- CURRENT CANDLE METRICS ---
         current_volume = current_candle['Volume']
+        current_body = abs(current_candle['Close'] - current_candle['Open'])
         current_high = current_candle['High']
         current_low = current_candle['Low']
         
-        # --- VOLUME CHECK ---
-        # Volume must be greater than the 20-period Moving Average
-        recent_avg_volume = df['Volume'].tail(20).mean()
-        volume_confirmed = current_volume > recent_avg_volume
+        # --- 1. HEAVY VOLUME CHECK ---
+        # Logic: Volume must be > 5 times the 20-period Moving Average
+        if avg_volume_20 == 0: avg_volume_20 = 1 # Prevent div/0
+        
+        volume_confirmed = current_volume >= (5 * avg_volume_20)
         
         if not volume_confirmed:
             return None
         
+        # --- 2. BIG MOVE (CANDLE) CHECK ---
+        # Logic: Current Body must be > 2 times the 20-period Average Body
+        # We add a small minimum threshold to avoid triggering on tiny candles during flat markets
+        min_body_threshold = current_candle['Close'] * 0.0005 # 0.05% minimum move
+        effective_avg_body = max(avg_body_20, min_body_threshold)
+        
+        big_move_confirmed = current_body >= (2 * effective_avg_body)
+        
+        if not big_move_confirmed:
+            return None
+            
+        # --- 3. BREAKOUT DIRECTION CHECK ---
+        
+        # Recalculate Day High/Low excluding the current candle to identify a TRUE breakout
+        # (The 'day_high' passed in might already include the current candle's high)
+        today_data = df[df.index.date == current_candle.name.date()]
+        if len(today_data) > 1:
+            prior_data = today_data[:-1] # Exclude current
+            prior_day_high = prior_data['High'].max()
+            prior_day_low = prior_data['Low'].min()
+        else:
+            # If it's the very first candle, we can't really breakout, but let's use the passed values
+            prior_day_high = day_high
+            prior_day_low = day_low
+        
         # --- BUY LOGIC (For Top Gainers) ---
         if bias == 'BUY':
-            # Entry: Price Breaks Day High
-            if current_high > day_high:
-                return 'BUY'
+            # Must be a green candle
+            if current_candle['Close'] > current_candle['Open']:
+                # Entry: Price Breaks Previous Day High
+                if current_high > prior_day_high:
+                    return 'BUY'
         
         # --- SELL LOGIC (For Top Losers) ---
         elif bias == 'SELL':
-            # Entry: Price Breaks Day Low
-            if current_low < day_low:
-                return 'SELL'
+            # Must be a red candle
+            if current_candle['Close'] < current_candle['Open']:
+                # Entry: Price Breaks Previous Day Low
+                if current_low < prior_day_low:
+                    return 'SELL'
         
         return None
     
@@ -267,6 +314,7 @@ def get_live_price(api, symbol, exchange="NSE"):
 def execute_trade(api, signal_type, quantity, symbol, product_type='C'):
     try:
         buy_or_sell = 'B' if signal_type == 'BUY' else 'S'
+        # Added discloseqty=0 here as well for consistency
         return api.place_order(buy_or_sell=buy_or_sell, product_type=product_type, exchange='NSE',
                              tradingsymbol=f"{symbol}-EQ", quantity=quantity, discloseqty=0,
                              price_type='MKT', retention='DAY')
@@ -288,7 +336,6 @@ def check_and_sync_positions(api, strategy):
                     
                     if strategy.position_symbol != symbol:
                         # Only sync to strategy if it's the one we want to track actively on the chart
-                        # We let the main loop handle generic position exit checks
                         strategy.position_symbol = symbol
                         strategy.product_type = product_type
                         strategy.current_position = position_type
@@ -317,42 +364,50 @@ def check_and_sync_positions(api, strategy):
     except:
         return False, None
 
-def get_top_movers_list(api, limit=5, direction="gainers"):
-    """
-    Get Top Gainers or Losers and return raw dicts
-    """
+def get_heavy_volume_stocks(api, rvol_threshold=3.0, ma_window=20, min_consecutive=10, limit=10):
     try:
-        stock_list = get_fno_stocks_list() # Get base list
-        movers_data = []
-        
+        stock_list = get_fno_stocks_list()
+        current_date = datetime.now().date()
+        results = []
         for symbol in stock_list:
-            token = get_token_from_isin(api, symbol)
-            if token:
-                quote = api.get_quotes(exchange='NSE', token=token)
-                if quote and quote.get('stat') == 'Ok':
-                    lp = float(quote.get('lp', 0))
-                    prev_close = float(quote.get('c', 0))
-                    
-                    if prev_close > 0:
-                        p_change = ((lp - prev_close) / prev_close) * 100
-                        movers_data.append({
-                            'Symbol': symbol,
-                            'LTP': lp,
-                            'Change': p_change
-                        })
-        
-        # Sort
-        if direction == "gainers":
-            movers_data.sort(key=lambda x: x['Change'], reverse=True)
-            filtered = [x for x in movers_data if x['Change'] > 0]
-        else:
-            movers_data.sort(key=lambda x: x['Change']) # Ascending for negative
-            filtered = [x for x in movers_data if x['Change'] < 0]
-            
-        return filtered[:limit]
-        
+            df = load_market_data(api, symbol)
+            if df is None or len(df) == 0:
+                continue
+            today_df = df[df.index.date == current_date]
+            if len(today_df) < ma_window:
+                continue
+            vol_ma = today_df['Volume'].rolling(window=ma_window, min_periods=ma_window).mean()
+            heavy = today_df['Volume'] > (rvol_threshold * vol_ma)
+            longest = 0
+            curr = 0
+            for flag in heavy.fillna(False).tolist():
+                if flag:
+                    curr += 1
+                    if curr > longest:
+                        longest = curr
+                else:
+                    curr = 0
+            if longest >= min_consecutive:
+                last_row = today_df.iloc[-1]
+                last_ma = vol_ma.iloc[-1]
+                rvol = (last_row['Volume'] / last_ma) if last_ma and not np.isnan(last_ma) and last_ma != 0 else 0
+                open_p = today_df['Open'].iloc[0]
+                ltp = last_row['Close']
+                chg = ((ltp - open_p) / open_p) * 100 if open_p else 0
+                bias = 'BUY' if chg >= 0 else 'SELL'
+                results.append({
+                    'Symbol': symbol,
+                    'LTP': ltp,
+                    'Change': chg,
+                    'RVOL': rvol,
+                    'Streak': longest,
+                    'TotalVol': int(today_df['Volume'].sum()),
+                    'Bias': bias
+                })
+        results.sort(key=lambda x: (x['RVOL'], x['Streak']), reverse=True)
+        return results[:limit]
     except Exception as e:
-        logging.error(f"Error fetching movers: {e}")
+        logging.error(f"Error fetching heavy volume: {e}")
         return []
 
 def create_chart(df, entry_point=None, stop_loss=None, target=None, trailing_stop=None):
@@ -376,7 +431,7 @@ def create_chart(df, entry_point=None, stop_loss=None, target=None, trailing_sto
 # --- MAIN APP ---
 
 def main():
-    st.set_page_config(page_title="FnO Breakout Bot", layout="wide")
+    st.set_page_config(page_title="FnO Heavy Volume Screener", layout="wide")
     
     try:
         api = init_flattrade_api()
@@ -396,16 +451,13 @@ def main():
     # --- Sidebar Controls ---
     with st.sidebar:
         st.header("⚙️ Bot Configuration")
-        
         st.subheader("Strategy Parameters")
         stop_loss_pct = st.slider("Stop Loss (%)", 0.1, 5.0, 1.0, 0.1)
         target_pct = st.slider("Target (%)", 0.1, 10.0, 3.0, 0.1)
         trailing_stop_pct = st.slider("Trailing Stop (%)", 0.5, 3.0, 1.0, 0.1)
-        
         strategy.stop_loss_pct = stop_loss_pct / 100
         strategy.target_pct = target_pct / 100
         strategy.trailing_stop_pct = trailing_stop_pct / 100
-        
         st.subheader("Position Sizing")
         sizing_mode = st.radio("Mode", ["Fixed Quantity", "Fixed Amount"])
         if sizing_mode == "Fixed Quantity":
@@ -414,14 +466,18 @@ def main():
         else:
             trade_amount = st.number_input("Amount (₹)", 1000, value=10000)
             quantity = None
-            
+        st.subheader("Heavy Volume Scan")
+        rvol_threshold = st.slider("RVOL threshold", 1.0, 10.0, 3.0, 0.5)
+        min_consecutive = st.slider("Min consecutive minutes", 5, 60, 10, 1)
+        scan_limit = st.number_input("Max results", 1, 50, value=10)
         st.divider()
         auto_trading = st.toggle("Enable Auto Trading", False)
-        if st.button("🔍 Scan Top Movers", type="primary"):
+        auto_refresh = st.toggle("🔄 Auto Refresh (5s)", value=False)
+        if st.button("🔍 Scan Heavy Volume", type="primary"):
             st.session_state.run_scanning = True
     
     # --- Top Dashboard (Funds) ---
-    st.title("⚡ FnO Top Gainers/Losers Strategy")
+    st.title("⚡ FnO Heavy Volume Screener")
     
     # Account Summary
     cash_avail = float(limits_resp.get('cash', 0))
@@ -440,24 +496,11 @@ def main():
     
     # --- Scanning Logic ---
     if st.session_state.get('run_scanning'):
-        with st.spinner("Fetching Top 5 Gainers & Losers..."):
-            strategy.screened_stocks = []
-            strategy.stock_bias = {}
-            
-            # Gainers (BUY Bias)
-            gainers = get_top_movers_list(api, limit=5, direction="gainers")
-            for g in gainers:
-                sym = g['Symbol']
-                strategy.screened_stocks.append(sym)
-                strategy.stock_bias[sym] = 'BUY'
-                
-            # Losers (SELL Bias)
-            losers = get_top_movers_list(api, limit=5, direction="losers")
-            for l in losers:
-                sym = l['Symbol']
-                strategy.screened_stocks.append(sym)
-                strategy.stock_bias[sym] = 'SELL'
-            
+        with st.spinner("Scanning heavy volume since market open..."):
+            heavy_results = get_heavy_volume_stocks(api, rvol_threshold=rvol_threshold, ma_window=20, min_consecutive=min_consecutive, limit=int(scan_limit))
+            strategy.screened_stocks = [x['Symbol'] for x in heavy_results]
+            strategy.stock_bias = {x['Symbol']: x['Bias'] for x in heavy_results}
+            st.session_state.heavy_results = {x['Symbol']: x for x in heavy_results}
             st.session_state.run_scanning = False
             st.success(f"Screened {len(strategy.screened_stocks)} stocks.")
 
@@ -474,12 +517,32 @@ def main():
             st.subheader("Watchlist")
             if strategy.screened_stocks:
                 w_data = []
+                heavy_map = st.session_state.get('heavy_results', {})
                 for sym in strategy.screened_stocks:
-                    w_data.append({
-                        "Symbol": sym,
-                        "Bias": "🟢 BUY" if strategy.stock_bias[sym] == 'BUY' else "🔴 SELL",
-                        "Condition": "Break Day High" if strategy.stock_bias[sym] == 'BUY' else "Break Day Low"
-                    })
+                    m = heavy_map.get(sym)
+                    if m:
+                        w_data.append({
+                            "Symbol": sym,
+                            "Bias": "🟢 BUY" if strategy.stock_bias[sym] == 'BUY' else "🔴 SELL",
+                            "LTP": f"{m['LTP']:.2f}",
+                            "% Change": f"{m['Change']:.2f}",
+                            "RVOL": f"{m['RVOL']:.2f}",
+                            "Streak (min)": m['Streak'],
+                            "Total Vol": f"{m['TotalVol']:,}"
+                        })
+                    else:
+                        token = get_token_from_isin(api, sym)
+                        quote_data = {}
+                        if token:
+                            res = api.get_quotes(exchange='NSE', token=token)
+                            if res and res.get('stat') == 'Ok':
+                                quote_data = res
+                        ltp = float(quote_data.get('lp', 0))
+                        w_data.append({
+                            "Symbol": sym,
+                            "Bias": "🟢 BUY" if strategy.stock_bias[sym] == 'BUY' else "🔴 SELL",
+                            "LTP": f"{ltp:.2f}"
+                        })
                 st.dataframe(pd.DataFrame(w_data), hide_index=True, use_container_width=True)
             else:
                 st.info("Run scan to populate.")
@@ -573,8 +636,11 @@ def main():
                 if auto_trading and exit_hit:
                     st.toast(f"⚡ Auto-Exiting {sym}...")
                     trantype = 'S' if netqty > 0 else 'B'
+                    
+                    # --- FIXED LINE BELOW (Added discloseqty=0) ---
                     api.place_order(buy_or_sell=trantype, product_type=prd, exchange='NSE', 
-                                    tradingsymbol=sym, quantity=abs(netqty), price_type='MKT', retention='DAY')
+                                    tradingsymbol=sym, quantity=abs(netqty), discloseqty=0,
+                                    price_type='MKT', retention='DAY')
                     time_module.sleep(1)
                     st.rerun()
             
@@ -609,6 +675,11 @@ def main():
             st.dataframe(trd_df[show_cols], use_container_width=True)
         else:
             st.info("No trades executed today.")
+
+    # --- AUTO REFRESH LOGIC ---
+    if auto_refresh:
+        time_module.sleep(5)
+        st.rerun()
 
 if __name__ == "__main__":
     main()
