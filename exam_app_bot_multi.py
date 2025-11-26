@@ -19,7 +19,7 @@ from api_helper import NorenApiPy
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Flattrade API Credentials ---
-USER_SESSION = "df24a9522687879f168b54077701691ecf23e1020703248688e90324fcba2d6b"
+USER_SESSION = "09add3026f8c427c3dc3fbe0b53e48c09cda332a6bb09ca3bca58625b407559d"
 USER_ID = "FZ03508"
 FLATTRADE_PASSWORD = "Shubhi@3"
 
