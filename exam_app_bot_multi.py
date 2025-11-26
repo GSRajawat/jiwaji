@@ -6,529 +6,1372 @@ import sys
 import logging
 from datetime import datetime, time, timedelta
 import time as time_module
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dotenv import load_dotenv  # pip install python-dotenv
+from supabase import create_client, Client
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import json
 
 # Add the parent directory to the path to import api_helper
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-try:
-    from api_helper import NorenApiPy
-except ImportError:
-    st.error("api_helper.py not found. Please ensure it is in the parent directory.")
+from api_helper import NorenApiPy
 
-# --- Configuration & Security ---
-load_dotenv() # Load credentials from .env file
+# --- Configuration ---
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# --- Flattrade API Credentials ---
+USER_SESSION = "09add3026f8c427c3dc3fbe0b53e48c09cda332a6bb09ca3bca58625b407559d"
+USER_ID = "FZ03508"
+FLATTRADE_PASSWORD = "Shubhi@3"
 
-# Credentials
-USER_ID = os.getenv("FLATTRADE_USER_ID")
-FLATTRADE_PASSWORD = os.getenv("FLATTRADE_PASSWORD")
-USER_SESSION = os.getenv("FLATTRADE_SESSION")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+# --- Supabase Credentials ---
+SUPABASE_URL = "https://zybakxpyibubzjhzdcwl.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp5YmFreHB5aWJ1YnpqaHpkY3dsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQ4OTQyMDgsImV4cCI6MjA3MDQ3MDIwOH0.8ZqreKy5zg_M-B1uH79T6lQXn62eRvvouo_OiMjwqGU"
 
-# --- Flattrade API Initialization ---
+# Initialize Supabase client
+@st.cache_resource
+def init_supabase():
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Initialize Flattrade API
 @st.cache_resource
 def init_flattrade_api():
-    if not USER_ID or not FLATTRADE_PASSWORD:
-        st.error("Missing Credentials! Please check your .env file.")
-        return None
-    
     api = NorenApiPy()
-    # Attempt login
-    try:
-        ret = api.set_session(userid=USER_ID, usertoken=USER_SESSION, password=FLATTRADE_PASSWORD)
-        if ret:
-            logging.info("API Session Active")
-            return api
-        else:
-            st.error("Failed to set API session.")
-            return None
-    except Exception as e:
-        st.error(f"API Connection Error: {e}")
-        return None
+    api.set_session(userid=USER_ID, usertoken=USER_SESSION, password=FLATTRADE_PASSWORD)
+    return api
 
 class FnOBreakoutStrategy:
     def __init__(self):
-        self.stop_loss_pct = 0.01
-        self.target_pct = 0.03
-        self.trailing_stop_pct = 0.01
+        self.stop_loss_pct = 0.01  # 1% stop loss
+        self.target_pct = 0.03  # 3% target
+        self.trailing_stop_pct = 0.01  # 1% trailing stop
         self.position_symbol = None
-        self.product_type = 'C'
+        self.product_type = 'C'  # Default to C
         self.screened_stocks = []
-        self.stock_bias = {}
         self.entry_price = None
-        self.current_position = None
+        self.current_position = None  # 'long' or 'short'
         self.position_size = 0
         self.stop_loss = None
         self.target = None
         self.day_high = None
         self.day_low = None
         self.trailing_stop = None
+        
+        self.screened_stocks = []
         self.current_date = None
+        self.avg_vol_opening = None
         
     def reset_daily_data(self, current_date):
+        """Reset daily data for new trading day"""
         if self.current_date != current_date:
             self.current_date = current_date
             self.screened_stocks = []
-            self.stock_bias = {}
             self.day_high = None
             self.day_low = None
+    
+    def calculate_rsi(self, series, period=14):
+        """Calculate RSI for momentum check"""
+        delta = series.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        return 100 - (100 / (1 + rs))
 
-    def check_breakout_entry(self, df, current_candle, day_high, day_low, symbol):
+    def calculate_opening_candle_metrics(self, df):
         """
-        Updated Logic:
-        1. Heavy Volume: > 5x of 20-period MA
-        2. Big Move: Current Candle Range (High-Low) > 2x of 20-period Avg Range
-        3. Breakout: Price breaks previous Day High/Low
+        Calculate metrics for 9:15 to 9:29 period
+        Returns: avg_volume_opening, trade_value, is_big_body, opening_candle_data
         """
-        if len(df) < 22: return None
+        # Filter data for 9:15 to 9:29
+        opening_data = df[(df.index.time >= time(9, 15)) & (df.index.time <= time(9, 29))]
         
-        bias = self.stock_bias.get(symbol)
-        if not bias: return None
-
-        # --- DATA PREPARATION ---
-        prev_20_candles = df.iloc[-21:-1]
+        if len(opening_data) == 0:
+            return None, None, None, None
         
-        # 1. Volume Check
-        avg_volume_20 = prev_20_candles['Volume'].mean()
-        if avg_volume_20 == 0: avg_volume_20 = 1
+        # Calculate average volume for opening period
+        avg_volume_opening = opening_data['Volume'].mean()
+        
+        # Calculate trade value (price * volume)
+        opening_data_copy = opening_data.copy()
+        opening_data_copy['TradeValue'] = opening_data_copy['Close'] * opening_data_copy['Volume']
+        total_trade_value = opening_data_copy['TradeValue'].sum()
+        trade_value_crores = total_trade_value / 10000000  # Convert to crores
+        
+        # Create 15-min candle (9:15 to 9:29)
+        opening_candle = {
+            'Open': opening_data['Open'].iloc[0],
+            'High': opening_data['High'].max(),
+            'Low': opening_data['Low'].min(),
+            'Close': opening_data['Close'].iloc[-1],
+            'Volume': opening_data['Volume'].sum()
+        }
+        
+        # Check if body is big (Modified to 0.3% from 0.5%)
+        body_size = abs(opening_candle['Close'] - opening_candle['Open'])
+        body_pct = (body_size / opening_candle['Open']) * 100
+        is_big_body = body_pct >= 0.3 # RELAXED CONDITION
+        
+        return avg_volume_opening, trade_value_crores, is_big_body, opening_candle
+    
+    def check_gap(self, df):
+        """
+        Check if stock has gap up or gap down
+        Compare today's open with previous day's close
+        """
+        if len(df) < 2:
+            return False
+        
+        # Get previous day's last candle
+        today = df.index[-1].date()
+        yesterday_data = df[df.index.date < today]
+        
+        if len(yesterday_data) == 0:
+            return True  # No previous day data, assume no gap
+        
+        prev_close = yesterday_data['Close'].iloc[-1]
+        today_open = df[df.index.date == today]['Open'].iloc[0]
+        
+        gap_pct = abs((today_open - prev_close) / prev_close) * 100
+        
+        # RELAXED CONDITION: Allow gaps up to 1.5% (was 0.5%)
+        return gap_pct < 1.5
+    
+    def screen_stock(self, df):
+        """
+        Screen stock based on Stage A criteria
+        Returns: (passed, reason, metrics)
+        """
+        # Need enough data for prev 60 candles + current opening 15 candles
+        if len(df) < 75:
+            return False, "Insufficient data", None
+        
+        # Check for gap
+        no_gap = self.check_gap(df)
+        if not no_gap:
+            return False, "Gap > 1.5%", None
+        
+        # Get opening candle metrics (Current Day 9:15-9:29)
+        avg_vol_opening, trade_value, big_body, opening_candle = self.calculate_opening_candle_metrics(df)
+        
+        if avg_vol_opening is None:
+            return False, "No opening period data", None
+        
+        # Calculate average volume of the PREVIOUS 60 candles (before today's open)
+        today_date = df.index[-1].date()
+        prev_data = df[df.index.date < today_date]
+        
+        if len(prev_data) < 60:
+            return False, "Insufficient previous day data", None
+            
+        avg_vol_prev_60 = prev_data['Volume'].tail(60).mean()
+        
+        # RELAXED CONDITION: Opening Volume > 2x Previous 60 Avg (was 5x)
+        volume_check = avg_vol_opening > (2 * avg_vol_prev_60)
+        
+        # RELAXED CONDITION: Trade Value > 10 Cr (was 20 Cr)
+        trade_value_check = trade_value > 10
+        
+        metrics = {
+            'avg_vol_opening': avg_vol_opening,
+            'avg_vol_prev_60': avg_vol_prev_60,
+            'trade_value': trade_value,
+            'body_pct': (abs(opening_candle['Close'] - opening_candle['Open']) / opening_candle['Open']) * 100
+        }
+        
+        reasons = []
+        if not volume_check:
+            reasons.append(f"Volume: {avg_vol_opening:.0f} vs {2*avg_vol_prev_60:.0f} (Req > 2x Prev 60)")
+        if not trade_value_check:
+            reasons.append(f"Trade Value: ₹{trade_value:.2f}Cr vs ₹10Cr")
+        if not big_body:
+            reasons.append("Body < 0.3%")
+        
+        passed = volume_check and trade_value_check and big_body
+        
+        reason = "Passed all criteria" if passed else ", ".join(reasons)
+        
+        return passed, reason, metrics
+    
+    def check_breakout_entry(self, df, current_candle, day_high, day_low):
+        """
+        Check for breakout entry signals (Stage B)
+        Returns: signal_type ('BUY', 'SELL', or None)
+        """
         current_volume = current_candle['Volume']
+        current_high = current_candle['High']
+        current_low = current_candle['Low']
         
-        if current_volume < (5 * avg_volume_20):
-            return None
-        
-        # 2. Volatility Check (Using RANGE, not Body)
-        # We use Range (High - Low) because it is stable during a live candle
-        prev_ranges = prev_20_candles['High'] - prev_20_candles['Low']
-        avg_range_20 = prev_ranges.mean()
-        
-        current_range = current_candle['High'] - current_candle['Low']
-        
-        # Avoid division by zero or extremely small ranges
-        min_range_threshold = current_candle['Close'] * 0.0005 
-        effective_avg_range = max(avg_range_20, min_range_threshold)
-        
-        if current_range < (2 * effective_avg_range):
+        # --- NEW ENTRY LOGIC: SMA VOLUME + RSI ---
+        if len(df) < 20:
             return None
             
-        # 3. Breakout Check
-        # Recalculate Day High/Low excluding current candle
-        today_data = df[df.index.date == current_candle.name.date()]
-        if len(today_data) > 1:
-            prior_data = today_data[:-1]
-            prior_day_high = prior_data['High'].max()
-            prior_day_low = prior_data['Low'].min()
-        else:
-            # Fallback if it's the first candle (risky, but uses provided H/L)
-            prior_day_high = day_high
-            prior_day_low = day_low
+        recent_avg_volume = df['Volume'].tail(20).mean()
         
-        # --- BUY LOGIC ---
-        if bias == 'BUY':
-            if current_candle['Close'] > current_candle['Open']: # Still want a green candle
-                if current_candle['High'] > prior_day_high:
-                    return 'BUY'
+        # Volume must be 1.5x the recent average (SMA 20)
+        volume_spike = current_volume > (recent_avg_volume * 1.5)
         
-        # --- SELL LOGIC ---
-        elif bias == 'SELL':
-            if current_candle['Close'] < current_candle['Open']: # Still want a red candle
-                if current_candle['Low'] < prior_day_low:
-                    return 'SELL'
+        # Calculate RSI
+        rsi = self.calculate_rsi(df['Close']).iloc[-1]
+
+        if not volume_spike:
+            return None
+        
+        # Buy signal: Breakout + RSI Momentum
+        if current_high > day_high:
+            # RSI Confirmation: RSI should be rising (e.g., > 50) but not extremely overbought yet (> 80)
+            if 50 < rsi < 80: 
+                return 'BUY'
+        
+        # Sell signal: Breakdown + RSI Momentum
+        if current_low < day_low:
+            # RSI Confirmation: RSI should be falling (e.g., < 50) but not extremely oversold yet (< 20)
+            if 20 < rsi < 50:
+                return 'SELL'
         
         return None
     
     def update_trailing_stop(self, current_price, current_day_high, current_day_low):
+        """
+        Update trailing stop loss based on day high/low
+        """
         if self.current_position == 'long':
+            # Trailing stop: 1% down from day high
             new_trailing = current_day_high * (1 - self.trailing_stop_pct)
             if self.trailing_stop is None or new_trailing > self.trailing_stop:
                 self.trailing_stop = new_trailing
+        
         elif self.current_position == 'short':
+            # Trailing stop: 1% up from day low
             new_trailing = current_day_low * (1 + self.trailing_stop_pct)
             if self.trailing_stop is None or new_trailing < self.trailing_stop:
                 self.trailing_stop = new_trailing
     
+    def check_exit_conditions(self, current_price, current_day_high, current_day_low):
+        """
+        Check exit conditions (Stage C)
+        Returns: (should_exit, reason)
+        """
+        if not self.current_position:
+            return False, None
+        
+        # Update trailing stop
+        self.update_trailing_stop(current_price, current_day_high, current_day_low)
+        
+        if self.current_position == 'long':
+            # Check target
+            if current_price >= self.target:
+                return True, "Target hit"
+            
+            # Check stop loss
+            if current_price <= self.stop_loss:
+                return True, "Stop loss hit"
+            
+            # Check trailing stop
+            if self.trailing_stop and current_price <= self.trailing_stop:
+                return True, "Trailing stop hit"
+        
+        elif self.current_position == 'short':
+            # Check target
+            if current_price <= self.target:
+                return True, "Target hit"
+            
+            # Check stop loss
+            if current_price >= self.stop_loss:
+                return True, "Stop loss hit"
+            
+            # Check trailing stop
+            if self.trailing_stop and current_price >= self.trailing_stop:
+                return True, "Trailing stop hit"
+        
+        return False, None
+    
     def enter_position(self, signal_type, entry_price, day_high, day_low, quantity, symbol):
+        """
+        Enter a position
+        """
         self.current_position = 'long' if signal_type == 'BUY' else 'short'
         self.entry_price = entry_price
         self.position_size = quantity
         self.day_high = day_high
         self.day_low = day_low
-        self.position_symbol = symbol
         self.trailing_stop = None
+        self.position_symbol = symbol
         
         if self.current_position == 'long':
-            stop_loss_val = entry_price * (1 - self.stop_loss_pct)
-            self.stop_loss = max(stop_loss_val, day_low)
+            # Stop loss: max of 1% or day low
+            stop_loss_pct = entry_price * (1 - self.stop_loss_pct)
+            self.stop_loss = max(stop_loss_pct, day_low)
+            
+            # Target: 3%
             self.target = entry_price * (1 + self.target_pct)
-        else:
-            stop_loss_val = entry_price * (1 + self.stop_loss_pct)
-            self.stop_loss = min(stop_loss_val, day_high)
+        
+        else:  # short
+            # Stop loss: min of 1% or day high
+            stop_loss_pct = entry_price * (1 + self.stop_loss_pct)
+            self.stop_loss = min(stop_loss_pct, day_high)
+            
+            # Target: 3%
             self.target = entry_price * (1 - self.target_pct)
+    
+    def exit_position(self):
+        """
+        Exit current position
+        """
+        self.current_position = None
+        self.entry_price = None
+        self.position_size = 0
+        self.stop_loss = None
+        self.target = None
+        self.trailing_stop = None
+        self.position_symbol = None
 
-# --- Helper Functions ---
-
-@st.cache_data
 def get_fno_stocks_list():
     """
-    Tries to load stocks from 'NSE_Equity.csv'. 
-    Falls back to a default list if the file is missing.
+    Get list of FnO stocks from CSV
     """
-    default_list = [
-        'RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'ICICIBANK', 'SBIN', 'BHARTIARTL', 
-        'KOTAKBANK', 'LT', 'AXISBANK', 'ITC', 'BAJFINANCE', 'MARUTI', 'TATAMOTORS'
-    ]
-    
-    csv_path = 'NSE_Equity.csv'
-    
-    if os.path.exists(csv_path):
-        try:
-            df = pd.read_csv(csv_path)
-            # Normalize column names to handle variations like 'Symbol', 'symbol', 'TRADINGSYMBOL'
-            df.columns = [c.strip().lower() for c in df.columns]
+    try:
+        # Load from CSV
+        equity_df = load_nse_equity_data()
+        if equity_df is not None:
+            # Try to identify symbol column
+            possible_cols = ['Symbol', 'Tradingsymbol', 'Trading Symbol', 'symbol', 'tradingsymbol']
+            symbol_col = None
             
-            # Look for a valid symbol column
-            target_col = None
-            for col in ['symbol', 'tradingsymbol', 'trading symbol']:
-                if col in df.columns:
-                    target_col = col
+            for col in possible_cols:
+                if col in equity_df.columns:
+                    symbol_col = col
                     break
             
-            if target_col:
-                # Return the top 50 to avoid hitting API rate limits during scanning
-                return df[target_col].dropna().unique().tolist()[:50]
-        except Exception as e:
-            logging.error(f"Error reading CSV: {e}")
-    
-    return default_list
+            if symbol_col:
+                # Get unique symbols, limit to first 50 for performance
+                fno_stocks = equity_df[symbol_col].dropna().unique().tolist()[:50]
+                return fno_stocks
+        
+        # Fallback to sample FnO stocks
+        fno_stocks = [
+            'RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'ICICIBANK',
+            'SBIN', 'BHARTIARTL', 'ITC', 'HINDUNILVR', 'LT',
+            'AXISBANK', 'KOTAKBANK', 'BAJFINANCE', 'ASIANPAINT', 'MARUTI'
+        ]
+        return fno_stocks
+    except Exception as e:
+        logging.error(f"Error loading FnO stocks: {e}")
+        # Return sample list as fallback
+        return ['RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'ICICIBANK']
+
+def load_nse_equity_data():
+    """Load NSE Equity CSV file with ISIN data"""
+    try:
+        equity_df = pd.read_csv('NSE_Equity.csv')
+        return equity_df
+    except Exception as e:
+        logging.error(f"Error loading NSE_Equity.csv: {e}")
+        return None
 
 def get_token_from_isin(api, symbol, exchange="NSE"):
+    """Get token for the symbol using ISIN from CSV"""
     try:
-        # Optimization: Just use searchscrip directly
+        # First try to load from CSV
+        equity_df = load_nse_equity_data()
+        
+        if equity_df is not None:
+            # Search for symbol in CSV
+            possible_cols = ['Symbol', 'Tradingsymbol', 'Trading Symbol', 'symbol', 'tradingsymbol']
+            symbol_col = None
+            
+            for col in possible_cols:
+                if col in equity_df.columns:
+                    symbol_col = col
+                    break
+            
+            if symbol_col:
+                # Find the row with matching symbol
+                mask = equity_df[symbol_col].str.upper() == symbol.upper()
+                if mask.any():
+                    row = equity_df[mask].iloc[0]
+                    
+                    # Check for ISIN column
+                    isin_cols = ['ISIN', 'Isin', 'isin']
+                    isin = None
+                    for col in isin_cols:
+                        if col in equity_df.columns:
+                            isin = row[col]
+                            break
+                    
+                    # Check for Token column (if available)
+                    token_cols = ['Token', 'token', 'ScripCode', 'token_number']
+                    for col in token_cols:
+                        if col in equity_df.columns and pd.notna(row[col]):
+                            return str(row[col])
+                    
+                    # If ISIN is available, search using it
+                    if isin and pd.notna(isin):
+                        result = api.searchscrip(exchange=exchange, searchtext=isin)
+                        if result and 'values' in result and len(result['values']) > 0:
+                            return result['values'][0].get('token')
+        
+        # Fallback: Search directly using symbol
         result = api.searchscrip(exchange=exchange, searchtext=symbol)
-        if result and 'values' in result:
+        if result and 'values' in result and len(result['values']) > 0:
             for item in result['values']:
                 if item.get('tsym') == f"{symbol}-EQ":
                     return item.get('token')
+            return result['values'][0].get('token')
+        
         return None
-    except:
+    except Exception as e:
+        logging.error(f"Error getting token for {symbol}: {e}")
         return None
 
-def load_market_data(api, symbol, exchange="NSE", days=5):
+def load_market_data(api, symbol, exchange="NSE"):
+    """Load real market data from Flattrade API"""
     try:
         token = get_token_from_isin(api, symbol, exchange)
-        if not token: return None
+        if not token:
+            logging.error(f"Could not find token for {symbol}")
+            return None
         
+        # Fetch last 5 days
         end_date = datetime.now()
-        start_date = end_date - timedelta(days=days)
+        start_date = end_date - timedelta(days=5)
+        
         start_time = start_date.strftime("%d-%m-%Y") + " 09:15:00"
+        end_time = end_date.strftime("%d-%m-%Y") + " " + end_date.strftime("%H:%M:%S")
         
-        # Use simple end time
-        hist_data = api.get_time_price_series(exchange=exchange, token=token, starttime=start_time, interval='1')
+        hist_data = api.get_time_price_series(
+            exchange=exchange,
+            token=token,
+            starttime=start_time,
+            endtime=end_time,
+            interval='1'  # 1-minute interval
+        )
         
-        if not hist_data: return None
+        if not hist_data:
+            return None
         
-        df = pd.DataFrame(hist_data)
-        df['Date'] = pd.to_datetime(df['time'], format='%d-%m-%Y %H:%M:%S')
-        df = df.rename(columns={'into':'Open','inth':'High','intl':'Low','intc':'Close','intv':'Volume'})
-        df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']].astype({'Open':float, 'High':float, 'Low':float, 'Close':float, 'Volume':int})
+        data_list = []
+        for item in hist_data:
+            data_list.append({
+                'Date': pd.to_datetime(item['time'], format='%d-%m-%Y %H:%M:%S'),
+                'Open': float(item['into']),
+                'High': float(item['inth']),
+                'Low': float(item['intl']),
+                'Close': float(item['intc']),
+                'Volume': int(item.get('intv', 0))
+            })
+        
+        if not data_list:
+            return None
+        
+        df = pd.DataFrame(data_list)
         df.set_index('Date', inplace=True)
-        return df.sort_index()
+        df = df.sort_index()
+        
+        return df
+        
     except Exception as e:
+        logging.error(f"Error loading data for {symbol}: {e}")
+        return None
+
+def get_live_price(api, symbol, exchange="NSE"):
+    """Get current live price"""
+    try:
+        token = get_token_from_isin(api, symbol, exchange)
+        if not token:
+            return None
+        
+        live_data = api.get_quotes(exchange=exchange, token=token)
+        if live_data and live_data.get('stat') == 'Ok':
+            return float(live_data.get('lp', 0))
+        
+        return None
+    except Exception as e:
+        logging.error(f"Error getting live price for {symbol}: {e}")
         return None
 
 def execute_trade(api, signal_type, quantity, symbol, product_type='C'):
+    """Execute trade through Flattrade API"""
     try:
         buy_or_sell = 'B' if signal_type == 'BUY' else 'S'
-        return api.place_order(buy_or_sell=buy_or_sell, product_type=product_type, exchange='NSE',
-                             tradingsymbol=f"{symbol}-EQ", quantity=quantity, discloseqty=0,
-                             price_type='MKT', retention='DAY')
+        
+        result = api.place_order(
+            buy_or_sell=buy_or_sell,
+            product_type=product_type,
+            exchange='NSE',
+            tradingsymbol=f"{symbol}-EQ",
+            quantity=quantity,
+            discloseqty=0,
+            price_type='MKT',
+            retention='DAY'
+        )
+        
+        return result
     except Exception as e:
         logging.error(f"Error executing trade: {e}")
         return None
-
+    
 def check_and_sync_positions(api, strategy):
-    """Syncs API positions with Strategy State"""
     try:
         positions = api.get_positions()
-        if positions:
+        if positions and len(positions) > 0:
             for pos in positions:
                 netqty = int(pos.get('netqty', 0))
                 if netqty != 0:
                     symbol = pos.get('tsym', '').replace('-EQ', '')
                     avg_price = float(pos.get('netavgprc', 0))
+                    product_type = pos.get('prd', 'C') 
+                    
+                    position_type = 'long' if netqty > 0 else 'short'
                     
                     if strategy.position_symbol != symbol:
-                        # Logic to restore state from an existing position
-                        strategy.position_symbol = symbol
-                        strategy.current_position = 'long' if netqty > 0 else 'short'
-                        strategy.entry_price = avg_price
-                        strategy.position_size = abs(netqty)
-                        
-                        # Set default stops since we missed the entry
-                        if strategy.current_position == 'long':
-                            strategy.target = avg_price * 1.03
-                            strategy.stop_loss = avg_price * 0.99
-                        else:
-                            strategy.target = avg_price * 0.97
-                            strategy.stop_loss = avg_price * 1.01
-                    return
-        # If loop finishes and no active position found
-        strategy.current_position = None
-        strategy.position_symbol = None
-    except:
-        pass
+                        st.warning(f"⚠️ Detected existing {position_type.upper()} position in {symbol} ({product_type})")                        
+                        # Load data to get day high/low
+                        df = load_market_data(api, symbol)
+                        if df is not None and len(df) > 0:
+                            today_data = df[df.index.date == datetime.now().date()]
+                            if len(today_data) > 0:
+                                day_high = today_data['High'].max()
+                                day_low = today_data['Low'].min()
+                                
+                                # Set position in strategy
+                                strategy.position_symbol = symbol
+                                strategy.product_type = product_type
+                                strategy.current_position = position_type
+                                strategy.entry_price = avg_price
+                                strategy.position_size = abs(netqty)
+                                        
+                                # Set stop loss and target
+                                if position_type == 'long':
+                                    stop_loss_pct = avg_price * (1 - strategy.stop_loss_pct)
+                                    strategy.stop_loss = max(stop_loss_pct, day_low)
+                                    strategy.target = avg_price * (1 + strategy.target_pct)
+                                else:
+                                    stop_loss_pct = avg_price * (1 + strategy.stop_loss_pct)
+                                    strategy.stop_loss = min(stop_loss_pct, day_high)
+                                    strategy.target = avg_price * (1 - strategy.target_pct)
+                                
+                                st.success(f"✅ Position synced: {symbol} - {position_type.upper()} - Type: {product_type}")
+                    
+                    return True, {
+                        'symbol': symbol,
+                        'type': position_type,
+                        'qty': abs(netqty),
+                        'avg_price': avg_price
+                    }
+        return False, None
+    except Exception as e:
+        logging.error(f"Error checking positions: {e}")
+        return False, None
 
-# --- Optimized Parallel Scanner ---
-
-def scan_single_stock(api, symbol, rvol_threshold, ma_window, min_consecutive):
-    """Worker function for threading"""
+def get_top_losers(api, limit=5):
+    """
+    Get Top 5 Losers from the FNO list
+    """
     try:
-        df = load_market_data(api, symbol, days=2) # Only need 2 days for scanning
-        if df is None or len(df) == 0: return None
+        # Reuse the existing list logic
+        stock_list = get_fno_stocks_list()[:30] 
         
-        current_date = datetime.now().date()
-        today_df = df[df.index.date == current_date]
+        losers_data = []
         
-        if len(today_df) < ma_window: return None
+        for symbol in stock_list:
+            token = get_token_from_isin(api, symbol)
+            if token:
+                quote = api.get_quotes(exchange='NSE', token=token)
+                if quote and quote.get('stat') == 'Ok':
+                    lp = float(quote.get('lp', 0))
+                    prev_close = float(quote.get('c', 0))
+                    
+                    if prev_close > 0:
+                        p_change = ((lp - prev_close) / prev_close) * 100
+                        
+                        # Only add negative changes (Losers)
+                        if p_change < 0:
+                            losers_data.append({
+                                'Symbol': symbol,
+                                'LTP': f"₹{lp:.2f}",
+                                'Change': p_change
+                            })
         
-        # RVOL Logic
-        vol_ma = today_df['Volume'].rolling(window=ma_window, min_periods=ma_window).mean()
-        heavy_mask = today_df['Volume'] > (rvol_threshold * vol_ma)
+        # Sort by Change ascending
+        losers_data.sort(key=lambda x: x['Change'])
         
-        # Calculate max consecutive streak
-        longest = 0
-        curr = 0
-        for is_heavy in heavy_mask.fillna(False):
-            if is_heavy:
-                curr += 1
-                longest = max(longest, curr)
-            else:
-                curr = 0
-                
-        if longest >= min_consecutive:
-            last_row = today_df.iloc[-1]
-            last_ma = vol_ma.iloc[-1]
-            rvol = (last_row['Volume'] / last_ma) if last_ma > 0 else 0
+        # Return top N and format Change for display
+        top_losers = losers_data[:limit]
+        for item in top_losers:
+            item['Change'] = f"{item['Change']:.2f}%"
             
-            open_p = today_df['Open'].iloc[0]
-            ltp = last_row['Close']
-            chg = ((ltp - open_p) / open_p) * 100
-            
-            return {
-                'Symbol': symbol,
-                'LTP': ltp,
-                'Change': chg,
-                'RVOL': rvol,
-                'Streak': longest,
-                'TotalVol': int(today_df['Volume'].sum()),
-                'Bias': 'BUY' if chg >= 0 else 'SELL'
-            }
-    except Exception:
-        return None
-
-def get_heavy_volume_stocks_threaded(api, rvol_threshold=3.0, ma_window=20, min_consecutive=10, limit=10):
-    stock_list = get_fno_stocks_list()
-    results = []
-    
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        # Submit all tasks
-        futures = {executor.submit(scan_single_stock, api, sym, rvol_threshold, ma_window, min_consecutive): sym for sym in stock_list}
+        return top_losers
         
-        for future in as_completed(futures):
-            res = future.result()
-            if res:
-                results.append(res)
+    except Exception as e:
+        logging.error(f"Error fetching top losers: {e}")
+        return []
+
+def get_top_gainers(api, limit=10):
+    """
+    Get Top 5 Gainers from the FNO list
+    """
+    try:
+        stock_list = get_fno_stocks_list()[:30] 
+        gainers_data = []
+        
+        for symbol in stock_list:
+            token = get_token_from_isin(api, symbol)
+            if token:
+                quote = api.get_quotes(exchange='NSE', token=token)
+                if quote and quote.get('stat') == 'Ok':
+                    lp = float(quote.get('lp', 0)) # Last Price
+                    prev_close = float(quote.get('c', 0)) # Previous Close
+                    
+                    if prev_close > 0:
+                        p_change = ((lp - prev_close) / prev_close) * 100
+                        
+                        # Only add positive gainers
+                        if p_change > 0:
+                            gainers_data.append({
+                                'Symbol': symbol,
+                                'LTP': f"₹{lp:.2f}",
+                                'Change': p_change
+                            })
+        
+        # Sort by Change % descending
+        gainers_data.sort(key=lambda x: x['Change'], reverse=True)
+        
+        # Return top N and format Change for display
+        top_gainers = gainers_data[:limit]
+        for item in top_gainers:
+            item['Change'] = f"+{item['Change']:.2f}%"
+            
+        return top_gainers
+        
+    except Exception as e:
+        logging.error(f"Error fetching top gainers: {e}")
+        return []
     
-    results.sort(key=lambda x: (x['RVOL'], x['Streak']), reverse=True)
-    return results[:limit]
-
-# --- Charting ---
-
-def create_chart(df, entry=None, sl=None, tgt=None, trail=None):
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                        subplot_titles=('Price', 'Volume'), 
-                        row_heights=[0.7, 0.3], vertical_spacing=0.05)
+def create_chart(df, entry_point=None, stop_loss=None, target=None, trailing_stop=None, signals_df=None):
+    """Create candlestick chart with levels and signals"""
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.1,
+                        subplot_titles=('Price & Trading Levels', 'Volume'),
+                        row_heights=[0.8, 0.2])
     
     # Candlestick
-    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'],
-                                low=df['Low'], close=df['Close'], name='Price'), row=1, col=1)
+    fig.add_trace(go.Candlestick(x=df.index,
+                                open=df['Open'],
+                                high=df['High'],
+                                low=df['Low'],
+                                close=df['Close'],
+                                name='Price'), row=1, col=1)
     
-    # Volume
-    colors = ['red' if r['Open'] > r['Close'] else 'green' for i, r in df.iterrows()]
-    fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='Volume', marker_color=colors), row=2, col=1)
+    # Volume bars
+    colors = ['red' if df['Close'].iloc[i] < df['Open'].iloc[i] else 'green' 
+              for i in range(len(df))]
+    fig.add_trace(go.Bar(x=df.index, y=df['Volume'],
+                        name='Volume',
+                        marker_color=colors), row=2, col=1)
     
-    # Lines
-    if entry: fig.add_hline(y=entry, line_dash="dash", line_color="blue", annotation_text="Entry", row=1, col=1)
-    if sl: fig.add_hline(y=sl, line_dash="solid", line_color="red", annotation_text="SL", row=1, col=1)
-    if tgt: fig.add_hline(y=tgt, line_dash="solid", line_color="green", annotation_text="TGT", row=1, col=1)
-    if trail: fig.add_hline(y=trail, line_dash="dot", line_color="orange", annotation_text="Trail", row=1, col=1)
+    # Add entry/exit levels if position exists
+    if entry_point:
+        fig.add_hline(y=entry_point, line_dash="dash", line_color="blue",
+                     annotation_text="Entry", row=1, col=1)
+    if stop_loss:
+        fig.add_hline(y=stop_loss, line_dash="dash", line_color="red",
+                     annotation_text="Stop Loss", row=1, col=1)
+    if target:
+        fig.add_hline(y=target, line_dash="dash", line_color="green",
+                     annotation_text="Target", row=1, col=1)
+    if trailing_stop:
+        fig.add_hline(y=trailing_stop, line_dash="dot", line_color="orange",
+                     annotation_text="Trailing Stop", row=1, col=1)
     
-    fig.update_layout(xaxis_rangeslider_visible=False, height=500, margin=dict(l=10, r=10, t=30, b=10))
+    # Add buy/sell signals if provided
+    if signals_df is not None and len(signals_df) > 0:
+        buy_signals = signals_df[signals_df['Signal'] == 'BUY']
+        sell_signals = signals_df[signals_df['Signal'] == 'SELL']
+        
+        if len(buy_signals) > 0:
+            fig.add_trace(go.Scatter(x=buy_signals['Time'], y=buy_signals['Price'],
+                                   mode='markers', name='Buy Signal',
+                                   marker=dict(color='green', size=10, symbol='triangle-up')),
+                         row=1, col=1)
+        
+        if len(sell_signals) > 0:
+            fig.add_trace(go.Scatter(x=sell_signals['Time'], y=sell_signals['Price'],
+                                   mode='markers', name='Sell Signal',
+                                   marker=dict(color='red', size=10, symbol='triangle-down')),
+                         row=1, col=1)
+    
+    fig.update_layout(title='FnO Breakout Trading Strategy - Live Data',
+                     xaxis_rangeslider_visible=False,
+                     height=800)
+    
     return fig
 
-# --- MAIN APP ---
-
 def main():
-    st.set_page_config(page_title="FnO Scanner Pro", layout="wide", initial_sidebar_state="expanded")
+    st.set_page_config(page_title="FnO Breakout Trading App (Enhanced)", layout="wide")
     
-    api = init_flattrade_api()
-    if not api: return
-
-    if 'strategy' not in st.session_state: 
-        st.session_state.strategy = FnOBreakoutStrategy()
-    strategy = st.session_state.strategy
+    st.title("⚡ FnO Breakout Trading Strategy App (Enhanced Logic)")
     
-    # --- Sidebar ---
-    with st.sidebar:
-        st.header("⚙️ Configuration")
-        
-        with st.expander("Strategy Settings", expanded=True):
-            stop_loss_pct = st.slider("Stop Loss (%)", 0.1, 5.0, 1.0, 0.1)
-            target_pct = st.slider("Target (%)", 0.1, 10.0, 3.0, 0.1)
-            trailing_stop_pct = st.slider("Trailing Stop (%)", 0.5, 3.0, 1.0, 0.1)
-            
-            # Update strategy object
-            strategy.stop_loss_pct = stop_loss_pct / 100
-            strategy.target_pct = target_pct / 100
-            strategy.trailing_stop_pct = trailing_stop_pct / 100
-            
-        with st.expander("Scanner Settings"):
-            rvol_thresh = st.slider("Min RVOL", 1.5, 10.0, 3.0)
-            min_cons = st.slider("Min Streak (Min)", 5, 60, 10)
-            
-        with st.expander("Execution"):
-            auto_trading = st.toggle("Enable Auto Trading", False)
-            qty = st.number_input("Quantity", 1, 1000, 1)
-            
-        if st.button("🚀 Run Scanner", type="primary"):
-            st.session_state.run_scanning = True
-
-    # --- Header ---
-    st.title("⚡ FnO Volatility Breakout")
-    
-    # Limits Check
+    # Initialize connections
     try:
-        limits = api.get_limits()
-        if limits and limits.get('stat') == 'Ok':
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Cash Available", f"₹{float(limits.get('cash', 0)):,.2f}")
-            c2.metric("Margin Used", f"₹{float(limits.get('marginused', 0)):,.2f}")
-            c3.metric("API Status", "🟢 Online")
-    except:
-        st.warning("Could not fetch limits.")
-
-    # --- Sync & Date Reset ---
-    current_date = datetime.now().date()
-    strategy.reset_daily_data(current_date)
-    check_and_sync_positions(api, strategy)
-
-    # --- Scanning Logic ---
-    if st.session_state.get('run_scanning'):
-        with st.spinner("Scanning Market (Parallel)..."):
-            heavy_results = get_heavy_volume_stocks_threaded(api, rvol_thresh, 20, min_cons)
+        supabase = init_supabase()
+        api = init_flattrade_api()
+        
+        # Initialize strategy in session state
+        if 'strategy' not in st.session_state:
+            st.session_state.strategy = FnOBreakoutStrategy()
+        
+        strategy = st.session_state.strategy
+        
+        # Test API connection
+        try:
+            api_status = api.get_limits()
+            if api_status and api_status.get('stat') != 'Ok':
+                st.error("Failed to connect to Flattrade API. Please check credentials.")
+                return
+        except Exception as e:
+            st.error(f"API connection failed: {e}")
+            return
             
-            strategy.screened_stocks = [x['Symbol'] for x in heavy_results]
-            strategy.stock_bias = {x['Symbol']: x['Bias'] for x in heavy_results}
-            st.session_state.heavy_results = {x['Symbol']: x for x in heavy_results}
-            
-            st.session_state.run_scanning = False
-            if not heavy_results:
-                st.toast("No stocks found matching criteria.")
-
-    # --- Layout ---
-    col_dash, col_chart = st.columns([1, 2])
+    except Exception as e:
+        st.error(f"Error initializing APIs: {e}")
+        return
     
-    with col_dash:
-        st.subheader("📡 Watchlist")
-        if strategy.screened_stocks:
-            res_list = list(st.session_state.heavy_results.values())
-            st.dataframe(pd.DataFrame(res_list)[['Symbol', 'Bias', 'LTP', 'RVOL']], hide_index=True)
+    # Sidebar for controls
+    with st.sidebar:
+        st.title("🚀 Market Movers")
+        
+        # Create tabs for cleaner UI
+        tab1, tab2 = st.tabs(["📈 Gainers", "📉 Losers"])
+        
+        # Button to refresh both
+        if st.button("🔄 Refresh Market Data"):
+            st.session_state.gainers = get_top_gainers(api)
+            st.session_state.losers = get_top_losers(api)
+            
+        # Initialize session state if empty
+        if 'gainers' not in st.session_state:
+            st.session_state.gainers = get_top_gainers(api)
+        if 'losers' not in st.session_state:
+            st.session_state.losers = get_top_losers(api)
+            
+        # --- Gainers Tab ---
+        with tab1:
+            if st.session_state.gainers:
+                st.dataframe(
+                    pd.DataFrame(st.session_state.gainers), 
+                    hide_index=True, 
+                    use_container_width=True,
+                    column_config={
+                        "Symbol": "Stock",
+                        "LTP": "Price",
+                        "Change": "Change %"
+                    }
+                )
+            else:
+                st.info("No gainers found")
+
+        # --- Losers Tab ---
+        with tab2:
+            if st.session_state.losers:
+                st.dataframe(
+                    pd.DataFrame(st.session_state.losers), 
+                    hide_index=True, 
+                    use_container_width=True,
+                    column_config={
+                        "Symbol": "Stock",
+                        "LTP": "Price",
+                        "Change": "Change %"
+                    }
+                )
+            else:
+                st.info("No losers found")
+            
+        st.markdown("---")
+        
+        st.header("Trading Controls")
+        
+        # Trading parameters
+        st.subheader("Strategy Parameters")
+        stop_loss_pct = st.slider("Stop Loss (%)", 0.1, 2.0, 0.1, 0.1)
+        target_pct = st.slider("Target (%)", 0.1, 5.0, 0.1, 0.1)
+        trailing_stop_pct = st.slider("Trailing Stop (%)", 0.5, 2.0, 1.0, 0.1)
+        
+        strategy.stop_loss_pct = stop_loss_pct / 100
+        strategy.target_pct = target_pct / 100
+        strategy.trailing_stop_pct = trailing_stop_pct / 100
+        
+        # Position sizing
+        st.subheader("Position Sizing")
+        sizing_mode = st.radio("Quantity Mode", ["Fixed Quantity", "Fixed Amount"])
+        
+        if sizing_mode == "Fixed Quantity":
+            quantity = st.number_input("Quantity", min_value=1, value=1)
+            trade_amount = None
         else:
-            st.info("Scanner results will appear here.")
-            
-        st.subheader("📍 Active Position")
-        if strategy.current_position:
-            pos_df = pd.DataFrame([{
-                'Symbol': strategy.position_symbol,
-                'Type': strategy.current_position.upper(),
-                'Entry': strategy.entry_price,
-                'Target': f"{strategy.target:.2f}",
-                'SL': f"{strategy.stop_loss:.2f}"
-            }])
-            st.dataframe(pos_df, hide_index=True)
-            
-            # Manual Exit Button
-            if st.button("🚨 Emergency Exit"):
-                # Simplified Exit Logic
-                try:
-                    positions = api.get_positions()
-                    for p in positions:
-                        if p['tsym'] == f"{strategy.position_symbol}-EQ" and int(p['netqty']) != 0:
-                            qty_exit = abs(int(p['netqty']))
-                            side = 'S' if int(p['netqty']) > 0 else 'B'
-                            api.place_order(buy_or_sell=side, product_type='C', exchange='NSE',
-                                          tradingsymbol=p['tsym'], quantity=qty_exit, discloseqty=0,
-                                          price_type='MKT', retention='DAY')
-                            st.success("Exit Order Placed")
-                            time_module.sleep(1)
-                            st.rerun()
-                except Exception as e:
-                    st.error(f"Exit failed: {e}")
-
-    with col_chart:
-        sel_stock = None
-        if strategy.current_position:
-            sel_stock = strategy.position_symbol
-        elif strategy.screened_stocks:
-            sel_stock = st.selectbox("View Chart", strategy.screened_stocks)
-            
-        if sel_stock:
-            df = load_market_data(api, sel_stock)
-            if df is not None:
-                # Live Check Logic
-                curr_candle = df.iloc[-1]
-                day_h = df[df.index.date == current_date]['High'].max()
-                day_l = df[df.index.date == current_date]['Low'].min()
-                
-                # Check Signal
-                if not strategy.current_position:
-                    sig = strategy.check_breakout_entry(df, curr_candle, day_h, day_l, sel_stock)
-                    if sig:
-                        st.toast(f"SIGNAL: {sig} on {sel_stock}", icon="🔥")
-                        if auto_trading:
-                            resp = execute_trade(api, sig, qty, sel_stock)
-                            if resp and resp.get('stat') == 'Ok':
-                                strategy.enter_position(sig, curr_candle['Close'], day_h, day_l, qty, sel_stock)
-                                st.rerun()
-                
-                # Check Exit
-                elif strategy.current_position:
-                    ltp = curr_candle['Close']
-                    strategy.update_trailing_stop(ltp, day_h, day_l)
-                    
-                    exit_needed = False
-                    if strategy.current_position == 'long':
-                        if ltp >= strategy.target or ltp <= strategy.stop_loss: exit_needed = True
-                        if strategy.trailing_stop and ltp <= strategy.trailing_stop: exit_needed = True
+            trade_amount = st.number_input("Trade Amount (₹)", min_value=1000, value=10000, step=1000)
+            quantity = None
+        
+        # Scanning options
+        st.subheader("📊 Scanning Options")
+        
+        # Number of stocks to scan
+        num_stocks_to_scan = st.number_input("Number of Stocks to Scan", min_value=5, max_value=250, value=20, step=5)
+        
+        # Continuous scanning toggle
+        continuous_scan = st.toggle("Continuous Scanning", False)
+        
+        if continuous_scan:
+            scan_interval = st.slider("Scan Interval (seconds)", 30, 300, 60, 30)
+        
+        # Manual scan button
+        if st.button("🔍 Run Enhanced Screening", type="primary"):
+            st.session_state.run_screening = True
+        
+        # Auto-trading toggle
+        auto_trading = st.toggle("Enable Auto Trading", False)
+        
+        # Manual trade buttons section
+        st.subheader("Manual Trading")
+        
+        # Show dropdown only if stocks are screened
+        if len(strategy.screened_stocks) > 0:
+            manual_trade_symbol = st.selectbox("Select Stock", strategy.screened_stocks, key="manual_trade_stock")
+        else:
+            manual_trade_symbol = None
+            st.info("Run screening first")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("🔴 Manual Sell", type="secondary", disabled=(strategy.current_position is not None or manual_trade_symbol is None)):
+                if auto_trading and manual_trade_symbol:
+                    # Calculate quantity if using amount mode
+                    if sizing_mode == "Fixed Amount":
+                        live_price = get_live_price(api, manual_trade_symbol)
+                        if live_price:
+                            calc_quantity = int(trade_amount / live_price)
+                        else:
+                            st.error("Could not get live price")
+                            calc_quantity = None
                     else:
-                        if ltp <= strategy.target or ltp >= strategy.stop_loss: exit_needed = True
-                        if strategy.trailing_stop and ltp >= strategy.trailing_stop: exit_needed = True
-                        
-                    if exit_needed and auto_trading:
-                        # Perform Exit
-                        st.toast(f"Auto-Exiting {sel_stock}")
-                        # (Reuse exit logic or call specific function)
+                        calc_quantity = quantity
+                    
+                    if calc_quantity:
+                        result = execute_trade(api, 'SELL', calc_quantity, manual_trade_symbol)
+                        if result and result.get('stat') == 'Ok':
+                            live_price = get_live_price(api, manual_trade_symbol)
+                            df = load_market_data(api, manual_trade_symbol)
+                            if df is not None and len(df) > 0:
+                                today_data = df[df.index.date == datetime.now().date()]
+                                day_high = today_data['High'].max()
+                                day_low = today_data['Low'].min()
+                                current_price = live_price if live_price else df['Close'].iloc[-1]
+                                strategy.enter_position('SELL', current_price, day_high, day_low, calc_quantity, manual_trade_symbol)
+                            st.success(f"Sell order placed: {result.get('norenordno')}")
+                        else:
+                            st.error("Failed to place sell order")
+                else:
+                    st.warning("Enable auto-trading first")
+        
+        with col2:
+            if st.button("🟢 Manual Buy", type="primary", disabled=(strategy.current_position is not None or manual_trade_symbol is None)):
+                if auto_trading and manual_trade_symbol:
+                    # Calculate quantity if using amount mode
+                    if sizing_mode == "Fixed Amount":
+                        live_price = get_live_price(api, manual_trade_symbol)
+                        if live_price:
+                            calc_quantity = int(trade_amount / live_price)
+                        else:
+                            st.error("Could not get live price")
+                            calc_quantity = None
+                    else:
+                        calc_quantity = quantity
+                    
+                    if calc_quantity:
+                        result = execute_trade(api, 'BUY', calc_quantity, manual_trade_symbol)
+                        if result and result.get('stat') == 'Ok':
+                            live_price = get_live_price(api, manual_trade_symbol)
+                            df = load_market_data(api, manual_trade_symbol)
+                            if df is not None and len(df) > 0:
+                                today_data = df[df.index.date == datetime.now().date()]
+                                day_high = today_data['High'].max()
+                                day_low = today_data['Low'].min()
+                                current_price = live_price if live_price else df['Close'].iloc[-1]
+                                strategy.enter_position('BUY', current_price, day_high, day_low, calc_quantity, manual_trade_symbol)
+                            st.success(f"Buy order placed: {result.get('norenordno')}")
+                        else:
+                            st.error("Failed to place buy order")
+                else:
+                    st.warning("Enable auto-trading first")
+        
+        # Close position button
+        if strategy.current_position:
+            if st.button("❌ Close Position", type="secondary"):
+                if auto_trading:
+                    exit_signal = 'SELL' if strategy.current_position == 'long' else 'BUY'
+                    # Use the tracked position symbol
+                    close_symbol = strategy.position_symbol
+                    if close_symbol:
+                        result = execute_trade(api, exit_signal, strategy.position_size, close_symbol, product_type=strategy.product_type)
+                        if result and result.get('stat') == 'Ok':
+                            strategy.exit_position()
+                            st.success("✅ Position closed!")
+                            st.rerun()
+                        else:
+                            st.error("Failed to close position")
+                else:
+                    st.warning("Enable auto-trading first")
+    
+    # Main content area
+    current_date = datetime.now().date()
+    current_time = datetime.now().time()
+    strategy.reset_daily_data(current_date)
+    
+    # Check for existing positions from API and sync
+    has_existing_position, position_details = check_and_sync_positions(api, strategy)
+    
+    if has_existing_position:
+        st.info(f"📍 Active Position Detected: {position_details['symbol']} - {position_details['type'].upper()} - Qty: {position_details['qty']}")
+    
+    # Check trading hours
+    if current_time < time(1, 15) or current_time > time(23, 30):
+        st.warning("⏰ Outside Trading Hours (9:15 AM - 3:30 PM)")
+    
+    # Screening Section - Only run if no open position
+    if 'run_screening' in st.session_state and st.session_state.run_screening:
+        if strategy.current_position:
+            st.warning("⚠️ Screening disabled - Close existing position first")
+            st.session_state.run_screening = False
+        else:
+            st.header("📋 Stage A: Stock Screening Results (Enhanced)")
+        
+        with st.spinner("Screening FnO stocks (Relaxed Criteria)..."):
+            stocks_to_screen = get_fno_stocks_list()[:num_stocks_to_scan]
+            
+            screening_results = []
+            
+            progress_bar = st.progress(0)
+            for idx, stock in enumerate(stocks_to_screen):
+                df = load_market_data(api, stock)
                 
-                # Plot
-                st.plotly_chart(create_chart(df.tail(60), strategy.entry_price, strategy.stop_loss, strategy.target, strategy.trailing_stop), use_container_width=True)
+                if df is not None and len(df) >= 300:
+                    passed, reason, metrics = strategy.screen_stock(df)
+                    
+                    result_data = {
+                        'Symbol': stock,
+                        'Status': '✅ Passed' if passed else '❌ Failed',
+                        'Reason': reason,
+                        'Current Price': f"₹{df['Close'].iloc[-1]:.2f}" if len(df) > 0 else 'N/A'
+                    }
+                    
+                    if metrics:
+                        result_data['Avg Vol (9:15-9:29)'] = f"{metrics['avg_vol_opening']:.0f}"
+                        result_data['Trade Value (Cr)'] = f"₹{metrics['trade_value']:.2f}"
+                    
+                    screening_results.append(result_data)
+                    
+                    if passed:
+                        strategy.screened_stocks.append(stock)
+                
+                progress_bar.progress((idx + 1) / len(stocks_to_screen))
+            
+            # Display results
+            if screening_results:
+                results_df = pd.DataFrame(screening_results)
+                st.dataframe(results_df, use_container_width=True)
+            
+            if len(strategy.screened_stocks) > 0:
+                st.success(f"✅ {len(strategy.screened_stocks)} stocks passed screening: {', '.join(strategy.screened_stocks)}")
+            else:
+                st.info("No stocks passed the screening criteria")
+        
+            st.session_state.run_screening = False
+    
+    # Continuous scanning - Only if no open position
+    if continuous_scan and len(strategy.screened_stocks) == 0 and not strategy.current_position:
+        st.info(f"🔄 Continuous scanning active - Running every {scan_interval} seconds")
+        time_module.sleep(scan_interval)
+        st.session_state.run_screening = True
+        st.rerun()
+    
+    # Trading Section
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.subheader("📈 Live Market Data & Signals")
+        
+        # If position exists, monitor that stock
+        if strategy.current_position and strategy.position_symbol:
+            st.info(f"🔒 Monitoring active position: {strategy.position_symbol}")
+            selected_stock = strategy.position_symbol
+            
+            # Also show screened stocks in sidebar info
+            if len(strategy.screened_stocks) > 0:
+                st.success(f"✅ {len(strategy.screened_stocks)} other stocks screened and ready: {', '.join(strategy.screened_stocks)}")
+        # Otherwise, select from screened stocks
+        elif len(strategy.screened_stocks) > 0:
+            selected_stock = st.selectbox("Select Screened Stock to Monitor", strategy.screened_stocks, key="monitor_stock")
+            st.session_state.selected_stock = selected_stock
+        else:
+            st.info("👆 Run screening to find trading opportunities")
+            selected_stock = None
+        
+        if selected_stock:
+            # Load and display market data
+            with st.spinner(f"Loading live market data for {selected_stock}..."):
+                df = load_market_data(api, selected_stock)
+            
+            if df is not None and len(df) > 0:
+                # Calculate day high/low
+                today_data = df[df.index.date == current_date]
+                
+                if len(today_data) > 0:
+                    day_high = today_data['High'].max()
+                    day_low = today_data['Low'].min()
+                    
+                    # Get opening period metrics
+                    avg_vol_opening, trade_value, big_body, opening_candle = strategy.calculate_opening_candle_metrics(df)
+                    
+                    if avg_vol_opening:
+                        strategy.avg_vol_opening = avg_vol_opening
+                    
+                    # Get current candle
+                    current_candle = {
+                        'Open': df['Open'].iloc[-1],
+                        'High': df['High'].iloc[-1],
+                        'Low': df['Low'].iloc[-1],
+                        'Close': df['Close'].iloc[-1],
+                        'Volume': df['Volume'].iloc[-1]
+                    }
+                    
+                    # Get live price
+                    live_price = get_live_price(api, selected_stock)
+                    current_price = live_price if live_price else current_candle['Close']
+                    
+                    # Display current signals
+                    signal_col1, signal_col2, signal_col3, signal_col4 = st.columns(4)
+                    
+                    with signal_col1:
+                        st.metric("Live Price", f"₹{current_price:.2f}")
+                    with signal_col2:
+                        st.metric("Day High", f"₹{day_high:.2f}")
+                    with signal_col3:
+                        st.metric("Day Low", f"₹{day_low:.2f}")
+                    with signal_col4:
+                        st.metric("Volume", f"{current_candle['Volume']:,}")
+                    
+                    # Check for entry signals if no position
+                    if not strategy.current_position and time(1, 30) <= current_time <= time(23, 20):
+                        # UPDATED: Use the new check_breakout_entry with dataframe for SMA calculation
+                        signal = strategy.check_breakout_entry(
+                            df, current_candle, day_high, day_low
+                        )
+                        
+                        if signal:
+                            if signal == 'BUY':
+                                st.success("🟢 BUY SIGNAL ACTIVE - Breakout + Vol + RSI!")
+                            else:
+                                st.error("🔴 SELL SIGNAL ACTIVE - Breakdown + Vol + RSI!")
+                            
+                            if auto_trading:
+                                # Calculate quantity based on mode
+                                if sizing_mode == "Fixed Amount":
+                                    calc_quantity = int(trade_amount / current_price)
+                                else:
+                                    calc_quantity = quantity
+                                
+                                result = execute_trade(api, signal, calc_quantity, selected_stock)
+                                if result and result.get('stat') == 'Ok':
+                                    strategy.enter_position(signal, current_price, day_high, day_low, calc_quantity, selected_stock)
+                                    st.success(f"✅ Auto {signal} Order Executed! Qty: {calc_quantity}")
+                                    st.rerun()
+                        else:
+                            st.info("⚪ No Entry Signal - Waiting for breakout & volume spike (1.5x SMA)")
+                    elif strategy.current_position:
+                        st.info(f"🔒 Position already open in {strategy.position_symbol} - Monitoring for exit")
+                    
+                    # Check for exit signals if position exists
+                    if strategy.current_position:
+                        should_exit, reason = strategy.check_exit_conditions(
+                            current_price, day_high, day_low
+                        )
+                        
+                        if should_exit:
+                            st.warning(f"⚠️ Exit Signal: {reason}")
+                            
+                            if auto_trading:
+                                exit_signal = 'SELL' if strategy.current_position == 'long' else 'BUY'
+                                
+                                result = execute_trade(
+                                    api, 
+                                    exit_signal, 
+                                    strategy.position_size, 
+                                    selected_stock, 
+                                    product_type=strategy.product_type 
+                                )
+                                
+                                if result and result.get('stat') == 'Ok':
+                                    strategy.exit_position()
+                                    st.success(f"✅ Position Closed: {reason}")
+                                    st.rerun()
+                                else:
+                                    st.error(f"Failed to close position. API Response: {result}")
+                                        
+                    # Create and display chart
+                    chart = create_chart(
+                        df.tail(100),
+                        strategy.entry_price,
+                        strategy.stop_loss,
+                        strategy.target,
+                        strategy.trailing_stop
+                    )
+                    st.plotly_chart(chart, use_container_width=True)
+                    
+                    # Display latest data
+                    st.subheader("📊 Latest OHLC Data")
+                    st.dataframe(df.tail(10), use_container_width=True)
+                
+                else:
+                    st.warning("No data available for today")
+            
+            else:
+                st.error(f"Failed to load market data for {selected_stock}")
+    
+    with col2:
+        st.subheader("📊 Position & Status")
+        
+        # Current position status
+        if strategy.current_position:
+            position_type = strategy.current_position.upper()
+            st.info(f"**Position:** {position_type}")
+            st.info(f"**Symbol:** {strategy.position_symbol}")
+            st.info(f"**Size:** {strategy.position_size}")
+            st.info(f"**Entry:** ₹{strategy.entry_price:.2f}")
+            
+            # Display stop loss and target
+            if strategy.stop_loss:
+                st.info(f"**Stop Loss:** ₹{strategy.stop_loss:.2f}")
+            if strategy.target:
+                st.info(f"**Target:** ₹{strategy.target:.2f}")
+            if strategy.trailing_stop:
+                st.info(f"**Trailing Stop:** ₹{strategy.trailing_stop:.2f}")
+            
+            # Calculate current P&L for the position symbol
+            if strategy.position_symbol:
+                live_price = get_live_price(api, strategy.position_symbol)
+                position_df = load_market_data(api, strategy.position_symbol)
+                
+                if position_df is not None and len(position_df) > 0:
+                    current_price = live_price if live_price else position_df['Close'].iloc[-1]
+                    
+                    if strategy.current_position == 'long':
+                        pnl = (current_price - strategy.entry_price) * strategy.position_size
+                        pnl_pct = ((current_price - strategy.entry_price) / strategy.entry_price) * 100
+                    else:
+                        pnl = (strategy.entry_price - current_price) * strategy.position_size
+                        pnl_pct = ((strategy.entry_price - current_price) / strategy.entry_price) * 100
+                    
+                    if pnl >= 0:
+                        st.success(f"**Current P&L:** +₹{pnl:.2f} ({pnl_pct:.2f}%)")
+                    else:
+                        st.error(f"**Current P&L:** ₹{pnl:.2f} ({pnl_pct:.2f}%)")
+        else:
+            st.info("No Open Position")
+        
+        # Account status
+        st.subheader("💰 Account Status")
+        try:
+            account_details = api.get_limits()
+            if account_details and account_details.get('stat') == 'Ok':
+                cash = account_details.get('cash', 'N/A')
+                margin_used = account_details.get('marginused', 'N/A')
+                
+                st.info(f"**Cash Available:** ₹{cash}")
+                st.info(f"**Margin Used:** ₹{margin_used}")
+            else:
+                st.warning("Could not fetch account details")
+        except Exception as e:
+            st.warning(f"Could not fetch account details")
+        
+        # Open Positions from API
+        # ---------------------------------------------------------
+        # REPLACEMENT CODE FOR "📍 Open Positions" SECTION
+        # ---------------------------------------------------------
+        st.subheader("📍 Open Positions & Auto-Monitor")
+        
+        try:
+            positions = api.get_positions()
+            
+            # Filter for only open positions (Net Qty != 0)
+            open_positions = [p for p in positions if int(p.get('netqty', 0)) != 0] if positions else []
+            
+            if len(open_positions) > 0:
+                monitor_data = []
+                
+                for pos in open_positions:
+                    # Extract Position Details
+                    symbol = pos.get('tsym')
+                    netqty = int(pos.get('netqty', 0))
+                    avg_price = float(pos.get('netavgprc', 0))
+                    product_type = pos.get('prd', 'C')
+                    
+                    # Get LTP (Live Price) - Try from position data first, else fetch quote
+                    ltp = float(pos.get('lp', 0))
+                    if ltp == 0:
+                        # Fallback if position data doesn't have LTP
+                        ltp = get_live_price(api, symbol.replace('-EQ', '')) or avg_price
 
-    # Auto Refresh
-    time_module.sleep(2)
-    st.rerun()
+                    # Determine Position Type
+                    is_long = netqty > 0
+                    
+                    # --- CALCULATE DYNAMIC TARGET & STOP LOSS ---
+                    # Uses the sliders from the sidebar
+                    current_sl_pct = strategy.stop_loss_pct
+                    current_target_pct = strategy.target_pct
+                    
+                    if is_long:
+                        calc_sl = avg_price * (1 - current_sl_pct)
+                        calc_target = avg_price * (1 + current_target_pct)
+                        pnl = (ltp - avg_price) * abs(netqty)
+                        # Exit Condition
+                        hit_target = ltp >= calc_target
+                        hit_sl = ltp <= calc_sl
+                    else: # Short
+                        calc_sl = avg_price * (1 + current_sl_pct)
+                        calc_target = avg_price * (1 - current_target_pct)
+                        pnl = (avg_price - ltp) * abs(netqty)
+                        # Exit Condition
+                        hit_target = ltp <= calc_target
+                        hit_sl = ltp >= calc_sl
+
+                    # --- DISPLAY DATA PREP ---
+                    monitor_data.append({
+                        "Symbol": symbol,
+                        "Side": "BUY" if is_long else "SELL",
+                        "Qty": netqty,
+                        "Avg Price": f"₹{avg_price:.2f}",
+                        "LTP": f"₹{ltp:.2f}",
+                        "🛑 Stop Loss": f"₹{calc_sl:.2f}",
+                        "🎯 Target": f"₹{calc_target:.2f}",
+                        "P&L": f"₹{pnl:.2f}",
+                        "Product": product_type
+                    })
+
+                    # --- AUTO EXIT LOGIC ---
+                    if auto_trading:
+                        exit_reason = None
+                        if hit_target:
+                            exit_reason = "Target Hit"
+                        elif hit_sl:
+                            exit_reason = "Stop Loss Hit"
+                        
+                        if exit_reason:
+                            st.warning(f"⚡ Triggering Auto-Exit for {symbol}: {exit_reason}")
+                            
+                            # Determine opposite transaction type
+                            trans_type = 'SELL' if is_long else 'BUY'
+                            
+                            # Place Order
+                            # Note: We use the exact symbol and product type from the position to ensure it closes correctly
+                            res = api.place_order(
+                                buy_or_sell='S' if trans_type == 'SELL' else 'B',
+                                product_type=product_type,
+                                exchange='NSE',
+                                tradingsymbol=symbol,
+                                quantity=abs(netqty),
+                                discloseqty=0,
+                                price_type='MKT',
+                                retention='DAY'
+                            )
+                            
+                            if res and res.get('stat') == 'Ok':
+                                st.toast(f"✅ Position Closed for {symbol} ({exit_reason})")
+                                time_module.sleep(1) # Brief pause
+                                st.rerun()
+                            else:
+                                st.error(f"❌ Failed to Close {symbol}: {res}")
+
+                # --- RENDER DATAFRAME ---
+                if monitor_data:
+                    st.dataframe(
+                        pd.DataFrame(monitor_data),
+                        column_config={
+                            "🛑 Stop Loss": st.column_config.TextColumn("Stop Loss", help="Calculated based on sidebar settings"),
+                            "🎯 Target": st.column_config.TextColumn("Target", help="Calculated based on sidebar settings"),
+                        },
+                        use_container_width=True,
+                        hide_index=True
+                    )
+            else:
+                st.info("No open positions found.")
+                
+        except Exception as e:
+            st.error(f"Error monitoring positions: {e}")
+        
+        # Recent orders - Order Book
+        st.subheader("📋 Order Book")
+        try:
+            orders = api.get_order_book()
+            if orders and len(orders) > 0:
+                orders_df = pd.DataFrame(orders)
+                display_cols = ['tsym', 'trantype', 'qty', 'prc', 'avgprc', 'status', 'rejreason']
+                available_cols = [col for col in display_cols if col in orders_df.columns]
+                
+                if available_cols:
+                    st.dataframe(orders_df[available_cols].head(10), use_container_width=True)
+                else:
+                    st.dataframe(orders_df.head(10), use_container_width=True)
+            else:
+                st.info("No recent orders")
+        except Exception as e:
+            st.info("No recent orders")
+        
+        # Trade Book
+        st.subheader("📒 Trade Book")
+        try:
+            trades = api.get_trade_book()
+            if trades and len(trades) > 0:
+                trades_df = pd.DataFrame(trades)
+                display_cols = ['tsym', 'trantype', 'qty', 'prc', 'flqty']
+                available_cols = [col for col in display_cols if col in trades_df.columns]
+                
+                if available_cols:
+                    st.dataframe(trades_df[available_cols].head(10), use_container_width=True)
+                else:
+                    st.dataframe(trades_df.head(10), use_container_width=True)
+            else:
+                st.info("No trades today")
+        except Exception as e:
+            st.info("No trades today")
+        
+        # Refresh button
+        if st.button("🔄 Refresh Data", type="secondary"):
+            st.rerun()
+    
+    # Footer with strategy info
+    st.markdown("---")
+    with st.expander("ℹ️ Enhanced Strategy Information & Rules"):
+        st.markdown(f"""
+        ### 📋 Stage A - Stock Screening (Enhanced)
+        1. **Volume Check:** Opening volume (9:15-9:29) > **2x** Previous Day Last Hour Avg (Reduced from 5x)
+        2. **Trade Value:** Total value > **₹10 Crores** (Reduced from 20Cr)
+        3. **Gap Check:** Gap Up/Down < **1.5%** (Relaxed from 0.5%)
+        4. **Big Body:** Opening Candle Body ≥ **0.3%** (Relaxed from 0.5%)
+        
+        ### 📈 Stage B - Entry Conditions (New Logic)
+        1. **Breakout:** Price breaks Day High (Buy) or Day Low (Sell).
+        2. **Volume Confirmation:** Current Volume > **1.5x SMA(20)** (More realistic than Opening Vol).
+        3. **RSI Filter:**
+           - **BUY:** RSI between 50 and 80 (Momentum active, not overbought).
+           - **SELL:** RSI between 20 and 50 (Momentum active, not oversold).
+        
+        ### 🎯 Stage C - Exit Strategy
+        1. **Stop Loss:** Better of 1% or day low/high
+        2. **Target:** {target_pct}% profit
+        3. **Trailing Stop:** {trailing_stop_pct}% trailing
+        
+        ### ⚙️ Current Settings
+        - Auto Trading: {'✅ Enabled' if auto_trading else '❌ Disabled'}
+        """)
 
 if __name__ == "__main__":
     main()
