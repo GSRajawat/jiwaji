@@ -568,7 +568,7 @@ def main():
         
         enable_smart_bias_filter = st.checkbox("Enable Complex Candle Bias Filter", True, key="complex_bias_toggle", help="Applies volume/range checks on the final entry candle (Rule 2).")
         # Defaulting to 5 Crore (50,000,000) for the single candle trade value filter
-        min_candle_trade_value = st.number_input("Min Single Candle Trade Value (₹)", min_value=1000000, value=50000000, step=1000000, key="min_candle_tv", help="Minimum trade value (Price * Volume) for the latest completed 1-minute candle to qualify for entry.")
+        min_candle_trade_value = st.number_input("Min Single Candle Trade Value (₹)", min_value=1000000, value=5000000, step=100000, key="min_candle_tv", help="Minimum trade value (Price * Volume) for the latest completed 1-minute candle to qualify for entry.")
         
         st.subheader("Trade Settings")
         
