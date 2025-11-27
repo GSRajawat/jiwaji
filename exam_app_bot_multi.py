@@ -361,7 +361,7 @@ def get_heavy_volume_stocks(api, volume_multiplier, max_stocks, max_price, min_t
     current_date = datetime.now().date()
     
     last_minute = datetime.now().replace(second=0, microsecond=0)
-    if datetime.now().second < 30 and datetime.now().minute != 15 and datetime.now().hour >= 9:
+    if datetime.now().second < 30 and datetime.now().minute != 45 and datetime.now().hour >= 3:
          last_minute -= timedelta(minutes=1)
          
     time_filter = last_minute.time()
