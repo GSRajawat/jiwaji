@@ -847,25 +847,7 @@ def main():
             else:
                 st.info("Run scan to populate the watchlist based on criteria.")
                 
-        with col_live:
-            st.subheader("Live Chart")
-            all_tradable_symbols = list(set(strategy.screened_stocks) | set(strategy.open_positions.keys()))
-            if all_tradable_symbols:
-                sorted_symbols = sorted(strategy.open_positions.keys()) + sorted([s for s in all_tradable_symbols if s not in strategy.open_positions])
-                sel_stock = st.selectbox("Select Stock to Chart", sorted_symbols, key="chart_stock_select") 
-            else:
-                sel_stock = None
-                
-            if sel_stock:
-                # Fetch 5 days back for decent chart data
-                df = get_historical_data_for_volume(api, sel_stock, days_back=5) 
-                position_data = strategy.open_positions.get(sel_stock)
-                
-                if df is not None and len(df) > 0:
-                    fig = create_chart(df.tail(100), position_data)
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.warning(f"Historical data is unavailable for charting {sel_stock}.")
+  
     
     # TAB 2: Positions & Auto-Exit
     with tab_positions:
