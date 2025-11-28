@@ -28,7 +28,7 @@ from api_helper import NorenApiPy
 # Setting logging level to INFO for production use, but DEBUG for development/troubleshooting
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Flattrade API Credentials (Using credentials from the previously modified file) ---
+# --- Flattrade API Credentials ---
 USER_SESSION = "0fae2092c3865a836c804c78da7d96f5ba6b47aeed9321ebb46cefc88d29e389"
 USER_ID = "FZ03508"
 FLATTRADE_PASSWORD = "Shubhi@3"
@@ -50,7 +50,6 @@ def init_flattrade_api():
     return api
 
 class FnOBreakoutStrategy:
-    
     def __init__(self):
         self.stop_loss_pct = 0.01
         self.target_pct = 0.03
@@ -84,11 +83,28 @@ class FnOBreakoutStrategy:
                 pos['stop_loss'] = entry_price * (1 + self.stop_loss_pct)
                 pos['target'] = entry_price * (1 - self.target_pct)
 
-    def check_breakout_entry(self, current_ltp, open_price, day_high, day_low, sma_60, sma_180):
+    def check_breakout_entry(self, df, current_ltp, open_price, day_high, day_low, symbol):
         """
-        Logic: Midpoint breakout logic completely removed per user request.
-        This function now returns None, making the Day High/Low entry the ONLY possible automated entry.
+        Logic: Buy/Sell if LTP confirms the candle color AND breaks the day range midpoint.
         """
+        current_day_high = day_high
+        current_day_low = day_low
+        
+        price_range = current_day_high - current_day_low
+        
+        if price_range <= 0 or open_price == 0 or current_ltp == 0:
+            return None
+            
+        midpoint = current_day_low + (price_range / 2)
+        
+        # BUY condition (LTP above open AND above midpoint)
+        if (current_ltp > open_price) and (current_ltp > midpoint):
+            return 'BUY'
+        
+        # SELL condition (LTP below open AND below midpoint)
+        elif (current_ltp < open_price) and (current_ltp < midpoint):
+            return 'SELL'
+            
         return None
     
     def update_trailing_stop(self, symbol, current_price, current_day_high, current_day_low):
@@ -136,7 +152,6 @@ class FnOBreakoutStrategy:
 # --- Helper Functions ---
 
 def load_nse_equity_data():
-    """Loads the NSE Equity list for symbol reference."""
     try:
         return pd.read_csv('NSE_Equity.csv')
     except Exception as e:
@@ -163,7 +178,6 @@ def get_fno_stocks_list():
         return ['RELIANCE', 'TCS', 'HDFCBANK', 'INFY', 'ICICIBANK', 'HINDUNILVR', 'BAJFINANCE', 'ADANIPORTS', 'KOTAKBANK', 'MARUTI']
 
 def get_token_from_isin(api, symbol, exchange="NSE"):
-    """Fetches the Noren API token for a given symbol."""
     try:
         result = api.searchscrip(exchange=exchange, searchtext=symbol)
         if result and 'values' in result and len(result['values']) > 0:
@@ -175,7 +189,6 @@ def get_token_from_isin(api, symbol, exchange="NSE"):
         return None
 
 def get_historical_data_for_volume(api, symbol, days_back=5, interval='1'):
-    """Fetches historical data using IST time for start/end points."""
     try:
         token = get_token_from_isin(api, symbol)
         if not token: return None
@@ -189,12 +202,9 @@ def get_historical_data_for_volume(api, symbol, days_back=5, interval='1'):
         # --- END IST TIME CORRECTION ---
         
         hist_data = api.get_time_price_series(exchange='NSE', token=token, starttime=start_time_str, endtime=end_time_str, interval=interval)
-        
         if not hist_data or (isinstance(hist_data, dict) and hist_data.get('stat') != 'Ok'): return None
-        
         data_list = []
         for item in hist_data:
-            # The API returns time in 'DD-MM-YYYY HH:MM:SS' format which needs to be parsed
             data_list.append({
                 'Date': pd.to_datetime(item['time'], format='%d-%m-%Y %H:%M:%S'),
                 'Volume': int(item.get('v', 0)), 'Open': float(item['into']), 'Close': float(item['intc']),
@@ -206,24 +216,29 @@ def get_historical_data_for_volume(api, symbol, days_back=5, interval='1'):
     except Exception as e:
         return None
 
-def calculate_smas(df):
-    """Calculates 60 and 180 period SMAs from the close price."""
-    if df is None or df.empty or len(df) < 180:
-        return 0.0, 0.0
-    
-    # Calculate SMAs (rolling mean of 'Close' price)
-    # Note: Use a copy of the dataframe slice to avoid SettingWithCopyWarning if it was sliced earlier
-    df_copy = df[['Close']].copy()
-    
-    df_copy['SMA_60'] = df_copy['Close'].rolling(window=60).mean()
-    df_copy['SMA_180'] = df_copy['Close'].rolling(window=180).mean()
-    
-    # Return the latest available SMA values, or 0.0 if NaN
-    latest_60_sma = df_copy['SMA_60'].iloc[-1] if not df_copy['SMA_60'].iloc[-1:].isnull().all() else 0.0
-    latest_180_sma = df_copy['SMA_180'].iloc[-1] if not df_copy['SMA_180'].iloc[-1:].isnull().all() else 0.0
-    
-    return latest_60_sma, latest_180_sma
-
+def check_smart_bias_filter(api, symbol, min_candle_trade_value):
+    try:
+        hist_df = get_historical_data_for_volume(api, symbol, days_back=1, interval='1') 
+        if hist_df is None or hist_df.empty: return False
+        if len(hist_df) < 10: return False 
+        current_candle = hist_df.iloc[-1]
+        current_vol = current_candle['Volume']
+        current_high = current_candle['High']
+        current_low = current_candle['Low']
+        current_range = current_high - current_low
+        current_mid_price = (current_high + current_low) / 2
+        current_trade_value = current_vol * current_mid_price
+        last_10_candles_vol = hist_df.iloc[-11:-1]['Volume']
+        avg_vol_10 = last_10_candles_vol.mean()
+        last_2_range_candles = hist_df.iloc[-3:-1] 
+        avg_range_2 = (last_2_range_candles['High'] - last_2_range_candles['Low']).mean()
+        if avg_vol_10 <= 0 or avg_range_2 <= 0: return False
+        if current_trade_value < min_candle_trade_value: return False
+        volume_condition = current_vol > (3 * avg_vol_10)
+        range_condition = current_range > (2 * avg_range_2)
+        return volume_condition or range_condition
+    except Exception as e:
+        return False
 
 def apply_tick_size(price, reference_price):
     """
@@ -233,37 +248,27 @@ def apply_tick_size(price, reference_price):
     if reference_price >= 250.0:
         # Tick size is 0.05
         tick_size = 0.05
-        # Round to nearest 0.05: round(price / 0.05) * 0.05
         return round(round(price / tick_size) * tick_size, 2)
     else:
-        # Tick size is 0.01 (standard 2 decimal places rounding)
+        # Tick size is 0.01
         return round(price, 2)
 
 def get_mid_price(quote_data, ltp):
-    """
-    Calculates the mid-price (midpoint of best bid/offer) and applies the tick size rule.
-    """
     try:
         bp1 = float(quote_data.get('bp1', 0.0))
         sp1 = float(quote_data.get('sp1', 0.0))
-        
-        # Determine the price to round: mid-point of BBO or just LTP
         if bp1 > 0 and sp1 > 0:
             raw_price = (bp1 + sp1) / 2
         else:
-            # Fallback to LTP if BBO is unavailable (this should be rare with quotes)
             raw_price = ltp 
         
         if raw_price > 0:
             return apply_tick_size(raw_price, ltp)
-        
         return 0.0
     except Exception as e:
-        logging.error(f"Error calculating mid-price: {e}")
         return 0.0
 
 def get_live_price(api, symbol, exchange="NSE"):
-    """Fetches live LTP, Day High/Low/Open, Volume, and the full quote data."""
     try:
         token = get_token_from_isin(api, symbol, exchange)
         if token:
@@ -280,27 +285,27 @@ def get_live_price(api, symbol, exchange="NSE"):
         return None, None, None, None, None, None
 
 def execute_trade(api, buy_or_sell, quantity, symbol, product_type, limit_price=0.0):
-    """Executes a trade using a Limit Order based on the calculated limit_price."""
     try:
         if not isinstance(quantity, int) or quantity <= 0:
             return {'stat': 'Not_Ok', 'emsg': f'Invalid quantity: {quantity}'}
         
-        # Fetch LTP to ensure correct price formatting based on tick size rule, if limit_price is not 0.0
         ltp, _, _, _, _, _ = get_live_price(api, symbol)
         
-        # Re-apply tick size to ensure the price is valid, using the fetched LTP as reference
         if ltp is not None and ltp != 0.0:
              final_limit_price = apply_tick_size(limit_price, ltp)
         else:
-             final_limit_price = round(limit_price, 2) # Fallback to 0.01 tick
+             final_limit_price = round(limit_price, 2) 
 
         formatted_price = f"{final_limit_price:.2f}"
         
-        # Log the product type explicitly before placing the order
         logging.info(f"Placing order for {symbol}. Type: {buy_or_sell}, Qty: {quantity}, Prd: {product_type}, Price: {formatted_price}")
         
-        # Note: product_type 'I' is used for MIS in the API call, 'M' is used internally by the bot for logging/tracking
-        return api.place_order(buy_or_sell=buy_or_sell, product_type='I' if product_type == 'M' else product_type, exchange='NSE',
+        # Determine the correct product type string for the API
+        # 'I' for Intraday (MIS), 'C' for Delivery (CNC)
+        # Note: Some API wrappers might use 'M' for MIS, but standard Noren uses 'I' and 'C'.
+        api_product_type = 'I' if product_type == 'M' else 'C'
+        
+        return api.place_order(buy_or_sell=buy_or_sell, product_type=api_product_type, exchange='NSE',
                              tradingsymbol=f"{symbol}-EQ", quantity=quantity, discloseqty=0,
                              price_type='LMT', price=formatted_price, retention='DAY')
     except Exception as e:
@@ -310,26 +315,20 @@ def execute_trade(api, buy_or_sell, quantity, symbol, product_type, limit_price=
 
 # --- VOLUME SCREENING FUNCTION (3-Day Average) ---
 def get_heavy_volume_stocks(api, volume_multiplier, max_stocks, max_price, min_trade_value):
-    """
-    Screens for stocks with current cumulative volume significantly higher than the 3-day 
-    average volume for the same time of day.
-    """
     # --- IST TIME CORRECTION ---
     now_ist = get_current_ist_time()
     current_date = now_ist.date()
-    # Time filter calculation (using last minute)
     last_minute = now_ist.replace(second=0, microsecond=0)
     if now_ist.second < 30 and now_ist.minute != 15 and now_ist.hour >= 9:
          last_minute -= timedelta(minutes=1)
     time_filter = last_minute.time()
     # --- END IST TIME CORRECTION ---
 
-    
     stock_list = get_fno_stocks_list()
     results = []
     
     for symbol in stock_list: 
-        if len(results) >= max_stocks: # Apply max_stocks limit across all filters
+        if len(results) >= max_stocks: 
             break
             
         try:
@@ -339,19 +338,15 @@ def get_heavy_volume_stocks(api, volume_multiplier, max_stocks, max_price, min_t
             if ltp is None or ltp == 0 or open_p == 0: continue
             
             # **STRICT PRICE FILTER**: Reject stocks priced above max_price
-            if ltp > max_price: 
-                logging.debug(f"Rejecting {symbol}: Price {ltp:.2f} > Max {max_price:.2f}")
-                continue
+            if ltp > max_price: continue
             trade_value = current_volume * ltp
             if trade_value < min_trade_value: continue
             
-           
-            # 2. Get Historical Volume Data (Need minimum 5 days back to ensure 3 trading days)
+            # 2. Get Historical Volume Data 
             hist_df = get_historical_data_for_volume(api, symbol, days_back=5) 
             if hist_df is None or hist_df.empty: continue
             
-            # 3. Calculate 3-Day Average Volume for Time of Day
-            # Note: hist_df index is naive datetime, but the date comparison works fine
+            # 3. Calculate 3-Day Average Volume 
             past_days_df = hist_df[hist_df.index.date != current_date]
             historical_dates = past_days_df.index.normalize().unique()[-3:] 
             
@@ -360,7 +355,6 @@ def get_heavy_volume_stocks(api, volume_multiplier, max_stocks, max_price, min_t
             daily_volumes = []
             for date in historical_dates:
                 day_data = past_days_df.loc[past_days_df.index.date == date]
-                # Note: Time comparison also works fine with naive datetime time components
                 time_filtered_data = day_data[day_data.index.time <= time_filter]
                 
                 if not time_filtered_data.empty:
@@ -402,7 +396,6 @@ def get_heavy_volume_stocks(api, volume_multiplier, max_stocks, max_price, min_t
 
 
 def check_and_sync_positions(api, strategy):
-    """Synchronizes internal position state with broker's positions."""
     try:
         positions = api.get_positions()
         if not positions or (isinstance(positions, dict) and positions.get('stat') != 'Ok'):
@@ -442,7 +435,6 @@ def check_and_sync_positions(api, strategy):
         return False, None
 
 def exit_all_positions(api, strategy, exit_message_placeholder):
-    """Exits all open positions by placing limit orders at mid-price."""
     if not strategy.open_positions:
         exit_message_placeholder.info("No open positions to exit.")
         return
@@ -463,15 +455,12 @@ def exit_all_positions(api, strategy, exit_message_placeholder):
              continue
         exit_message_placeholder.warning(f"Manual Exit: Placing {product_type_to_use} Limit Order for {sym} @ {exit_limit_price:.2f} (Tick Adjusted)...")
         
-        # --- EXECUTE TRADE ---
         res = execute_trade(api, trantype, pos['size'], sym, product_type=product_type_to_use, limit_price=exit_limit_price)
         
         if res and res.get('stat') == 'Ok':
-            # --- LOG CONDITION ---
             order_no = res.get('norenordno')
             if order_no and 'order_conditions' in st.session_state:
                 st.session_state.order_conditions[order_no] = "Manual Exit"
-            # --- END LOG CONDITION ---
             
             exit_message_placeholder.success(f"✅ Manual Exit Limit Order Placed for {sym}. (Order No: {res.get('norenordno')}). Waiting for broker sync...")
         else:
@@ -480,24 +469,12 @@ def exit_all_positions(api, strategy, exit_message_placeholder):
     check_and_sync_positions(api, strategy)
 
 def create_chart(df, position_data=None):
-    """Creates a Plotly Candlestick and Volume chart."""
     if df is None or df.empty: return None
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, subplot_titles=('Price', 'Volume'), row_heights=[0.8, 0.2])
     fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Price'), row=1, col=1)
     colors = ['red' if df['Close'].iloc[i] < df['Open'].iloc[i] else 'green' for i in range(len(df))]
     fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='Volume', marker_color=colors), row=2, col=1)
     
-    # Add SMAs to the chart
-    sma_60, sma_180 = calculate_smas(df)
-    if sma_60 > 0.0:
-        df_copy = df[['Close']].copy()
-        df_copy['SMA_60'] = df_copy['Close'].rolling(window=60).mean()
-        fig.add_trace(go.Scatter(x=df.index, y=df_copy['SMA_60'], mode='lines', name='SMA 60', line=dict(color='orange', width=1)), row=1, col=1)
-    if sma_180 > 0.0:
-        df_copy = df[['Close']].copy()
-        df_copy['SMA_180'] = df_copy['Close'].rolling(window=180).mean()
-        fig.add_trace(go.Scatter(x=df.index, y=df_copy['SMA_180'], mode='lines', name='SMA 180', line=dict(color='purple', width=1)), row=1, col=1)
-
     if position_data:
         if position_data.get('entry_price'): fig.add_hline(y=position_data['entry_price'], line_dash="dash", line_color="blue", annotation_text="Entry", row=1, col=1)
         if position_data.get('stop_loss'): fig.add_hline(y=position_data['stop_loss'], line_dash="dash", line_color="red", annotation_text="Stop Loss", row=1, col=1)
@@ -516,9 +493,7 @@ def main():
     try:
         api = init_flattrade_api()
         if 'strategy' not in st.session_state: st.session_state.strategy = FnOBreakoutStrategy()
-        # --- NEW STATE INITIALIZATION ---
         if 'order_conditions' not in st.session_state: st.session_state.order_conditions = {}
-        # --- END NEW STATE INITIALIZATION ---
         
         strategy = st.session_state.strategy
         
@@ -536,7 +511,6 @@ def main():
         st.header("⚙️ Bot Configuration")
         
         st.subheader("Flexible Buy/Sell Variables (Exit Conditions)")
-        
         stop_loss_pct = st.slider("Stop Loss (%)", 0.1, 5.0, 1.0, 0.1, key="sl_pct")
         target_pct = st.slider("Target (%)", 0.1, 10.0, 3.0, 0.1, key="tg_pct")
         trailing_stop_pct = st.slider("Trailing Stop (%)", 0.5, 3.0, 1.0, 0.1, key="ts_pct")
@@ -547,7 +521,6 @@ def main():
         
         st.subheader("Volume Screening Parameters")
         
-        # Toggle for Daily Volume Screen
         enable_daily_volume_screen = st.checkbox("✅ Enable Daily Heavy Volume Screen", value=True, key="enable_daily_vol_screen", help="If unchecked, the bot monitors F&O stocks but ignores the 3-day average cumulative volume filter.")
 
         if enable_daily_volume_screen:
@@ -557,14 +530,11 @@ def main():
         
         scan_limit = st.number_input("Max Stocks to Track (5-20)", min_value=5, max_value=20, value=10, step=1, key="scan_limit")
         
-        # Price and Trade Value Filters
         max_price = st.number_input("Stock Price Limit (₹)", min_value=10.0, max_value=10000.0, value=500.0, step=10.0, key="max_prc")
         min_trade_value = st.number_input("Min Daily Trade Value (₹)", min_value=0, value=5000000, step=1000000, key="min_trade_value", help="Minimum total value of shares traded today (Volume * LTP).")
         
         st.subheader("Entry Filters")
         
-        # Toggle for Day High/Low Entry (Priority Entry)
-        # Note: This is now the ONLY automated entry method.
         enable_day_high_low_entry = st.checkbox("⭐ Enable Day High/Low Breakout Entry (ONLY Entry)", True, key="day_high_low_entry_toggle", help="Highest priority entry. Places order if LTP = Day High (Long) or LTP = Day Low (Short). Midpoint logic is removed.")
 
         st.subheader("Trade Settings")
@@ -589,17 +559,14 @@ def main():
         
         close_time_str = st.selectbox("Auto-Close Time", ["15:15:00"], index=0, key="close_time_select")
         
-        # --- IST TIME CORRECTION (DISPLAY FIX) ---
         current_time_ist_dt = get_current_ist_time()
         current_time_ist_time_only = current_time_ist_dt.time()
         close_time = datetime.strptime(close_time_str, "%H:%M:%S").time()
         is_close_time = current_time_ist_time_only >= close_time
         
-        # Display the time clearly with the offset, or the explicit IST name
         ist_display_str = current_time_ist_dt.strftime('%H:%M:%S') + ' (+05:30 IST)'
         
         st.caption(f"Current Time: **{ist_display_str}**")
-        # --- END IST TIME CORRECTION (DISPLAY FIX) ---
 
         if st.button("🔴 Exit All Positions Now", disabled=not strategy.open_positions, type="secondary"):
             st.session_state.manual_exit_all = True
@@ -607,12 +574,10 @@ def main():
         st.divider()
         auto_refresh = st.toggle("🔄 Auto Refresh (5s)", value=False, key="auto_refresh_toggle")
         
-        # Kept original button for manual scan
         if not auto_scan:
             if st.button("🔍 Scan Watchlist", type="primary", key="scan_button"):
                 st.session_state.run_scanning = True
     
-    # --- Top Dashboard (Funds) ---
     st.title("🧪 Heavy Volume Breakout Bot (Day High/Low Only)")
     
     limits_resp = api.get_limits()
@@ -625,14 +590,12 @@ def main():
     c3.metric("📊 Auto-Trading", "Active" if auto_trading else "Inactive", delta_color="normal")
     st.divider()
 
-    # --- Sync & Update ---
     current_date = get_current_ist_time().date()
     strategy.reset_daily_data(current_date)
     
     check_and_sync_positions(api, strategy)
     strategy.update_position_parameters()
     
-    # --- Manual Exit All Handler ---
     exit_placeholder = st.empty()
     if st.session_state.get('manual_exit_all', False):
         with exit_placeholder:
@@ -640,7 +603,6 @@ def main():
         st.session_state.manual_exit_all = False
         st.rerun() 
 
-    # --- Scanning Logic ---
     should_run_scan = st.session_state.get('run_scanning', False) or (auto_scan and not strategy.screened_stocks)
 
     if should_run_scan:
@@ -654,7 +616,6 @@ def main():
                 st.session_state.run_scanning = False 
                 st.success(f"Screened {len(strategy.screened_stocks)} stocks meeting **3-day heavy volume** criteria.")
         else:
-            # Logic for monitoring F&O list, filtered by Price and Min Trade Value
             with st.spinner(f"Scanning F&O Stocks (Max: {scan_limit}, Max Price: ₹{max_price})..."):
                 
                 full_fno_list = get_fno_stocks_list()
@@ -669,12 +630,10 @@ def main():
 
                     if ltp is None or ltp == 0 or open_p == 0: continue
                     
-                    # Apply Price Filters (Ensuring Max Price is always respected)
                     if ltp > max_price: continue
                     trade_value = current_volume * ltp
                     if trade_value < min_trade_value: continue
                     
-                    # Passed filters
                     filtered_symbols.append(symbol)
                     
                     chg = ((ltp - open_p) / open_p) * 100
@@ -692,15 +651,11 @@ def main():
                 st.session_state.run_scanning = False 
                 st.success(f"**Volume screening disabled.** Monitoring {len(strategy.screened_stocks)} stocks filtered by price/value criteria.")
 
-    # --- Tabs for Main Interface ---
     tab_monitor, tab_positions, tab_orders, tab_trades = st.tabs([
         "📈 Strategy Monitor", "📍 Open Positions & Exit", "📋 Order Book", "📒 Trade Book"
     ])
     
-    # TAB 1: Strategy Monitor
     with tab_monitor:
-        
-        # --- CENTRALIZED AUTO-TRADING ENTRY CHECK ---
         entry_placeholder = st.empty()
         
         if auto_trading and strategy.screened_stocks and not is_close_time:
@@ -715,10 +670,9 @@ def main():
                     logging.debug(f"Skipping {symbol}: Previously rejected today.")
                     continue
                 
-                # Check position limit immediately before scanning a new entry
                 if len(strategy.open_positions) >= max_positions:
                     entry_placeholder.warning(f"Position limit ({max_positions}) reached mid-scan. Stopping new entries.")
-                    break # Stop the loop immediately!
+                    break 
                     
                 ltp, day_h, day_l, open_price, _, quote_data = get_live_price(api, symbol)
                 
@@ -727,23 +681,15 @@ def main():
                 signal = None
                 signal_source = None
                 
-                # 1. Day High/Low Entry Check (Highest Priority)
                 if enable_day_high_low_entry:
-                    # Day High Long: LTP is equal to or marginally above Day High, AND confirms bullish trend (LTP > Open)
                     if ltp >= day_h and ltp > open_price: 
                          signal = 'BUY'
                          signal_source = 'Day High Break'
-                    # Day Low Short: LTP is equal to or marginally below Day Low, AND confirms bearish trend (LTP < Open)
                     elif ltp <= day_l and ltp < open_price: 
                          signal = 'SELL'
                          signal_source = 'Day Low Break'
 
-                # --- 2. Midpoint Breakout Check (REMOVED) ---
-                # Logic was removed per user request. If enable_day_high_low_entry is False, 'signal' will remain None.
-                        
                 if signal:
-                    
-                    # --- Proceed with trade ---
                     limit_price = get_mid_price(quote_data, ltp)
                     
                     if limit_price == 0.0: continue
@@ -758,58 +704,106 @@ def main():
                     res_mis = execute_trade(api, trantype, qty, symbol, product_type='M', limit_price=limit_price)
                     
                     if res_mis and res_mis.get('stat') == 'Ok':
-                        strategy.enter_position(signal, limit_price, day_h, day_l, qty, symbol, product_type='M')
-                        
-                        # --- LOG CONDITION ---
                         order_no = res_mis.get('norenordno')
                         if order_no and 'order_conditions' in st.session_state:
                             st.session_state.order_conditions[order_no] = signal_source 
-                        # --- END LOG CONDITION ---
                         
-                        entry_placeholder.success(f"✅ MIS Limit Order Placed (Order No: {order_no}) for **{symbol}**.")
-                        # --- ADDED 2-SECOND DELAY FOR ENTRY ---
-                        time_module.sleep(2)
-                        # --- END DELAY ---
-                        continue
-
-                    error_mis = res_mis.get('emsg', 'No API Response') if res_mis else 'No API Response'
-                    logging.warning(f"MIS Order Failed for {symbol}. Error: {error_mis}. Trying CNC...")
-                    entry_placeholder.warning(f"MIS failed for **{symbol}**. Error: {error_mis}. Retrying with **CNC**...")
+                        entry_placeholder.success(f"✅ MIS Order Placed (Order No: {order_no}) for **{symbol}**. Waiting 3s to verify execution...")
+                        time_module.sleep(3)
+                        
+                        # VERIFY ORDER WAS FILLED before adding to positions
+                        order_status = api.get_order_book()
+                        is_filled = False
+                        
+                        if order_status and not (isinstance(order_status, dict) and order_status.get('stat') != 'Ok'):
+                            for order in order_status:
+                                if order.get('norenordno') == order_no:
+                                    status = order.get('status', '').upper()
+                                    if status == 'COMPLETE':
+                                        is_filled = True
+                                        fill_price = float(order.get('avgprc', limit_price))
+                                        # NOW add to positions with actual fill price
+                                        strategy.enter_position(signal, fill_price, day_h, day_l, qty, symbol, product_type='M')
+                                        entry_placeholder.success(f"✅ MIS Order FILLED for **{symbol}** @ {fill_price:.2f}. Position added.")
+                                        time_module.sleep(1)
+                                        break
+                                    elif status == 'REJECTED':
+                                        error_mis = order.get('rejreason', 'Order Rejected')
+                                        entry_placeholder.warning(f"MIS Order REJECTED for **{symbol}**. Reason: {error_mis}")
+                                        break
+                        
+                        if is_filled:
+                            continue  # Move to next symbol
+                        
+                        # If not filled, fall through to CNC
+                        error_mis = "Order not filled" if not is_filled else res_mis.get('emsg', 'No API Response')
+                    else:
+                        error_mis = res_mis.get('emsg', 'No API Response') if res_mis else 'No API Response'
                     
-                    # 2. Attempt CNC (Delivery)
+                    logging.warning(f"MIS Order Failed/Not Filled for {symbol}. Error: {error_mis}. Waiting 2s before checking CNC...")
+                    entry_placeholder.warning(f"MIS failed for **{symbol}**. Error: {error_mis}. Checking CNC Fallback in 2s...")
+                    
+                    # --- Explicit 2-second delay ---
+                    time_module.sleep(2)
+                    
+                    # --- Condition to prevent CNC Sell Entry ---
+                    if trantype == 'S':
+                        strategy.rejected_symbols.add(symbol)
+                        st.session_state.strategy = strategy 
+                        entry_placeholder.error(f"❌ MIS Sell Failed for **{symbol}**. Skipping CNC Fallback (CNC Short Selling not supported). Rejected for today.")
+                        st.rerun()
+                    
+                    # 2. Attempt CNC (Delivery) - Only if BUY
+                    entry_placeholder.info(f"Attempting CNC (Delivery) Buy for **{symbol}**...")
                     res_cnc = execute_trade(api, trantype, qty, symbol, product_type='C', limit_price=limit_price)
                     
                     if res_cnc and res_cnc.get('stat') == 'Ok':
-                        strategy.enter_position(signal, limit_price, day_h, day_l, qty, symbol, product_type='C')
-                        
-                        # --- LOG CONDITION ---
                         order_no = res_cnc.get('norenordno')
                         if order_no and 'order_conditions' in st.session_state:
                             st.session_state.order_conditions[order_no] = signal_source 
-                        # --- END LOG CONDITION ---
                         
-                        entry_placeholder.success(f"✅ CNC Limit Order Placed (Order No: {order_no}) for **{symbol}**.")
-                        # --- ADDED 2-SECOND DELAY FOR ENTRY ---
-                        time_module.sleep(2)
-                        # --- END DELAY ---
-                        continue
+                        entry_placeholder.success(f"✅ CNC Order Placed (Order No: {order_no}) for **{symbol}**. Waiting 3s to verify execution...")
+                        time_module.sleep(3)
+                        
+                        # VERIFY ORDER WAS FILLED before adding to positions
+                        order_status = api.get_order_book()
+                        is_filled = False
+                        
+                        if order_status and not (isinstance(order_status, dict) and order_status.get('stat') != 'Ok'):
+                            for order in order_status:
+                                if order.get('norenordno') == order_no:
+                                    status = order.get('status', '').upper()
+                                    if status == 'COMPLETE':
+                                        is_filled = True
+                                        fill_price = float(order.get('avgprc', limit_price))
+                                        # NOW add to positions with actual fill price
+                                        strategy.enter_position(signal, fill_price, day_h, day_l, qty, symbol, product_type='C')
+                                        entry_placeholder.success(f"✅ CNC Order FILLED for **{symbol}** @ {fill_price:.2f}. Position added.")
+                                        time_module.sleep(1)
+                                        break
+                                    elif status == 'REJECTED':
+                                        error_cnc = order.get('rejreason', 'Order Rejected')
+                                        break
+                        
+                        if is_filled:
+                            continue  # Move to next symbol
+                        
+                        error_cnc = "Order not filled" if not is_filled else res_cnc.get('emsg', 'Unknown Error')
+                    else:
+                        error_cnc = res_cnc.get('emsg', 'Unknown Error') if res_cnc else 'No API Response'
                     
-                    # 3. Both MIS and CNC failed - add to rejection list AND force rerun (CRITICAL FIX)
-                    error_cnc = res_cnc.get('emsg', 'Unknown Error') if res_cnc else 'No API Response'
+                    # 3. Both failed
                     strategy.rejected_symbols.add(symbol)
-                    st.session_state.strategy = strategy # Explicitly commit state
+                    st.session_state.strategy = strategy 
                     
                     entry_placeholder.error(f"❌ Order Failed for **{symbol}**. MIS Error: {error_mis}. CNC Error: {error_cnc}. Added to rejection list for today (will not re-order).")
                     
-                    # Force a rerun to immediately reload state and respect the rejected_symbols list
                     st.rerun() 
-
 
             entry_placeholder.info(f"Monitoring complete. No new entry signals found. Open positions: {len(strategy.open_positions)}.")
 
         col_scan, col_live = st.columns([1, 2])
         
-        # Watchlist and Charting logic
         with col_scan:
             st.subheader("Heavy Volume Watchlist")
             if strategy.screened_stocks:
@@ -838,7 +832,6 @@ def main():
                             "Change (%)": f"{m['Change']:.2f}%"
                         })
                     else:
-                        # Fallback for when daily volume screen is OFF
                         ltp, _, _, _, _, _ = get_live_price(api, sym)
                         status_text = "✅ OPEN" if is_open else "⛔ REJECTED" if is_rejected else "Monitoring"
                         w_data.append({"Symbol": sym, "Status": status_text, "Bias": strategy.stock_bias.get(sym, 'N/A'), "Vol Ratio": "N/A (Screen Off)", "Current Vol": "N/A", "Avg Vol (3d)": "N/A", "LTP": f"{ltp:.2f}" if ltp else "N/A", "Change (%)": "N/A"})
@@ -847,15 +840,31 @@ def main():
             else:
                 st.info("Run scan to populate the watchlist based on criteria.")
                 
-  
+        with col_live:
+            st.subheader("Live Chart")
+            all_tradable_symbols = list(set(strategy.screened_stocks) | set(strategy.open_positions.keys()))
+            if all_tradable_symbols:
+                sorted_symbols = sorted(strategy.open_positions.keys()) + sorted([s for s in all_tradable_symbols if s not in strategy.open_positions])
+                sel_stock = st.selectbox("Select Stock to Chart", sorted_symbols, key="chart_stock_select") 
+            else:
+                sel_stock = None
+                
+            if sel_stock:
+                df = get_historical_data_for_volume(api, sel_stock, days_back=5) 
+                position_data = strategy.open_positions.get(sel_stock)
+                
+                if df is not None and len(df) > 0:
+                    fig = create_chart(df.tail(100), position_data)
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.warning(f"Historical data is unavailable for charting {sel_stock}.")
     
-    # TAB 2: Positions & Auto-Exit
     with tab_positions:
         st.subheader("📍 Open Positions Manager (Bot Tracked)")
         
         open_positions = strategy.open_positions
         pos_data = []
-        total_pnl = 0.0 # Initialize total P&L accumulator
+        total_pnl = 0.0 
         
         exit_message_placeholder = st.empty()
         
@@ -879,9 +888,8 @@ def main():
                 netqty = pos['size'] if pos['type'] == 'long' else -pos['size']
                 avg_prc = pos['entry_price']
                 
-                # Calculate P&L (as float)
                 pnl = (ltp - avg_prc) * netqty if pos['type'] == 'long' else (avg_prc - ltp) * abs(netqty)
-                total_pnl += pnl # Accumulate total P&L
+                total_pnl += pnl 
                 
                 exit_button_key = f"exit_button_{sym}"
                 
@@ -895,12 +903,11 @@ def main():
                     "SL": f"{pos['stop_loss']:.2f}",
                     "Trailing": f"{pos['trailing_stop']:.2f}" if pos['trailing_stop'] else 'N/A',
                     "Product": pos['product_type'],
-                    "P&L_Float": pnl, # Store PNL as float temporarily
+                    "P&L_Float": pnl, 
                     "Exit Hit?": f"⚠️ {reason.upper()}" if should_exit else "No",
                     "Action": st.button("Exit", key=exit_button_key)
                 })
                 
-                # --- AUTO EXIT EXECUTION ---
                 if auto_trading and should_exit:
                     symbols_to_exit.append(sym)
                     exit_message_placeholder.warning(f"⚡ Auto-Exiting {sym} due to: {reason.upper()}... Placing Limit Order.")
@@ -914,23 +921,17 @@ def main():
                          exit_message_placeholder.error(f"❌ Exit Order FAILED for {sym}. Cannot calculate mid-price for Limit Order. Try placing manually.")
                          continue
                     
-                    # --- EXECUTE TRADE ---
                     res = execute_trade(api, trantype, pos['size'], sym, product_type=product_type_to_use, limit_price=exit_limit_price)
                     
                     if res and res.get('stat') == 'Ok':
-                        # --- LOG CONDITION ---
                         order_no = res.get('norenordno')
                         if order_no and 'order_conditions' in st.session_state:
-                            st.session_state.order_conditions[order_no] = reason # Exit reason is the condition met
-                        # --- END LOG CONDITION ---
+                            st.session_state.order_conditions[order_no] = reason 
                         exit_message_placeholder.success(f"✅ Exit Limit Order Placed for {sym}. (Order No: {order_no}, Product: {product_type_to_use})")
-                        # --- ADDED 1-SECOND DELAY FOR EXIT ---
                         time_module.sleep(1)
-                        # --- END DELAY ---
                     else:
                         exit_message_placeholder.error(f"❌ Exit Order FAILED for {sym}. Error: {res.get('emsg', 'Unknown Error')}")
                         
-            # --- MANUAL PER-POSITION EXIT EXECUTION ---
             manual_exits = [item for item in pos_data if item['Action']]
             if manual_exits:
                 for item in manual_exits:
@@ -950,15 +951,12 @@ def main():
                          
                     exit_message_placeholder.warning(f"Manual Exit: Placing {product_type_to_use} Limit Order for {sym} @ {exit_limit_price:.2f} (Tick Adjusted)...")
 
-                    # --- EXECUTE TRADE ---
                     res = execute_trade(api, trantype, pos['size'], sym, product_type=product_type_to_use, limit_price=exit_limit_price)
 
                     if res and res.get('stat') == 'Ok':
-                        # --- LOG CONDITION ---
                         order_no = res.get('norenordno')
                         if order_no and 'order_conditions' in st.session_state:
                             st.session_state.order_conditions[order_no] = "Manual Exit"
-                        # --- END LOG CONDITION ---
                         exit_message_placeholder.success(f"✅ Manual Exit Limit Order Placed for {sym}. (Order No: {order_no})")
                     else:
                         exit_message_placeholder.error(f"❌ Manual Exit Order FAILED for {sym}. Error: {res.get('emsg', 'Unknown Error')}")
@@ -966,14 +964,11 @@ def main():
                 time_module.sleep(1)
                 st.rerun()
 
-            # --- Add Total Row ---
             pos_data_display = []
             for item in pos_data:
-                # Format P&L float back to string for display
                 item['P&L'] = f"{item.pop('P&L_Float'):,.2f}" 
                 pos_data_display.append({k: item[k] for k in item if k != 'P&L_Float' and k != 'Action'})
                 
-            # Add the total row after all individual positions
             total_row = {
                 "Symbol": "**TOTAL**",
                 "Side": "",
@@ -1028,7 +1023,6 @@ def main():
             st.rerun() 
             
 
-    # TAB 3: Order Book
     with tab_orders:
         st.subheader("📋 Today's Orders")
         orders = api.get_order_book()
@@ -1036,11 +1030,8 @@ def main():
         if orders and not (isinstance(orders, dict) and orders.get('stat') != 'Ok'):
             ord_df = pd.DataFrame(orders)
             
-            # --- NEW: Add Condition Met Column ---
-            # Map the order number to the stored condition/reason from session state
             ord_df['Condition Met'] = ord_df['norenordno'].astype(str).map(st.session_state.get('order_conditions', {}))
             ord_df['Condition Met'] = ord_df['Condition Met'].fillna('N/A (Sync or Rejected)')
-            # --- END NEW: Add Condition Met Column ---
             
             cols = ['norenordno', 'tsym', 'trantype', 'qty', 'prc', 'status', 'Condition Met', 'rejreason', 'norentm', 'prd']
             show_cols = [c for c in cols if c in ord_df.columns]
@@ -1049,7 +1040,6 @@ def main():
         else:
             st.info("No orders placed today or API error fetching orders.")
 
-    # TAB 4: Trade Book
     with tab_trades:
         st.subheader("📒 Executed Trades")
         trades = api.get_trade_book()
@@ -1061,7 +1051,6 @@ def main():
         else:
             st.info("No trades executed today or API error fetching trades.")
 
-    # --- AUTO REFRESH LOGIC ---
     if auto_refresh:
         time_module.sleep(5)
         st.rerun()
