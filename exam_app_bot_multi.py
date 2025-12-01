@@ -557,7 +557,7 @@ def main():
         auto_scan = st.toggle("🤖 Auto Scan (on load)", False, key="auto_scan_toggle", help="Automatically scans and generates the watchlist.")
         auto_trading = st.toggle("Enable Auto Trading (Multi-Stock)", False, key="auto_trade_toggle")
         
-        close_time_str = st.selectbox("Auto-Close Time", ["15:10:00"], index=0, key="close_time_select")
+        close_time_str = st.selectbox("Auto-Close Time", ["15:15:00"], index=0, key="close_time_select")
         
         current_time_ist_dt = get_current_ist_time()
         current_time_ist_time_only = current_time_ist_dt.time()
