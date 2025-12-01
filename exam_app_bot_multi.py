@@ -528,9 +528,9 @@ def main():
         else:
              volume_multiplier = 3.0 # Default value, ignored if screen is off
         
-        scan_limit = st.number_input("Max Stocks to Track (5-20)", min_value=5, max_value=20, value=20, step=1, key="scan_limit")
+        scan_limit = st.number_input("Max Stocks to Track (5-20)", min_value=5, max_value=200, value=20, step=1, key="scan_limit")
         
-        max_price = st.number_input("Stock Price Limit (₹)", min_value=10.0, max_value=10000.0, value=1000.0, step=10.0, key="max_prc")
+        max_price = st.number_input("Stock Price Limit (₹)", min_value=10.0, max_value=20000.0, value=1000.0, step=100.0, key="max_prc")
         min_trade_value = st.number_input("Min Daily Trade Value (₹)", min_value=0, value=5000000, step=1000000, key="min_trade_value", help="Minimum total value of shares traded today (Volume * LTP).")
         
         st.subheader("Entry Filters")
