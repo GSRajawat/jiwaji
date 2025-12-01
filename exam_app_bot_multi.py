@@ -409,7 +409,9 @@ def check_and_sync_positions(api, strategy):
                 api_open_symbols.add(symbol)
                 if symbol not in strategy.open_positions:
                     avg_price = float(pos.get('netavgprc', 0))
-                    product_type = pos.get('prd', 'C')
+                    # Normalize product type: API returns 'I' for MIS, 'C' for CNC
+                    broker_prd = pos.get('prd', 'C')
+                    product_type = 'M' if broker_prd in ('I', 'M') else 'C'
                     position_type = 'long' if netqty > 0 else 'short'
                     _, day_h, day_l, _, _, _ = get_live_price(api, symbol)
                     day_h = day_h if day_h != 0 else avg_price * 1.01
