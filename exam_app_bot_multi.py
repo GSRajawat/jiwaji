@@ -528,9 +528,9 @@ def main():
         else:
              volume_multiplier = 3.0 # Default value, ignored if screen is off
         
-        scan_limit = st.number_input("Max Stocks to Track (5-20)", min_value=5, max_value=20, value=10, step=1, key="scan_limit")
+        scan_limit = st.number_input("Max Stocks to Track (5-20)", min_value=5, max_value=20, value=20, step=1, key="scan_limit")
         
-        max_price = st.number_input("Stock Price Limit (₹)", min_value=10.0, max_value=10000.0, value=500.0, step=10.0, key="max_prc")
+        max_price = st.number_input("Stock Price Limit (₹)", min_value=10.0, max_value=10000.0, value=1000.0, step=10.0, key="max_prc")
         min_trade_value = st.number_input("Min Daily Trade Value (₹)", min_value=0, value=5000000, step=1000000, key="min_trade_value", help="Minimum total value of shares traded today (Volume * LTP).")
         
         st.subheader("Entry Filters")
@@ -541,7 +541,7 @@ def main():
         
         st.radio("New Entry Product Priority", ['MIS (Intraday) -> CNC (Delivery)'], index=0, disabled=True, help="Bot will attempt MIS first, then CNC if MIS fails.")
             
-        max_positions = st.number_input("Max Open Positions Limit", min_value=1, value=2, step=1, key="max_pos_limit")
+        max_positions = st.number_input("Max Open Positions Limit", min_value=1, value=10, step=1, key="max_pos_limit")
 
         st.subheader("Position Sizing")
         sizing_mode = st.radio("Mode", ["Fixed Quantity", "Fixed Amount"], key="size_mode")
@@ -549,7 +549,7 @@ def main():
             quantity = st.number_input("Qty", 1, value=1, key="qty_input")
             trade_amount = None
         else:
-            trade_amount = st.number_input("Amount (₹)", 1000, value=10000, key="amt_input")
+            trade_amount = st.number_input("Amount (₹)", 1000, value=1000, key="amt_input")
             quantity = None
             
         st.divider()
