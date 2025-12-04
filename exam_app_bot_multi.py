@@ -242,16 +242,31 @@ def check_smart_bias_filter(api, symbol, min_candle_trade_value):
 
 def apply_tick_size(price, reference_price):
     """
-    Applies the NSE equity tick size rule for limit prices.
-    Rule: Below 250 -> 0.01; At/Above 250 -> 0.05.
+    Applies updated NSE equity tick size rules for limit prices:
+    - Below ₹250: tick size 0.01
+    - ₹251 to ₹1,000: tick size 0.05
+    - ₹1,001 to ₹5,000: tick size 0.10
+    - ₹5,001 to ₹10,000: tick size 0.50
+    - ₹10,001 to ₹20,000: tick size 1.00
+    - Above ₹20,001: tick size 5.00
     """
-    if reference_price >= 250.0:
-        # Tick size is 0.05
+    if reference_price < 250:
+        tick_size = 0.01
+    elif 251 <= reference_price <= 1000:
         tick_size = 0.05
-        return round(round(price / tick_size) * tick_size, 2)
+    elif 1001 <= reference_price <= 5000:
+        tick_size = 0.10
+    elif 5001 <= reference_price <= 10000:
+        tick_size = 0.50
+    elif 10001 <= reference_price <= 20000:
+        tick_size = 1.00
+    elif reference_price > 20001:
+        tick_size = 5.00
     else:
-        # Tick size is 0.01
-        return round(price, 2)
+        # For prices exactly 250 or between 250 and 251, safest fallback
+        tick_size = 0.05
+
+    return round(round(price / tick_size) * tick_size, 2)
 
 def get_mid_price(quote_data, ltp):
     try:
@@ -284,33 +299,108 @@ def get_live_price(api, symbol, exchange="NSE"):
     except:
         return None, None, None, None, None, None
 
+import time
+import logging
+
 def execute_trade(api, buy_or_sell, quantity, symbol, product_type, limit_price=0.0):
+    """
+    Places an order with initial limit price as average of bid-ask prices.
+    If order remains unfilled after 5 seconds, modifies the limit price to bid (for sell)
+    or ask (for buy) price and attempts to confirm the trade.
+    """
     try:
         if not isinstance(quantity, int) or quantity <= 0:
             return {'stat': 'Not_Ok', 'emsg': f'Invalid quantity: {quantity}'}
-        
-        ltp, _, _, _, _, _ = get_live_price(api, symbol)
-        
-        if ltp is not None and ltp != 0.0:
-             final_limit_price = apply_tick_size(limit_price, ltp)
-        else:
-             final_limit_price = round(limit_price, 2) 
 
-        formatted_price = f"{final_limit_price:.2f}"
-        
-        logging.info(f"Placing order for {symbol}. Type: {buy_or_sell}, Qty: {quantity}, Prd: {product_type}, Price: {formatted_price}")
-        
-        # Determine the correct product type string for the API
-        # 'I' for Intraday (MIS), 'C' for Delivery (CNC)
-        # Note: Some API wrappers might use 'M' for MIS, but standard Noren uses 'I' and 'C'.
+        # Get live price and quote data
+        ltp, _, _, _, _, quote_data = get_live_price(api, symbol)
+        if ltp is None or ltp == 0.0 or quote_data is None:
+            return {'stat': 'Not_Ok', 'emsg': 'Failed to get live price or quote data'}
+
+        # Initial limit price = average of bid and ask prices
+        bp1 = float(quote_data.get('bp1', 0.0))
+        sp1 = float(quote_data.get('sp1', 0.0))
+        if bp1 > 0 and sp1 > 0:
+            initial_limit_price = round((bp1 + sp1) / 2, 2)
+        else:
+            initial_limit_price = round(limit_price, 2)  # fallback to given limit price or rounded
+
+        # Format price string
+        formatted_price = f"{apply_tick_size(initial_limit_price, ltp):.2f}"
+
+        logging.info(f"Placing initial order for {symbol}. Type: {buy_or_sell}, Qty: {quantity}, Prd: {product_type}, Price: {formatted_price}")
+
+        # Place initial order
         api_product_type = 'I' if product_type == 'M' else 'C'
-        
-        return api.place_order(buy_or_sell=buy_or_sell, product_type=api_product_type, exchange='NSE',
-                             tradingsymbol=f"{symbol}-EQ", quantity=quantity, discloseqty=0,
-                             price_type='LMT', price=formatted_price, retention='DAY')
+        order_response = api.place_order(
+            buy_or_sell=buy_or_sell,
+            product_type=api_product_type,
+            exchange='NSE',
+            tradingsymbol=f"{symbol}-EQ",
+            quantity=quantity,
+            discloseqty=0,
+            price_type='LMT',
+            price=formatted_price,
+            retention='DAY'
+        )
+
+        if not order_response or order_response.get('stat') != 'Ok':
+            return order_response or {'stat': 'Not_Ok', 'emsg': 'Order placement failed'}
+
+        order_no = order_response.get('norenordno')
+        if not order_no:
+            return {'stat': 'Not_Ok', 'emsg': 'Order number missing in response'}
+
+        # Wait 5 seconds before modifying order if required
+        time.sleep(5)
+
+        # Check order status
+        orders = api.get_order_book()
+        if not orders or (isinstance(orders, dict) and orders.get('stat') != 'Ok'):
+            return {'stat': 'Not_Ok', 'emsg': 'Failed to fetch order book for order status'}
+
+        # Find order by order_no
+        order_info = next((o for o in orders if o.get('norenordno') == order_no), None)
+        if not order_info:
+            return {'stat': 'Not_Ok', 'emsg': 'Order not found in order book'}
+
+        status = order_info.get('status', '').upper()
+        if status == 'COMPLETE':
+            # Order filled, no update needed
+            return order_response
+        elif status == 'REJECTED':
+            return {'stat': 'Not_Ok', 'emsg': f"Order rejected: {order_info.get('rejreason', 'No reason')}"}
+
+        # Order still open, modify price as per new logic
+        if buy_or_sell == 'B':
+            new_limit_price = float(quote_data.get('sp1', initial_limit_price))  # ask price
+        else:
+            new_limit_price = float(quote_data.get('bp1', initial_limit_price))  # bid price
+
+        new_limit_price = round(new_limit_price, 2)
+        new_formatted_price = f"{apply_tick_size(new_limit_price, ltp):.2f}"
+
+        logging.info(f"Modifying order {order_no} for {symbol} to new limit price {new_formatted_price} after 5 seconds")
+
+        # Modify order with new limit price
+        modify_response = api.modify_order(
+            norenordno=order_no,
+            price=new_formatted_price,
+            quantity=quantity,
+            price_type='LMT',
+        )
+
+        if modify_response and modify_response.get('stat') == 'Ok':
+            return modify_response
+        else:
+            # If modify fails, return original order response with warning
+            logging.warning(f"Order modify failed for {symbol} order {order_no}: {modify_response}")
+            return order_response
+
     except Exception as e:
         logging.error(f"Error executing trade for {symbol}: {e}")
         return {'stat': 'Not_Ok', 'emsg': f"API Exception: {e}"}
+
 
 
 # --- VOLUME SCREENING FUNCTION (3-Day Average) ---
@@ -436,6 +526,7 @@ def check_and_sync_positions(api, strategy):
         logging.error(f"Error syncing positions: {e}")
         return False, None
 
+
 def exit_all_positions(api, strategy, exit_message_placeholder):
     if not strategy.open_positions:
         exit_message_placeholder.info("No open positions to exit.")
@@ -443,30 +534,31 @@ def exit_all_positions(api, strategy, exit_message_placeholder):
     symbols_to_exit_now = list(strategy.open_positions.keys())
     for sym in symbols_to_exit_now:
         pos = strategy.open_positions[sym]
-        ltp, _, _, _, _, quote_data = get_live_price(api, sym)
-        if ltp is None or ltp == 0:
-            exit_message_placeholder.warning(f"Could not get live price for {sym}. Skipping manual exit.")
-            continue
         trantype = 'S' if pos['type'] == 'long' else 'B'
         product_type_to_use = pos['product_type']
-        
-        exit_limit_price = get_mid_price(quote_data, ltp) 
-        
-        if exit_limit_price == 0.0:
-             exit_message_placeholder.error(f"❌ Exit Order FAILED for {sym}. Cannot calculate mid-price for Limit Order.")
-             continue
-        exit_message_placeholder.warning(f"Manual Exit: Placing {product_type_to_use} Limit Order for {sym} @ {exit_limit_price:.2f} (Tick Adjusted)...")
-        
-        res = execute_trade(api, trantype, pos['size'], sym, product_type=product_type_to_use, limit_price=exit_limit_price)
-        
+
+        exit_message_placeholder.warning(f"Manual Exit: Placing {product_type_to_use} MARKET Order for {sym}...")
+
+        res = api.place_order(
+            buy_or_sell=trantype,
+            product_type='I' if product_type_to_use == 'M' else 'C',
+            exchange='NSE',
+            tradingsymbol=f"{sym}-EQ",
+            quantity=pos['size'],
+            discloseqty=0,
+            price_type='MKT',  # Market order
+            price=0,
+            retention='DAY'
+        )
+
         if res and res.get('stat') == 'Ok':
             order_no = res.get('norenordno')
             if order_no and 'order_conditions' in st.session_state:
-                st.session_state.order_conditions[order_no] = "Manual Exit"
-            
-            exit_message_placeholder.success(f"✅ Manual Exit Limit Order Placed for {sym}. (Order No: {res.get('norenordno')}). Waiting for broker sync...")
+                st.session_state.order_conditions[order_no] = "Manual Market Exit"
+
+            exit_message_placeholder.success(f"✅ Manual Market Exit Order Placed for {sym}. (Order No: {order_no}). Waiting for broker sync...")
         else:
-            exit_message_placeholder.error(f"❌ Manual Exit Order FAILED for {sym}. Error: {res.get('emsg', 'Unknown Error')}")
+            exit_message_placeholder.error(f"❌ Manual Market Exit Order FAILED for {sym}. Error: {res.get('emsg', 'Unknown Error')}")
     time_module.sleep(1)
     check_and_sync_positions(api, strategy)
 
@@ -532,7 +624,7 @@ def main():
         
         scan_limit = st.number_input("Max Stocks to Track (5-20)", min_value=5, max_value=200, value=20, step=1, key="scan_limit")
         
-        max_price = st.number_input("Stock Price Limit (₹)", min_value=10.0, max_value=20000.0, value=1000.0, step=100.0, key="max_prc")
+        max_price = st.number_input("Stock Price Limit (₹)", min_value=10.0, max_value=20000.0, value=1500.0, step=100.0, key="max_prc")
         min_trade_value = st.number_input("Min Daily Trade Value (₹)", min_value=0, value=5000000, step=1000000, key="min_trade_value", help="Minimum total value of shares traded today (Volume * LTP).")
         
         st.subheader("Entry Filters")
@@ -551,7 +643,7 @@ def main():
             quantity = st.number_input("Qty", 1, value=1, key="qty_input")
             trade_amount = None
         else:
-            trade_amount = st.number_input("Amount (₹)", 1000, value=1000, key="amt_input")
+            trade_amount = st.number_input("Amount (₹)", 1000, value=1500, key="amt_input")
             quantity = None
             
         st.divider()
@@ -672,9 +764,15 @@ def main():
                     logging.debug(f"Skipping {symbol}: Previously rejected today.")
                     continue
                 
-                if len(strategy.open_positions) >= max_positions:
-                    entry_placeholder.warning(f"Position limit ({max_positions}) reached mid-scan. Stopping new entries.")
-                    break 
+                all_positions = api.get_positions()
+                if all_positions and not (isinstance(all_positions, dict) and all_positions.get('stat') != 'Ok'):
+                    total_positions_in_account = len({pos.get('tsym', '').replace('-EQ', '') for pos in all_positions if int(pos.get('netqty', 0)) != 0})
+                else:
+                    total_positions_in_account = 0
+
+                if total_positions_in_account >= max_positions:
+                    entry_placeholder.warning(f"Max position limit ({max_positions}) reached in broker account. No new trades allowed.")
+                    break
                     
                 ltp, day_h, day_l, open_price, _, quote_data = get_live_price(api, symbol)
                 
@@ -912,27 +1010,31 @@ def main():
                 
                 if auto_trading and should_exit:
                     symbols_to_exit.append(sym)
-                    exit_message_placeholder.warning(f"⚡ Auto-Exiting {sym} due to: {reason.upper()}... Placing Limit Order.")
-                    
+                    exit_message_placeholder.warning(f"⚡ Auto-Exiting {sym} due to: {reason.upper()}... Placing MARKET Order.")
+
                     trantype = 'S' if pos['type'] == 'long' else 'B'
                     product_type_to_use = pos['product_type']
-                    
-                    exit_limit_price = get_mid_price(quote_data, ltp) 
-                    
-                    if exit_limit_price == 0.0:
-                         exit_message_placeholder.error(f"❌ Exit Order FAILED for {sym}. Cannot calculate mid-price for Limit Order. Try placing manually.")
-                         continue
-                    
-                    res = execute_trade(api, trantype, pos['size'], sym, product_type=product_type_to_use, limit_price=exit_limit_price)
-                    
+
+                    res = api.place_order(
+                        buy_or_sell=trantype,
+                        product_type='I' if product_type_to_use == 'M' else 'C',
+                        exchange='NSE',
+                        tradingsymbol=f"{sym}-EQ",
+                        quantity=pos['size'],
+                        discloseqty=0,
+                        price_type='MKT',  # Market order
+                        price=0,
+                        retention='DAY'
+                    )
+
                     if res and res.get('stat') == 'Ok':
                         order_no = res.get('norenordno')
                         if order_no and 'order_conditions' in st.session_state:
-                            st.session_state.order_conditions[order_no] = reason 
-                        exit_message_placeholder.success(f"✅ Exit Limit Order Placed for {sym}. (Order No: {order_no}, Product: {product_type_to_use})")
+                            st.session_state.order_conditions[order_no] = reason
+                        exit_message_placeholder.success(f"✅ Exit Market Order Placed for {sym}. (Order No: {order_no}, Product: {product_type_to_use})")
                         time_module.sleep(1)
                     else:
-                        exit_message_placeholder.error(f"❌ Exit Order FAILED for {sym}. Error: {res.get('emsg', 'Unknown Error')}")
+                        exit_message_placeholder.error(f"❌ Exit Market Order FAILED for {sym}. Error: {res.get('emsg', 'Unknown Error')}")
                         
             manual_exits = [item for item in pos_data if item['Action']]
             if manual_exits:
