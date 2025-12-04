@@ -243,31 +243,70 @@ def check_smart_bias_filter(api, symbol, min_candle_trade_value):
 
 def apply_tick_size(price, reference_price):
     """
-    Applies the NSE equity tick size rule for limit prices.
-    Rule: Below 250 -> 0.01; At/Above 250 -> 0.05.
+    Applies updated NSE equity tick size rules for limit prices:
+    - Below ₹250: tick size 0.01
+    - ₹251 to ₹1,000: tick size 0.05
+    - ₹1,001 to ₹5,000: tick size 0.10
+    - ₹5,001 to ₹10,000: tick size 0.50
+    - ₹10,001 to ₹20,000: tick size 1.00
+    - Above ₹20,001: tick size 5.00
     """
-    if reference_price >= 250.0:
-        # Tick size is 0.05
+    if reference_price < 250:
+        tick_size = 0.01
+    elif 251 <= reference_price <= 1000:
         tick_size = 0.05
-        return round(round(price / tick_size) * tick_size, 2)
+    elif 1001 <= reference_price <= 5000:
+        tick_size = 0.10
+    elif 5001 <= reference_price <= 10000:
+        tick_size = 0.50
+    elif 10001 <= reference_price <= 20000:
+        tick_size = 1.00
+    elif reference_price > 20001:
+        tick_size = 5.00
     else:
-        # Tick size is 0.01
-        return round(price, 2)
+        # For prices exactly 250 or between 250 and 251, safest fallback
+        tick_size = 0.05
 
-def get_mid_price(quote_data, ltp):
+    return round(round(price / tick_size) * tick_size, 2)
+
+def get_bid_price(quote_data, ltp):
+    """Get the best bid price (for SELL orders)"""
     try:
         bp1 = float(quote_data.get('bp1', 0.0))
-        sp1 = float(quote_data.get('sp1', 0.0))
-        if bp1 > 0 and sp1 > 0:
-            raw_price = (bp1 + sp1) / 2
-        else:
-            raw_price = ltp 
-        
-        if raw_price > 0:
-            return apply_tick_size(raw_price, ltp)
-        return 0.0
+        if bp1 > 0:
+            return apply_tick_size(bp1, ltp)
+        return apply_tick_size(ltp, ltp)  # Fallback to LTP
     except Exception as e:
-        return 0.0
+        logging.error(f"Error getting bid price: {e}")
+        return apply_tick_size(ltp, ltp)
+
+def get_ask_price(quote_data, ltp):
+    """Get the best ask/offer price (for BUY orders)"""
+    try:
+        sp1 = float(quote_data.get('sp1', 0.0))
+        if sp1 > 0:
+            return apply_tick_size(sp1, ltp)
+        return apply_tick_size(ltp, ltp)  # Fallback to LTP
+    except Exception as e:
+        logging.error(f"Error getting ask price: {e}")
+        return apply_tick_size(ltp, ltp)
+
+def has_pending_order(api, symbol):
+    """Check if there's already a pending/open order for the symbol"""
+    try:
+        orders = api.get_order_book()
+        if orders and not (isinstance(orders, dict) and orders.get('stat') != 'Ok'):
+            for order in orders:
+                order_symbol = order.get('tsym', '').replace('-EQ', '')
+                order_status = order.get('status', '').upper()
+                # Check for pending/open orders (not rejected, cancelled, or complete)
+                if order_symbol == symbol and order_status in ['PENDING', 'OPEN', 'TRIGGER_PENDING']:
+                    logging.info(f"Pending order found for {symbol}. Status: {order_status}")
+                    return True
+        return False
+    except Exception as e:
+        logging.error(f"Error checking pending orders for {symbol}: {e}")
+        return False  # On error, allow order placement
 
 def get_live_price(api, symbol, exchange="NSE"):
     try:
@@ -448,15 +487,27 @@ def exit_all_positions(api, strategy, exit_message_placeholder):
         if ltp is None or ltp == 0:
             exit_message_placeholder.warning(f"Could not get live price for {sym}. Skipping manual exit.")
             continue
+        
+        # **CHECK FOR PENDING ORDERS**
+        if has_pending_order(api, sym):
+            exit_message_placeholder.warning(f"â³ Pending order already exists for **{sym}**. Skipping exit to avoid duplicate.")
+            continue
+        
         trantype = 'S' if pos['type'] == 'long' else 'B'
         product_type_to_use = pos['product_type']
         
-        exit_limit_price = get_mid_price(quote_data, ltp) 
+        # Use bid for SELL, ask for BUY
+        if trantype == 'S':
+            exit_limit_price = get_bid_price(quote_data, ltp)
+            price_type = "Bid"
+        else:
+            exit_limit_price = get_ask_price(quote_data, ltp)
+            price_type = "Ask"
         
         if exit_limit_price == 0.0:
-             exit_message_placeholder.error(f"❌ Exit Order FAILED for {sym}. Cannot calculate mid-price for Limit Order.")
+             exit_message_placeholder.error(f"âŒ Exit Order FAILED for {sym}. Cannot calculate {price_type} price for Limit Order.")
              continue
-        exit_message_placeholder.warning(f"Manual Exit: Placing {product_type_to_use} Limit Order for {sym} @ {exit_limit_price:.2f} (Tick Adjusted)...")
+        exit_message_placeholder.warning(f"Manual Exit: Placing {product_type_to_use} Limit Order for {sym} @ {exit_limit_price:.2f} ({price_type}, Tick Adjusted)...")
         
         res = execute_trade(api, trantype, pos['size'], sym, product_type=product_type_to_use, limit_price=exit_limit_price)
         
@@ -465,10 +516,11 @@ def exit_all_positions(api, strategy, exit_message_placeholder):
             if order_no and 'order_conditions' in st.session_state:
                 st.session_state.order_conditions[order_no] = "Manual Exit"
             
-            exit_message_placeholder.success(f"✅ Manual Exit Limit Order Placed for {sym}. (Order No: {res.get('norenordno')}). Waiting for broker sync...")
+            exit_message_placeholder.success(f"âœ… Manual Exit Limit Order Placed for {sym}. (Order No: {res.get('norenordno')}). Waiting 5s for broker sync...")
+            time_module.sleep(5)  # **5 SECOND DELAY**
         else:
-            exit_message_placeholder.error(f"❌ Manual Exit Order FAILED for {sym}. Error: {res.get('emsg', 'Unknown Error')}")
-    time_module.sleep(1)
+            exit_message_placeholder.error(f"âŒ Manual Exit Order FAILED for {sym}. Error: {res.get('emsg', 'Unknown Error')}")
+    
     check_and_sync_positions(api, strategy)
 
 def create_chart(df, position_data=None):
@@ -487,6 +539,27 @@ def create_chart(df, position_data=None):
     fig.update_layout(xaxis_rangeslider_visible=False, height=600, margin=dict(l=0, r=0, t=30, b=0))
     return fig
 
+def get_total_positions_count(api):
+    """Get count of total positions (open + closed/settled) in broker account today"""
+    try:
+        all_positions = api.get_positions()
+        
+        if all_positions and not (isinstance(all_positions, dict) and all_positions.get('stat') != 'Ok'):
+            # Count all positions that have any activity today
+            total_count = 0
+            for pos in all_positions:
+                # Count if there's any buy or sell activity
+                buyqty = int(pos.get('buyqty', 0))
+                sellqty = int(pos.get('sellqty', 0))
+                
+                if buyqty > 0 or sellqty > 0:
+                    total_count += 1
+            
+            return total_count
+        return 0
+    except Exception as e:
+        logging.error(f"Error getting total positions count: {e}")
+        return 0
 
 # --- MAIN APP ---
 
@@ -534,12 +607,35 @@ def main():
         scan_limit = st.number_input("Max Stocks to Track (5-20)", min_value=5, max_value=200, value=20, step=1, key="scan_limit")
         
         max_price = st.number_input("Stock Price Limit (₹)", min_value=10.0, max_value=20000.0, value=1000.0, step=100.0, key="max_prc")
+        
         min_trade_value = st.number_input("Min Daily Trade Value (₹)", min_value=0, value=5000000, step=1000000, key="min_trade_value", help="Minimum total value of shares traded today (Volume * LTP).")
+        
         
         st.subheader("Entry Filters")
         
         enable_day_high_low_entry = st.checkbox("⭐ Enable Day High/Low Breakout Entry (ONLY Entry)", True, key="day_high_low_entry_toggle", help="Highest priority entry. Places order if LTP = Day High (Long) or LTP = Day Low (Short). Midpoint logic is removed.")
-
+        
+        # NEW: Entry Time Window Filter
+        enable_entry_time_window = st.checkbox("⏰ Enable Entry Time Window", True, key="entry_time_window_toggle", help="Only allow new entries between specified times")
+        
+        if enable_entry_time_window:
+            col_time1, col_time2 = st.columns(2)
+            with col_time1:
+                entry_start_time = st.time_input("Start Time", value=time(9, 17, 0), key="entry_start_time", help="Entries allowed after this time")
+            with col_time2:
+                entry_end_time = st.time_input("End Time", value=time(13, 0, 0), key="entry_end_time", help="Entries allowed before this time")
+        else:
+            entry_start_time = time(9, 17, 0)  # Default values
+            entry_end_time = time(13, 0, 0)
+        
+        # NEW: Max Total Positions (Open + Closed) Limit
+        enable_total_positions_limit = st.checkbox("📊 Enable Max Total Positions Limit (Broker Account)", False, key="enable_total_pos_limit_toggle", help="Limits total positions (open + closed today) in broker account")
+        
+        if enable_total_positions_limit:
+            max_total_positions = st.number_input("Max Total Positions (Open + Closed Today)", min_value=1, max_value=100, value=20, step=1, key="max_total_pos_input", help="Total number of positions (open + settled) allowed in broker account today")
+        else:
+            max_total_positions = 999  # No limit
+        
         st.subheader("Trade Settings")
         
         st.radio("New Entry Product Priority", ['MIS (Intraday) -> CNC (Delivery)'], index=0, disabled=True, help="Bot will attempt MIS first, then CNC if MIS fails.")
@@ -560,7 +656,7 @@ def main():
         auto_scan = st.toggle("🤖 Auto Scan (on load)", False, key="auto_scan_toggle", help="Automatically scans and generates the watchlist.")
         auto_trading = st.toggle("Enable Auto Trading (Multi-Stock)", False, key="auto_trade_toggle")
         
-        close_time_str = st.selectbox("Auto-Close Time", ["15:10:00"], index=0, key="close_time_select")
+        close_time_str = st.selectbox("Auto-Close Time", ["15:05:00"], index=0, key="close_time_select")
         
         current_time_ist_dt = get_current_ist_time()
         current_time_ist_time_only = current_time_ist_dt.time()
@@ -575,11 +671,30 @@ def main():
             st.session_state.manual_exit_all = True
 
         st.divider()
+        
         auto_refresh = st.toggle("🔄 Auto Refresh (5s)", value=False, key="auto_refresh_toggle")
         
         if not auto_scan:
             if st.button("🔍 Scan Watchlist", type="primary", key="scan_button"):
                 st.session_state.run_scanning = True
+        
+        # --- DANGER ZONE: Separated exit button ---
+        st.divider()
+        st.markdown("### ⚠️ DANGER ZONE")
+        st.caption("⚠️ **Warning:** This will exit ALL open positions immediately!")
+        
+        # Add extra spacing
+        st.write("")
+        
+        # Confirmation toggle before showing button
+        show_exit_button = st.checkbox("Enable Exit All Button", value=False, key="enable_exit_all_checkbox", help="Check this box to enable the Exit All button")
+        
+        if show_exit_button:
+            st.write("")  # Extra spacing
+            if st.button("🔴 EXIT ALL POSITIONS NOW", disabled=not strategy.open_positions, type="secondary", key="exit_all_btn", use_container_width=True):
+                st.session_state.manual_exit_all = True
+        else:
+            st.info("☑️ Check the box above to enable the Exit All button")
     
     st.title("🧪 Heavy Volume Breakout Bot (Day High/Low Only)")
     
@@ -587,10 +702,22 @@ def main():
     cash_avail = float(limits_resp.get('cash', 0))
     margin_used = float(limits_resp.get('marginused', 0))
     
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("💰 Available Cash", f"₹{cash_avail:,.2f}")
     c2.metric("🔒 Margin Used", f"₹{margin_used:,.2f}")
     c3.metric("📊 Auto-Trading", "Active" if auto_trading else "Inactive", delta_color="normal")
+    
+    # NEW: Show Total Positions Count
+    if enable_total_positions_limit:
+        total_pos_count = get_total_positions_count(api)
+        c4.metric("📊 Total Positions Today", f"{total_pos_count}/{max_total_positions}", 
+                  delta=f"{max_total_positions - total_pos_count} remaining", 
+                  delta_color="normal")
+    else:
+        c4.metric("⏰ Entry Window", 
+                  "Active" if enable_entry_time_window and entry_start_time <= current_time_ist_time_only <= entry_end_time else "All Day",
+                  delta_color="normal")
+    
     st.divider()
 
     current_date = get_current_ist_time().date()
@@ -663,400 +790,481 @@ def main():
         
         if auto_trading and strategy.screened_stocks and not is_close_time:
             st.subheader("Auto-Trade Monitor")
-            entry_placeholder.info(f"Monitoring {len(strategy.screened_stocks)} stocks for entry signal. Open positions: {len(strategy.open_positions)}.")
             
-            for symbol in strategy.screened_stocks:
-                if symbol in strategy.open_positions: 
-                    logging.debug(f"Skipping {symbol}: Position already open.")
-                    continue
-                if symbol in strategy.rejected_symbols: 
-                    logging.debug(f"Skipping {symbol}: Previously rejected today.")
-                    continue
+            # **NEW: Check Entry Time Window**
+            if enable_entry_time_window:
+                if not (entry_start_time <= current_time_ist_time_only <= entry_end_time):
+                    entry_placeholder.info(f"⏰ Outside entry time window ({entry_start_time.strftime('%H:%M:%S')} - {entry_end_time.strftime('%H:%M:%S')}). Current time: {ist_display_str}. Monitoring paused.")
+                    # Don't return, just skip the entry loop but continue monitoring
+                    st.subheader("Watchlist (Time Filter Active)")
+                else:
+                    entry_placeholder.info(f"✅ Within entry time window. Monitoring {len(strategy.screened_stocks)} stocks for entry signal. Open positions: {len(strategy.open_positions)}.")
+            else:
+                entry_placeholder.info(f"Monitoring {len(strategy.screened_stocks)} stocks for entry signal. Open positions: {len(strategy.open_positions)}.")
+            
+            # **NEW: Check Total Positions Limit in Broker Account**
+            if enable_total_positions_limit:
+                current_total_positions = get_total_positions_count(api)
                 
-                if len(strategy.open_positions) >= max_positions:
-                    entry_placeholder.warning(f"Position limit ({max_positions}) reached mid-scan. Stopping new entries.")
-                    break 
+                if current_total_positions >= max_total_positions:
+                    entry_placeholder.warning(f"🚫 Total positions limit reached! Broker Account: {current_total_positions}/{max_total_positions} positions (open + closed today). No new entries allowed.")
+                    # Skip entry scanning
+                    st.caption(f"📊 Total Broker Positions Today: **{current_total_positions}** (Limit: {max_total_positions})")
+                else:
+                    st.caption(f"📊 Total Broker Positions Today: **{current_total_positions}** / {max_total_positions}")
+            
+            # Only proceed with entry scanning if all conditions are met
+            can_enter_new_positions = True
+            
+            if enable_entry_time_window and not (entry_start_time <= current_time_ist_time_only <= entry_end_time):
+                can_enter_new_positions = False
+            
+            if enable_total_positions_limit and get_total_positions_count(api) >= max_total_positions:
+                can_enter_new_positions = False
+            
+            if can_enter_new_positions:
+                for symbol in strategy.screened_stocks:
+                    if symbol in strategy.open_positions: 
+                        logging.debug(f"Skipping {symbol}: Position already open.")
+                        continue
+                    if symbol in strategy.rejected_symbols: 
+                        logging.debug(f"Skipping {symbol}: Previously rejected today.")
+                        continue
                     
-                ltp, day_h, day_l, open_price, _, quote_data = get_live_price(api, symbol)
-                
-                if ltp is None or ltp == 0 or open_price == 0 or day_h == 0 or day_l == 0: continue
+                    if len(strategy.open_positions) >= max_positions:
+                        entry_placeholder.warning(f"Position limit ({max_positions}) reached mid-scan. Stopping new entries.")
+                        break 
+                    
+                    # **DOUBLE CHECK: Total positions limit before each order**
+                    if enable_total_positions_limit:
+                        if get_total_positions_count(api) >= max_total_positions:
+                            entry_placeholder.warning(f"🚫 Total positions limit reached during scan! No more entries.")
+                            break
+                        
+                    ltp, day_h, day_l, open_price, _, quote_data = get_live_price(api, symbol)
+                    
+                    if ltp is None or ltp == 0 or open_price == 0 or day_h == 0 or day_l == 0: continue
 
-                signal = None
-                signal_source = None
-                
-                if enable_day_high_low_entry:
-                    if ltp >= day_h and ltp > open_price: 
-                         signal = 'BUY'
-                         signal_source = 'Day High Break'
-                    elif ltp <= day_l and ltp < open_price: 
-                         signal = 'SELL'
-                         signal_source = 'Day Low Break'
+                    signal = None
+                    signal_source = None
+                    
+                    if enable_day_high_low_entry:
+                        if ltp >= day_h and ltp > open_price: 
+                             signal = 'BUY'
+                             signal_source = 'Day High Break'
+                        elif ltp <= day_l and ltp < open_price: 
+                             signal = 'SELL'
+                             signal_source = 'Day Low Break'
 
-                if signal:
-                    limit_price = get_mid_price(quote_data, ltp)
-                    
-                    if limit_price == 0.0: continue
+                    if signal:
+                        # ... [rest of the existing signal processing code remains the same] ...
+                    # **CHECK FOR PENDING ORDERS FIRST**
+                        if has_pending_order(api, symbol):
+                            entry_placeholder.warning(f"⏳ Pending order already exists for **{symbol}**. Skipping to avoid duplicate orders.")
+                            time_module.sleep(0.5)  # Small delay before next iteration
+                            continue
                         
-                    qty = int(trade_amount / limit_price) if sizing_mode == "Fixed Amount" and trade_amount else quantity
-                    if not quantity and not trade_amount or qty is None or qty <= 0: continue
+                        # Determine correct limit price based on signal direction
+                        if signal == 'BUY':
+                            limit_price = get_ask_price(quote_data, ltp)
+                            price_type = "Ask/Offer"
+                        else:  # SELL
+                            limit_price = get_bid_price(quote_data, ltp)
+                            price_type = "Bid"
+                        
+                        if limit_price == 0.0: 
+                            entry_placeholder.warning(f"Cannot calculate {price_type} price for {symbol}. Skipping.")
+                            continue
+                            
+                        qty = int(trade_amount / limit_price) if sizing_mode == "Fixed Amount" and trade_amount else quantity
+                        if not quantity and not trade_amount or qty is None or qty <= 0: continue
 
-                    trantype = 'B' if signal == 'BUY' else 'S'
-                    
-                    # 1. Attempt MIS (Intraday)
-                    entry_placeholder.success(f"⚡ {signal_source} Signal FOUND on **{symbol}**! Placing **MIS** Limit Order @ {limit_price:.2f} (Tick Adjusted)...")
-                    res_mis = execute_trade(api, trantype, qty, symbol, product_type='M', limit_price=limit_price)
-                    
-                    if res_mis and res_mis.get('stat') == 'Ok':
-                        order_no = res_mis.get('norenordno')
-                        if order_no and 'order_conditions' in st.session_state:
-                            st.session_state.order_conditions[order_no] = signal_source 
+                        trantype = 'B' if signal == 'BUY' else 'S'
                         
-                        entry_placeholder.success(f"✅ MIS Order Placed (Order No: {order_no}) for **{symbol}**. Waiting 3s to verify execution...")
-                        time_module.sleep(3)
+                        # 1. Attempt MIS (Intraday)
+                        entry_placeholder.success(f"⚡ {signal_source} Signal FOUND on **{symbol}**! Placing **MIS** Limit Order @ {limit_price:.2f} ({price_type}, Tick Adjusted)...")
+                        res_mis = execute_trade(api, trantype, qty, symbol, product_type='M', limit_price=limit_price)
                         
-                        # VERIFY ORDER WAS FILLED before adding to positions
-                        order_status = api.get_order_book()
-                        is_filled = False
-                        
-                        if order_status and not (isinstance(order_status, dict) and order_status.get('stat') != 'Ok'):
-                            for order in order_status:
-                                if order.get('norenordno') == order_no:
-                                    status = order.get('status', '').upper()
-                                    if status == 'COMPLETE':
-                                        is_filled = True
-                                        fill_price = float(order.get('avgprc', limit_price))
-                                        # NOW add to positions with actual fill price
-                                        strategy.enter_position(signal, fill_price, day_h, day_l, qty, symbol, product_type='M')
-                                        entry_placeholder.success(f"✅ MIS Order FILLED for **{symbol}** @ {fill_price:.2f}. Position added.")
-                                        time_module.sleep(1)
-                                        break
-                                    elif status == 'REJECTED':
+                        if res_mis and res_mis.get('stat') == 'Ok':
+                            order_no = res_mis.get('norenordno')
+                            if order_no and 'order_conditions' in st.session_state:
+                                st.session_state.order_conditions[order_no] = signal_source 
+                            
+                            entry_placeholder.success(f"✅ MIS Order Placed (Order No: {order_no}) for **{symbol}**. Waiting 5s to verify execution...")
+                            time_module.sleep(5)  # **5 SECOND DELAY**
+                            
+                            # VERIFY ORDER WAS FILLED before adding to positions
+                            order_status = api.get_order_book()
+                            is_filled = False
+                            is_rejected = False
+                            
+                            if order_status and not (isinstance(order_status, dict) and order_status.get('stat') != 'Ok'):
+                                for order in order_status:
+                                    if order.get('norenordno') == order_no:
+                                        status = order.get('status', '').upper()
+                                        if status == 'COMPLETE':
+                                            is_filled = True
+                                            fill_price = float(order.get('avgprc', limit_price))
+                                            # NOW add to positions with actual fill price
+                                            strategy.enter_position(signal, fill_price, day_h, day_l, qty, symbol, product_type='M')
+                                            entry_placeholder.success(f"✅ MIS Order FILLED for **{symbol}** @ {fill_price:.2f}. Position added.")
+                                            time_module.sleep(1)
+                                            break
+                                        elif status == 'REJECTED':
+                                            is_rejected = True
+                                            error_mis = order.get('rejreason', 'Order Rejected')
+                                            entry_placeholder.warning(f"⚠️ MIS Order REJECTED for **{symbol}**. Reason: {error_mis}")
+                                            break
+                            
+                            if is_filled:
+                                continue  # Move to next symbol - SUCCESS!
+                            
+                            # If order was rejected or not filled, get error message
+                            if is_rejected:
+                                # Get the actual rejection reason
+                                for order in order_status:
+                                    if order.get('norenordno') == order_no:
                                         error_mis = order.get('rejreason', 'Order Rejected')
-                                        entry_placeholder.warning(f"MIS Order REJECTED for **{symbol}**. Reason: {error_mis}")
                                         break
+                            else:
+                                error_mis = "Order not filled within 5 seconds"
+                        else:
+                            error_mis = res_mis.get('emsg', 'No API Response') if res_mis else 'No API Response'
+                            is_rejected = True  # API level rejection
                         
-                        if is_filled:
-                            continue  # Move to next symbol
+                        # --- CNC FALLBACK LOGIC ---
+                        # Only attempt CNC if:
+                        # 1. MIS order failed/rejected
+                        # 2. Signal is BUY (CNC doesn't support short selling)
                         
-                        # If not filled, fall through to CNC
-                        error_mis = "Order not filled" if not is_filled else res_mis.get('emsg', 'No API Response')
-                    else:
-                        error_mis = res_mis.get('emsg', 'No API Response') if res_mis else 'No API Response'
-                    
-                    logging.warning(f"MIS Order Failed/Not Filled for {symbol}. Error: {error_mis}. Waiting 2s before checking CNC...")
-                    entry_placeholder.warning(f"MIS failed for **{symbol}**. Error: {error_mis}. Checking CNC Fallback in 2s...")
-                    
-                    # --- Explicit 2-second delay ---
-                    time_module.sleep(2)
-                    
-                    # --- Condition to prevent CNC Sell Entry ---
-                    if trantype == 'S':
+                        if trantype == 'S':
+                            # SELL orders cannot use CNC fallback
+                            strategy.rejected_symbols.add(symbol)
+                            st.session_state.strategy = strategy 
+                            entry_placeholder.error(f"❌ MIS Sell Order Failed for **{symbol}**. Error: {error_mis}. CNC Fallback SKIPPED (CNC doesn't support short selling). Symbol rejected for today.")
+                            time_module.sleep(1)
+                            st.rerun()
+                        
+                        # --- If we reach here, it's a BUY order that failed MIS ---
+                        logging.warning(f"MIS Order Failed/Not Filled for {symbol}. Error: {error_mis}. Attempting CNC fallback...")
+                        entry_placeholder.warning(f"⚠️ MIS failed for **{symbol}**. Error: {error_mis}. Checking CNC Fallback in 2s...")
+                        
+                        # --- Explicit 2-second delay ---
+                        time_module.sleep(2)
+                        
+                        # 2. Attempt CNC (Delivery) - Only for BUY orders
+                        entry_placeholder.info(f"💼 Attempting CNC (Delivery) Buy for **{symbol}** @ {limit_price:.2f} ({price_type})...")
+                        res_cnc = execute_trade(api, trantype, qty, symbol, product_type='C', limit_price=limit_price)
+                        
+                        if res_cnc and res_cnc.get('stat') == 'Ok':
+                            order_no = res_cnc.get('norenordno')
+                            if order_no and 'order_conditions' in st.session_state:
+                                st.session_state.order_conditions[order_no] = signal_source 
+                            
+                            entry_placeholder.success(f"✅ CNC Order Placed (Order No: {order_no}) for **{symbol}**. Waiting 5s to verify execution...")
+                            time_module.sleep(5)  # **5 SECOND DELAY**
+                            
+                            # VERIFY ORDER WAS FILLED before adding to positions
+                            order_status = api.get_order_book()
+                            is_filled = False
+                            
+                            if order_status and not (isinstance(order_status, dict) and order_status.get('stat') != 'Ok'):
+                                for order in order_status:
+                                    if order.get('norenordno') == order_no:
+                                        status = order.get('status', '').upper()
+                                        if status == 'COMPLETE':
+                                            is_filled = True
+                                            fill_price = float(order.get('avgprc', limit_price))
+                                            # NOW add to positions with actual fill price
+                                            strategy.enter_position(signal, fill_price, day_h, day_l, qty, symbol, product_type='C')
+                                            entry_placeholder.success(f"✅ CNC Order FILLED for **{symbol}** @ {fill_price:.2f}. Position added.")
+                                            time_module.sleep(1)
+                                            break
+                                        elif status == 'REJECTED':
+                                            error_cnc = order.get('rejreason', 'Order Rejected')
+                                            entry_placeholder.error(f"❌ CNC Order REJECTED for **{symbol}**. Reason: {error_cnc}")
+                                            break
+                            
+                            if is_filled:
+                                continue  # Move to next symbol - SUCCESS!
+                            
+                            error_cnc = "Order not filled within 5 seconds" if not is_filled else res_cnc.get('emsg', 'Unknown Error')
+                        else:
+                            error_cnc = res_cnc.get('emsg', 'Unknown Error') if res_cnc else 'No API Response'
+                        
+                        # 3. Both MIS and CNC failed
                         strategy.rejected_symbols.add(symbol)
                         st.session_state.strategy = strategy 
-                        entry_placeholder.error(f"❌ MIS Sell Failed for **{symbol}**. Skipping CNC Fallback (CNC Short Selling not supported). Rejected for today.")
-                        st.rerun()
-                    
-                    # 2. Attempt CNC (Delivery) - Only if BUY
-                    entry_placeholder.info(f"Attempting CNC (Delivery) Buy for **{symbol}**...")
-                    res_cnc = execute_trade(api, trantype, qty, symbol, product_type='C', limit_price=limit_price)
-                    
-                    if res_cnc and res_cnc.get('stat') == 'Ok':
-                        order_no = res_cnc.get('norenordno')
-                        if order_no and 'order_conditions' in st.session_state:
-                            st.session_state.order_conditions[order_no] = signal_source 
                         
-                        entry_placeholder.success(f"✅ CNC Order Placed (Order No: {order_no}) for **{symbol}**. Waiting 3s to verify execution...")
-                        time_module.sleep(3)
-                        
-                        # VERIFY ORDER WAS FILLED before adding to positions
-                        order_status = api.get_order_book()
-                        is_filled = False
-                        
-                        if order_status and not (isinstance(order_status, dict) and order_status.get('stat') != 'Ok'):
-                            for order in order_status:
-                                if order.get('norenordno') == order_no:
-                                    status = order.get('status', '').upper()
-                                    if status == 'COMPLETE':
-                                        is_filled = True
-                                        fill_price = float(order.get('avgprc', limit_price))
-                                        # NOW add to positions with actual fill price
-                                        strategy.enter_position(signal, fill_price, day_h, day_l, qty, symbol, product_type='C')
-                                        entry_placeholder.success(f"✅ CNC Order FILLED for **{symbol}** @ {fill_price:.2f}. Position added.")
-                                        time_module.sleep(1)
-                                        break
-                                    elif status == 'REJECTED':
-                                        error_cnc = order.get('rejreason', 'Order Rejected')
-                                        break
-                        
-                        if is_filled:
-                            continue  # Move to next symbol
-                        
-                        error_cnc = "Order not filled" if not is_filled else res_cnc.get('emsg', 'Unknown Error')
-                    else:
-                        error_cnc = res_cnc.get('emsg', 'Unknown Error') if res_cnc else 'No API Response'
-                    
-                    # 3. Both failed
-                    strategy.rejected_symbols.add(symbol)
-                    st.session_state.strategy = strategy 
-                    
-                    entry_placeholder.error(f"❌ Order Failed for **{symbol}**. MIS Error: {error_mis}. CNC Error: {error_cnc}. Added to rejection list for today (will not re-order).")
-                    
-                    st.rerun() 
-
-            entry_placeholder.info(f"Monitoring complete. No new entry signals found. Open positions: {len(strategy.open_positions)}.")
-
-        col_scan, col_live = st.columns([1, 2])
-        
-        with col_scan:
-            st.subheader("Heavy Volume Watchlist")
-            if strategy.screened_stocks:
-                w_data = []
-                heavy_map = st.session_state.get('heavy_results', {})
-                for sym in strategy.screened_stocks:
-                    m = heavy_map.get(sym)
-                    is_open = sym in strategy.open_positions
-                    is_rejected = sym in strategy.rejected_symbols
-                    
-                    if m:
-                        status_icon = "⬆️" if m['Bias'] == 'BUY' else "⬇️"
-                        status_text = f"{status_icon} {m['Bias']}"
-                        
-                        if is_open: status_text = "✅ OPEN"
-                        if is_rejected: status_text = "⛔ REJECTED"
-                        
-                        w_data.append({
-                            "Symbol": sym,
-                            "Status": status_text,
-                            "Bias": m['Bias'],
-                            "Vol Ratio": f"{m['VolumeRatio']:.2f}x" if enable_daily_volume_screen else "N/A (Screen Off)",
-                            "Current Vol": f"{m['CurrentVolume']:,}",
-                            "Avg Vol (3d)": f"{m['AvgVolume']:,}" if enable_daily_volume_screen else "N/A",
-                            "LTP": f"{m['LTP']:.2f}",
-                            "Change (%)": f"{m['Change']:.2f}%"
-                        })
-                    else:
-                        ltp, _, _, _, _, _ = get_live_price(api, sym)
-                        status_text = "✅ OPEN" if is_open else "⛔ REJECTED" if is_rejected else "Monitoring"
-                        w_data.append({"Symbol": sym, "Status": status_text, "Bias": strategy.stock_bias.get(sym, 'N/A'), "Vol Ratio": "N/A (Screen Off)", "Current Vol": "N/A", "Avg Vol (3d)": "N/A", "LTP": f"{ltp:.2f}" if ltp else "N/A", "Change (%)": "N/A"})
-
-                st.dataframe(pd.DataFrame(w_data), hide_index=True, use_container_width=True)
-            else:
-                st.info("Run scan to populate the watchlist based on criteria.")
-                
-        with col_live:
-            st.subheader("Live Chart")
-            all_tradable_symbols = list(set(strategy.screened_stocks) | set(strategy.open_positions.keys()))
-            if all_tradable_symbols:
-                sorted_symbols = sorted(strategy.open_positions.keys()) + sorted([s for s in all_tradable_symbols if s not in strategy.open_positions])
-                sel_stock = st.selectbox("Select Stock to Chart", sorted_symbols, key="chart_stock_select") 
-            else:
-                sel_stock = None
-                
-            if sel_stock:
-                df = get_historical_data_for_volume(api, sel_stock, days_back=5) 
-                position_data = strategy.open_positions.get(sel_stock)
-                
-                if df is not None and len(df) > 0:
-                    fig = create_chart(df.tail(100), position_data)
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.warning(f"Historical data is unavailable for charting {sel_stock}.")
-    
-    with tab_positions:
-        st.subheader("📍 Open Positions Manager (Bot Tracked)")
-        
-        open_positions = strategy.open_positions
-        pos_data = []
-        total_pnl = 0.0 
-        
-        exit_message_placeholder = st.empty()
-        
-        if open_positions:
-            symbols_to_exit = []
-
-            for sym, pos in open_positions.items():
-                ltp, day_h, day_l, _, _, quote_data = get_live_price(api, sym)
-                
-                if ltp is None or ltp == 0:
-                    ltp = pos['entry_price']
-                    day_h = pos.get('day_high', ltp * 1.01)
-                    day_l = pos.get('day_low', ltp * 0.99)
-                
-                should_exit, reason = strategy.check_exit_conditions(sym, ltp, day_h, day_l)
-                
-                if not should_exit and is_close_time and pos['product_type'] == 'M':
-                    should_exit = True
-                    reason = "Market Close"
-                
-                netqty = pos['size'] if pos['type'] == 'long' else -pos['size']
-                avg_prc = pos['entry_price']
-                
-                pnl = (ltp - avg_prc) * netqty if pos['type'] == 'long' else (avg_prc - ltp) * abs(netqty)
-                total_pnl += pnl 
-                
-                exit_button_key = f"exit_button_{sym}"
-                
-                pos_data.append({
-                    "Symbol": sym,
-                    "Side": pos['type'].upper(),
-                    "Qty": netqty,
-                    "Avg": f"{avg_prc:.2f}",
-                    "LTP": f"{ltp:.2f}",
-                    "Target": f"{pos['target']:.2f}",
-                    "SL": f"{pos['stop_loss']:.2f}",
-                    "Trailing": f"{pos['trailing_stop']:.2f}" if pos['trailing_stop'] else 'N/A',
-                    "Product": pos['product_type'],
-                    "P&L_Float": pnl, 
-                    "Exit Hit?": f"⚠️ {reason.upper()}" if should_exit else "No",
-                    "Action": st.button("Exit", key=exit_button_key)
-                })
-                
-                if auto_trading and should_exit:
-                    symbols_to_exit.append(sym)
-                    exit_message_placeholder.warning(f"⚡ Auto-Exiting {sym} due to: {reason.upper()}... Placing Limit Order.")
-                    
-                    trantype = 'S' if pos['type'] == 'long' else 'B'
-                    product_type_to_use = pos['product_type']
-                    
-                    exit_limit_price = get_mid_price(quote_data, ltp) 
-                    
-                    if exit_limit_price == 0.0:
-                         exit_message_placeholder.error(f"❌ Exit Order FAILED for {sym}. Cannot calculate mid-price for Limit Order. Try placing manually.")
-                         continue
-                    
-                    res = execute_trade(api, trantype, pos['size'], sym, product_type=product_type_to_use, limit_price=exit_limit_price)
-                    
-                    if res and res.get('stat') == 'Ok':
-                        order_no = res.get('norenordno')
-                        if order_no and 'order_conditions' in st.session_state:
-                            st.session_state.order_conditions[order_no] = reason 
-                        exit_message_placeholder.success(f"✅ Exit Limit Order Placed for {sym}. (Order No: {order_no}, Product: {product_type_to_use})")
+                        entry_placeholder.error(f"❌ All Order Attempts Failed for **{symbol}**. MIS Error: {error_mis}. CNC Error: {error_cnc}. Added to rejection list for today (will not re-order).")
                         time_module.sleep(1)
-                    else:
-                        exit_message_placeholder.error(f"❌ Exit Order FAILED for {sym}. Error: {res.get('emsg', 'Unknown Error')}")
+                        st.rerun() 
+
+                entry_placeholder.info(f"Monitoring complete. No new entry signals found. Open positions: {len(strategy.open_positions)}.")
+
+            col_scan, col_live = st.columns([1, 2])
+            
+            with col_scan:
+                st.subheader("Heavy Volume Watchlist")
+                if strategy.screened_stocks:
+                    w_data = []
+                    heavy_map = st.session_state.get('heavy_results', {})
+                    for sym in strategy.screened_stocks:
+                        m = heavy_map.get(sym)
+                        is_open = sym in strategy.open_positions
+                        is_rejected = sym in strategy.rejected_symbols
                         
-            manual_exits = [item for item in pos_data if item['Action']]
-            if manual_exits:
-                for item in manual_exits:
-                    sym = item['Symbol']
-                    pos = open_positions[sym]
-                    
-                    ltp, _, _, _, _, quote_data = get_live_price(api, sym)
-                    
-                    trantype = 'S' if pos['type'] == 'long' else 'B'
-                    product_type_to_use = pos['product_type']
-                    
-                    exit_limit_price = get_mid_price(quote_data, ltp) 
-                    
-                    if exit_limit_price == 0.0:
-                         exit_message_placeholder.error(f"❌ Manual Exit Order FAILED for {sym}. Cannot calculate mid-price for Limit Order.")
-                         continue
-                         
-                    exit_message_placeholder.warning(f"Manual Exit: Placing {product_type_to_use} Limit Order for {sym} @ {exit_limit_price:.2f} (Tick Adjusted)...")
+                        if m:
+                            status_icon = "⬆️" if m['Bias'] == 'BUY' else "⬇️"
+                            status_text = f"{status_icon} {m['Bias']}"
+                            
+                            if is_open: status_text = "✅ OPEN"
+                            if is_rejected: status_text = "⛔ REJECTED"
+                            
+                            w_data.append({
+                                "Symbol": sym,
+                                "Status": status_text,
+                                "Bias": m['Bias'],
+                                "Vol Ratio": f"{m['VolumeRatio']:.2f}x" if enable_daily_volume_screen else "N/A (Screen Off)",
+                                "Current Vol": f"{m['CurrentVolume']:,}",
+                                "Avg Vol (3d)": f"{m['AvgVolume']:,}" if enable_daily_volume_screen else "N/A",
+                                "LTP": f"{m['LTP']:.2f}",
+                                "Change (%)": f"{m['Change']:.2f}%"
+                            })
+                        else:
+                            ltp, _, _, _, _, _ = get_live_price(api, sym)
+                            status_text = "✅ OPEN" if is_open else "⛔ REJECTED" if is_rejected else "Monitoring"
+                            w_data.append({"Symbol": sym, "Status": status_text, "Bias": strategy.stock_bias.get(sym, 'N/A'), "Vol Ratio": "N/A (Screen Off)", "Current Vol": "N/A", "Avg Vol (3d)": "N/A", "LTP": f"{ltp:.2f}" if ltp else "N/A", "Change (%)": "N/A"})
 
-                    res = execute_trade(api, trantype, pos['size'], sym, product_type=product_type_to_use, limit_price=exit_limit_price)
-
-                    if res and res.get('stat') == 'Ok':
-                        order_no = res.get('norenordno')
-                        if order_no and 'order_conditions' in st.session_state:
-                            st.session_state.order_conditions[order_no] = "Manual Exit"
-                        exit_message_placeholder.success(f"✅ Manual Exit Limit Order Placed for {sym}. (Order No: {order_no})")
-                    else:
-                        exit_message_placeholder.error(f"❌ Manual Exit Order FAILED for {sym}. Error: {res.get('emsg', 'Unknown Error')}")
-                
-                time_module.sleep(1)
-                st.rerun()
-
-            pos_data_display = []
-            for item in pos_data:
-                item['P&L'] = f"{item.pop('P&L_Float'):,.2f}" 
-                pos_data_display.append({k: item[k] for k in item if k != 'P&L_Float' and k != 'Action'})
-                
-            total_row = {
-                "Symbol": "**TOTAL**",
-                "Side": "",
-                "Qty": "",
-                "Avg": "",
-                "LTP": "",
-                "Target": "",
-                "SL": "",
-                "Trailing": "",
-                "Product": "",
-                "P&L": f"**{total_pnl:,.2f}**",
-                "Exit Hit?": "",
-            }
-            pos_data_display.append(total_row)
-            
-            df_display = pd.DataFrame(pos_data_display)
-            
-            st.dataframe(df_display, use_container_width=True)
-            
-        else:
-            st.info("No open positions being tracked by the bot.")
-
-        st.divider()
-        st.subheader("🏦 Broker Account Positions (Open & Settled Today)")
-        
-        all_positions = api.get_positions()
-        
-        if all_positions and not (isinstance(all_positions, dict) and all_positions.get('stat') != 'Ok'):
-            pos_df = pd.DataFrame(all_positions)
-            
-            def determine_status(row):
-                netqty = int(row.get('netqty', 0))
-                if netqty != 0:
-                    return 'OPEN'
-                elif int(row.get('sellqty', 0)) > 0 and int(row.get('buyqty', 0)) > 0:
-                    return 'CLOSED (Settled)'
+                    st.dataframe(pd.DataFrame(w_data), hide_index=True, use_container_width=True)
                 else:
-                    return 'CLOSED'
+                    st.info("Run scan to populate the watchlist based on criteria.")
                     
-            pos_df['Status'] = pos_df.apply(determine_status, axis=1)
-            
-            cols = ['tsym', 'netqty', 'buyqty', 'sellqty', 'netavgprc', 'ltp', 'rpnl', 'm2m_pnl', 'prd', 'Status']
-            show_cols = [c for c in cols if c in pos_df.columns]
-
-            st.dataframe(pos_df[show_cols], use_container_width=True)
-            st.caption("Note: **netqty** = Qty remaining open. **rpnl** = Realized P&L. **m2m_pnl** = Unrealized P&L. **prd** is the Product Type.")
-        else:
-            st.info("Failed to fetch all broker positions or no activity today.")
+            with col_live:
+                st.subheader("Live Chart")
+                all_tradable_symbols = list(set(strategy.screened_stocks) | set(strategy.open_positions.keys()))
+                if all_tradable_symbols:
+                    sorted_symbols = sorted(strategy.open_positions.keys()) + sorted([s for s in all_tradable_symbols if s not in strategy.open_positions])
+                    sel_stock = st.selectbox("Select Stock to Chart", sorted_symbols, key="chart_stock_select") 
+                else:
+                    sel_stock = None
+                    
+                if sel_stock:
+                    df = get_historical_data_for_volume(api, sel_stock, days_back=5) 
+                    position_data = strategy.open_positions.get(sel_stock)
+                    
+                    if df is not None and len(df) > 0:
+                        fig = create_chart(df.tail(100), position_data)
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.warning(f"Historical data is unavailable for charting {sel_stock}.")
         
-        if st.button("Force Refresh Positions"):
-            time_module.sleep(1)
-            st.rerun() 
+        with tab_positions:
+            st.subheader("📍 Open Positions Manager (Bot Tracked)")
             
-
-    with tab_orders:
-        st.subheader("📋 Today's Orders")
-        orders = api.get_order_book()
-        
-        if orders and not (isinstance(orders, dict) and orders.get('stat') != 'Ok'):
-            ord_df = pd.DataFrame(orders)
+            open_positions = strategy.open_positions
+            pos_data = []
+            total_pnl = 0.0 
             
-            ord_df['Condition Met'] = ord_df['norenordno'].astype(str).map(st.session_state.get('order_conditions', {}))
-            ord_df['Condition Met'] = ord_df['Condition Met'].fillna('N/A (Sync or Rejected)')
+            exit_message_placeholder = st.empty()
             
-            cols = ['norenordno', 'tsym', 'trantype', 'qty', 'prc', 'status', 'Condition Met', 'rejreason', 'norentm', 'prd']
-            show_cols = [c for c in cols if c in ord_df.columns]
-            st.dataframe(ord_df[show_cols], use_container_width=True)
-            st.caption("Product Type (`prd`): **C** = CNC/Delivery, **M** = MIS/Intraday. **Condition Met** tracks the strategy signal (Day High Break, SL Hit, Manual Exit, etc).")
-        else:
-            st.info("No orders placed today or API error fetching orders.")
+            if open_positions:
+                symbols_to_exit = []
 
-    with tab_trades:
-        st.subheader("📒 Executed Trades")
-        trades = api.get_trade_book()
-        if trades and not (isinstance(trades, dict) and trades.get('stat') != 'Ok'):
-            trd_df = pd.DataFrame(trades)
-            cols = ['norentm', 'tsym', 'trantype', 'qty', 'flprc', 'exchordid']
-            show_cols = [c for c in cols if c in trd_df.columns]
-            st.dataframe(trd_df[show_cols], use_container_width=True)
-        else:
-            st.info("No trades executed today or API error fetching trades.")
+                for sym, pos in open_positions.items():
+                    ltp, day_h, day_l, _, _, quote_data = get_live_price(api, sym)
+                    
+                    if ltp is None or ltp == 0:
+                        ltp = pos['entry_price']
+                        day_h = pos.get('day_high', ltp * 1.01)
+                        day_l = pos.get('day_low', ltp * 0.99)
+                    
+                    should_exit, reason = strategy.check_exit_conditions(sym, ltp, day_h, day_l)
+                    
+                    if not should_exit and is_close_time and pos['product_type'] == 'M':
+                        should_exit = True
+                        reason = "Market Close"
+                    
+                    netqty = pos['size'] if pos['type'] == 'long' else -pos['size']
+                    avg_prc = pos['entry_price']
+                    
+                    pnl = (ltp - avg_prc) * netqty if pos['type'] == 'long' else (avg_prc - ltp) * abs(netqty)
+                    total_pnl += pnl 
+                    
+                    exit_button_key = f"exit_button_{sym}"
+                    
+                    pos_data.append({
+                        "Symbol": sym,
+                        "Side": pos['type'].upper(),
+                        "Qty": netqty,
+                        "Avg": f"{avg_prc:.2f}",
+                        "LTP": f"{ltp:.2f}",
+                        "Target": f"{pos['target']:.2f}",
+                        "SL": f"{pos['stop_loss']:.2f}",
+                        "Trailing": f"{pos['trailing_stop']:.2f}" if pos['trailing_stop'] else 'N/A',
+                        "Product": pos['product_type'],
+                        "P&L_Float": pnl, 
+                        "Exit Hit?": f"⚠️ {reason.upper()}" if should_exit else "No",
+                        "Action": st.button("Exit", key=exit_button_key)
+                    })
+                    
+                    if auto_trading and should_exit:
+                        # **CHECK FOR PENDING ORDERS**
+                        if has_pending_order(api, sym):
+                            exit_message_placeholder.warning(f"â³ Pending order already exists for **{sym}**. Skipping auto-exit.")
+                            continue
+                        
+                        symbols_to_exit.append(sym)
+                        exit_message_placeholder.warning(f"âš¡ Auto-Exiting {sym} due to: {reason.upper()}... Placing Limit Order.")
+                        
+                        trantype = 'S' if pos['type'] == 'long' else 'B'
+                        product_type_to_use = pos['product_type']
+                        
+                        # Use bid for SELL, ask for BUY
+                        if trantype == 'S':
+                            exit_limit_price = get_bid_price(quote_data, ltp)
+                            price_type = "Bid"
+                        else:
+                            exit_limit_price = get_ask_price(quote_data, ltp)
+                            price_type = "Ask"
+                        
+                        if exit_limit_price == 0.0:
+                            exit_message_placeholder.error(f"âŒ Exit Order FAILED for {sym}. Cannot calculate {price_type} price for Limit Order. Try placing manually.")
+                            continue
+                        
+                        res = execute_trade(api, trantype, pos['size'], sym, product_type=product_type_to_use, limit_price=exit_limit_price)
+                        
+                        if res and res.get('stat') == 'Ok':
+                            order_no = res.get('norenordno')
+                            if order_no and 'order_conditions' in st.session_state:
+                                st.session_state.order_conditions[order_no] = reason 
+                            exit_message_placeholder.success(f"âœ… Exit Limit Order Placed for {sym}. (Order No: {order_no}, Product: {product_type_to_use}, Price: {exit_limit_price:.2f} {price_type})")
+                            time_module.sleep(5)  # **5 SECOND DELAY**
+                        else:
+                            exit_message_placeholder.error(f"âŒ Exit Order FAILED for {sym}. Error: {res.get('emsg', 'Unknown Error')}")
+                            
+                manual_exits = [item for item in pos_data if item['Action']]
+                if manual_exits:
+                    for item in manual_exits:
+                        sym = item['Symbol']
+                        pos = open_positions[sym]
+                        
+                        ltp, _, _, _, _, quote_data = get_live_price(api, sym)
+                        
+                        trantype = 'S' if pos['type'] == 'long' else 'B'
+                        product_type_to_use = pos['product_type']
+                        
+                        exit_limit_price = get_mid_price(quote_data, ltp) 
+                        
+                        if exit_limit_price == 0.0:
+                            exit_message_placeholder.error(f"❌ Manual Exit Order FAILED for {sym}. Cannot calculate mid-price for Limit Order.")
+                            continue
+                            
+                        exit_message_placeholder.warning(f"Manual Exit: Placing {product_type_to_use} Limit Order for {sym} @ {exit_limit_price:.2f} (Tick Adjusted)...")
 
-    if auto_refresh:
-        time_module.sleep(5)
-        st.rerun()
+                        res = execute_trade(api, trantype, pos['size'], sym, product_type=product_type_to_use, limit_price=exit_limit_price)
+
+                        if res and res.get('stat') == 'Ok':
+                            order_no = res.get('norenordno')
+                            if order_no and 'order_conditions' in st.session_state:
+                                st.session_state.order_conditions[order_no] = "Manual Exit"
+                            exit_message_placeholder.success(f"✅ Manual Exit Limit Order Placed for {sym}. (Order No: {order_no})")
+                        else:
+                            exit_message_placeholder.error(f"❌ Manual Exit Order FAILED for {sym}. Error: {res.get('emsg', 'Unknown Error')}")
+                    
+                    time_module.sleep(1)
+                    st.rerun()
+
+                pos_data_display = []
+                for item in pos_data:
+                    item['P&L'] = f"{item.pop('P&L_Float'):,.2f}" 
+                    pos_data_display.append({k: item[k] for k in item if k != 'P&L_Float' and k != 'Action'})
+                    
+                total_row = {
+                    "Symbol": "**TOTAL**",
+                    "Side": "",
+                    "Qty": "",
+                    "Avg": "",
+                    "LTP": "",
+                    "Target": "",
+                    "SL": "",
+                    "Trailing": "",
+                    "Product": "",
+                    "P&L": f"**{total_pnl:,.2f}**",
+                    "Exit Hit?": "",
+                }
+                pos_data_display.append(total_row)
+                
+                df_display = pd.DataFrame(pos_data_display)
+                
+                st.dataframe(df_display, use_container_width=True)
+                
+            else:
+                st.info("No open positions being tracked by the bot.")
+
+            st.divider()
+            st.subheader("🏦 Broker Account Positions (Open & Settled Today)")
+            
+            all_positions = api.get_positions()
+            
+            if all_positions and not (isinstance(all_positions, dict) and all_positions.get('stat') != 'Ok'):
+                pos_df = pd.DataFrame(all_positions)
+                
+                def determine_status(row):
+                    netqty = int(row.get('netqty', 0))
+                    if netqty != 0:
+                        return 'OPEN'
+                    elif int(row.get('sellqty', 0)) > 0 and int(row.get('buyqty', 0)) > 0:
+                        return 'CLOSED (Settled)'
+                    else:
+                        return 'CLOSED'
+                        
+                pos_df['Status'] = pos_df.apply(determine_status, axis=1)
+                
+                cols = ['tsym', 'netqty', 'buyqty', 'sellqty', 'netavgprc', 'ltp', 'rpnl', 'm2m_pnl', 'prd', 'Status']
+                show_cols = [c for c in cols if c in pos_df.columns]
+
+                st.dataframe(pos_df[show_cols], use_container_width=True)
+                st.caption("Note: **netqty** = Qty remaining open. **rpnl** = Realized P&L. **m2m_pnl** = Unrealized P&L. **prd** is the Product Type.")
+            else:
+                st.info("Failed to fetch all broker positions or no activity today.")
+            
+            if st.button("Force Refresh Positions"):
+                time_module.sleep(1)
+                st.rerun() 
+                
+
+        with tab_orders:
+            st.subheader("📋 Today's Orders")
+            orders = api.get_order_book()
+            
+            if orders and not (isinstance(orders, dict) and orders.get('stat') != 'Ok'):
+                ord_df = pd.DataFrame(orders)
+                
+                ord_df['Condition Met'] = ord_df['norenordno'].astype(str).map(st.session_state.get('order_conditions', {}))
+                ord_df['Condition Met'] = ord_df['Condition Met'].fillna('N/A (Sync or Rejected)')
+                
+                cols = ['norenordno', 'tsym', 'trantype', 'qty', 'prc', 'status', 'Condition Met', 'rejreason', 'norentm', 'prd']
+                show_cols = [c for c in cols if c in ord_df.columns]
+                st.dataframe(ord_df[show_cols], use_container_width=True)
+                st.caption("Product Type (`prd`): **C** = CNC/Delivery, **M** = MIS/Intraday. **Condition Met** tracks the strategy signal (Day High Break, SL Hit, Manual Exit, etc).")
+            else:
+                st.info("No orders placed today or API error fetching orders.")
+
+        with tab_trades:
+            st.subheader("📒 Executed Trades")
+            trades = api.get_trade_book()
+            if trades and not (isinstance(trades, dict) and trades.get('stat') != 'Ok'):
+                trd_df = pd.DataFrame(trades)
+                cols = ['norentm', 'tsym', 'trantype', 'qty', 'flprc', 'exchordid']
+                show_cols = [c for c in cols if c in trd_df.columns]
+                st.dataframe(trd_df[show_cols], use_container_width=True)
+            else:
+                st.info("No trades executed today or API error fetching trades.")
+
+        if auto_refresh:
+            time_module.sleep(5)
+            st.rerun()
 
 if __name__ == "__main__":
     main()
