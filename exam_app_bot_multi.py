@@ -354,8 +354,8 @@ def execute_trade(api, buy_or_sell, quantity, symbol, product_type, limit_price=
 
 
 # --- VOLUME SCREENING FUNCTION (3-Day Average) ---
-def get_heavy_volume_stocks(api, volume_multiplier, max_stocks, max_price, liquidity_filter_type, max_spread_pct, min_depth):
-    """Modified to use liquidity filter instead of min_trade_value"""
+def get_heavy_volume_stocks(api, volume_multiplier, max_stocks, max_price, liquidity_filter_type, max_spread_pct, min_depth, exclude_symbols=None):
+    """Modified to exclude closed positions"""
     # --- IST TIME CORRECTION ---
     now_ist = get_current_ist_time()
     current_date = now_ist.date()
@@ -365,14 +365,23 @@ def get_heavy_volume_stocks(api, volume_multiplier, max_stocks, max_price, liqui
     time_filter = last_minute.time()
     # --- END IST TIME CORRECTION ---
 
+    if exclude_symbols is None:
+        exclude_symbols = set()
+
     stock_list = get_fno_stocks_list()
     results = []
     
     for symbol in stock_list: 
         if len(results) >= max_stocks: 
             break
+        
+        # **SKIP CLOSED POSITIONS**
+        if symbol in exclude_symbols:
+            logging.debug(f"Skipping {symbol}: Already closed today.")
+            continue
             
         try:
+            # ... rest of the function remains the same ...
             # 1. Get Live Data 
             ltp, _, _, open_p, current_volume, quote_data = get_live_price(api, symbol)
 
@@ -642,6 +651,32 @@ def check_liquidity(quote_data, ltp, filter_type, max_spread_pct, min_depth):
         logging.error(f"Error in liquidity check: {e}")
         return False, {}
 
+def get_closed_positions_today(api):
+    """Get list of symbols that have closed positions today (to avoid re-scanning them)"""
+    try:
+        all_positions = api.get_positions()
+        
+        if all_positions and not (isinstance(all_positions, dict) and all_positions.get('stat') != 'Ok'):
+            closed_symbols = set()
+            
+            for pos in all_positions:
+                netqty = int(pos.get('netqty', 0))
+                buyqty = int(pos.get('buyqty', 0))
+                sellqty = int(pos.get('sellqty', 0))
+                symbol = pos.get('tsym', '').replace('-EQ', '')
+                
+                # If position is closed (netqty = 0) but had activity (buy and sell happened)
+                if netqty == 0 and buyqty > 0 and sellqty > 0:
+                    closed_symbols.add(symbol)
+                    logging.info(f"Found closed position for {symbol}. Will skip in scan.")
+            
+            return closed_symbols
+        
+        return set()
+    except Exception as e:
+        logging.error(f"Error getting closed positions: {e}")
+        return set()
+
 # --- MAIN APP ---
 
 def main():
@@ -847,6 +882,12 @@ def main():
     should_run_scan = st.session_state.get('run_scanning', False) or (auto_scan and not strategy.screened_stocks)
 
     if should_run_scan:
+        # **GET CLOSED POSITIONS TO EXCLUDE FROM SCAN**
+        closed_positions = get_closed_positions_today(api)
+        
+        if closed_positions:
+            st.info(f"🚫 Excluding {len(closed_positions)} stocks with closed positions today: {', '.join(sorted(list(closed_positions)[:5]))}{'...' if len(closed_positions) > 5 else ''}")
+        
         if enable_daily_volume_screen:
             with st.spinner(f"Scanning Heavy Volume Stocks (Multiplier: {volume_multiplier}x, Max: {scan_limit})..."):
                 heavy_results = get_heavy_volume_stocks(
@@ -856,7 +897,8 @@ def main():
                     max_price, 
                     liquidity_filter_type,
                     max_spread_pct,
-                    min_orderbook_depth
+                    min_orderbook_depth,
+                    exclude_symbols=closed_positions  # **PASS CLOSED POSITIONS**
                 )
                 
                 strategy.screened_stocks = [x['Symbol'] for x in heavy_results]
@@ -874,6 +916,11 @@ def main():
                 for symbol in full_fno_list:
                     if len(filtered_symbols) >= scan_limit:
                         break
+                    
+                    # **SKIP CLOSED POSITIONS**
+                    if symbol in closed_positions:
+                        logging.debug(f"Skipping {symbol}: Already closed today.")
+                        continue
                         
                     ltp, _, _, open_p, current_volume, quote_data = get_live_price(api, symbol)
 
@@ -1184,17 +1231,48 @@ def main():
                         sel_stock = st.selectbox("Select Stock to Chart", sorted_symbols, key="chart_stock_select") 
                     else:
                         sel_stock = None
+                        st.info("No stocks available for charting. Run scan first.")
                         
                     if sel_stock:
-                        df = get_historical_data_for_volume(api, sel_stock, days_back=5) 
-                        position_data = strategy.open_positions.get(sel_stock)
-                        
-                        if df is not None and len(df) > 0:
-                            fig = create_chart(df.tail(100), position_data)
-                            st.plotly_chart(fig, use_container_width=True)
-                        else:
-                            st.warning(f"Historical data is unavailable for charting {sel_stock}.")
-        
+                        with st.spinner(f"Loading chart for {sel_stock}..."):
+                            df = get_historical_data_for_volume(api, sel_stock, days_back=5, interval='1')
+                            position_data = strategy.open_positions.get(sel_stock)
+                            
+                            if df is not None and not df.empty and len(df) > 0:
+                                try:
+                                    # Get current price for reference
+                                    current_ltp, current_high, current_low, _, _, _ = get_live_price(api, sel_stock)
+                                    
+                                    fig = create_chart(df.tail(100), position_data)
+                                    
+                                    if fig:
+                                        st.plotly_chart(fig, use_container_width=True)
+                                        
+                                        # Show current price info
+                                        col_info1, col_info2, col_info3 = st.columns(3)
+                                        if current_ltp:
+                                            col_info1.metric("Current LTP", f"₹{current_ltp:.2f}")
+                                        if current_high:
+                                            col_info2.metric("Day High", f"₹{current_high:.2f}")
+                                        if current_low:
+                                            col_info3.metric("Day Low", f"₹{current_low:.2f}")
+                                    else:
+                                        st.error(f"Failed to create chart for {sel_stock}.")
+                                except Exception as e:
+                                    st.error(f"Error displaying chart: {str(e)}")
+                                    logging.error(f"Chart error for {sel_stock}: {e}")
+                            else:
+                                st.warning(f"📊 No historical data available for {sel_stock}. Chart cannot be displayed.")
+                                
+                                # Show at least current price if available
+                                current_ltp, current_high, current_low, current_open, _, _ = get_live_price(api, sel_stock)
+                                if current_ltp:
+                                    st.info("**Current Market Data:**")
+                                    col1, col2, col3, col4 = st.columns(4)
+                                    col1.metric("LTP", f"₹{current_ltp:.2f}")
+                                    col2.metric("Open", f"₹{current_open:.2f}" if current_open else "N/A")
+                                    col3.metric("High", f"₹{current_high:.2f}" if current_high else "N/A")
+                                    col4.metric("Low", f"₹{current_low:.2f}" if current_low else "N/A")
         with tab_positions:
             st.subheader("📍 Open Positions Manager (Bot Tracked)")
             
@@ -1357,11 +1435,37 @@ def main():
                         
                 pos_df['Status'] = pos_df.apply(determine_status, axis=1)
                 
+                # Calculate totals
+                total_rpnl = pos_df['rpnl'].astype(float).sum() if 'rpnl' in pos_df.columns else 0.0
+                total_m2m = pos_df['m2m_pnl'].astype(float).sum() if 'm2m_pnl' in pos_df.columns else 0.0
+                total_pnl = total_rpnl + total_m2m
+                
                 cols = ['tsym', 'netqty', 'buyqty', 'sellqty', 'netavgprc', 'ltp', 'rpnl', 'm2m_pnl', 'prd', 'Status']
                 show_cols = [c for c in cols if c in pos_df.columns]
-
-                st.dataframe(pos_df[show_cols], use_container_width=True)
+                
+                # Create display dataframe
+                display_df = pos_df[show_cols].copy()
+                
+                # Add total row
+                total_row = pd.Series({col: '' for col in show_cols})
+                total_row['tsym'] = '**TOTAL**'
+                if 'rpnl' in show_cols:
+                    total_row['rpnl'] = f"**{total_rpnl:.2f}**"
+                if 'm2m_pnl' in show_cols:
+                    total_row['m2m_pnl'] = f"**{total_m2m:.2f}**"
+                total_row['Status'] = f"**Total P&L: ₹{total_pnl:.2f}**"
+                
+                # Append total row
+                display_df = pd.concat([display_df, pd.DataFrame([total_row])], ignore_index=True)
+                
+                st.dataframe(display_df, use_container_width=True)
                 st.caption("Note: **netqty** = Qty remaining open. **rpnl** = Realized P&L. **m2m_pnl** = Unrealized P&L. **prd** is the Product Type.")
+                
+                # Display summary metrics
+                col_metric1, col_metric2, col_metric3 = st.columns(3)
+                col_metric1.metric("💰 Realized P&L", f"₹{total_rpnl:,.2f}", delta_color="normal")
+                col_metric2.metric("📊 Unrealized P&L", f"₹{total_m2m:,.2f}", delta_color="normal")
+                col_metric3.metric("📈 Total P&L", f"₹{total_pnl:,.2f}", delta_color="normal")
             else:
                 st.info("Failed to fetch all broker positions or no activity today.")
             
