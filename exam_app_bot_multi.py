@@ -30,7 +30,7 @@ from api_helper import NorenApiPy
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Flattrade API Credentials ---
-USER_SESSION = "2811ab88839428bf06f939ffdca6046a02055346d367cd7fc614c0e5503e0a46"
+USER_SESSION = "fa9482eab1927e81251236e7d1a352dcfe8a4d180bde22c2b8a9297c33d7fd89"
 USER_ID = "FZ03508"
 FLATTRADE_PASSWORD = "Shubhi@3"
 
@@ -354,7 +354,8 @@ def execute_trade(api, buy_or_sell, quantity, symbol, product_type, limit_price=
 
 
 # --- VOLUME SCREENING FUNCTION (3-Day Average) ---
-def get_heavy_volume_stocks(api, volume_multiplier, max_stocks, max_price, min_trade_value):
+def get_heavy_volume_stocks(api, volume_multiplier, max_stocks, max_price, liquidity_filter_type, max_spread_pct, min_depth):
+    """Modified to use liquidity filter instead of min_trade_value"""
     # --- IST TIME CORRECTION ---
     now_ist = get_current_ist_time()
     current_date = now_ist.date()
@@ -375,12 +376,19 @@ def get_heavy_volume_stocks(api, volume_multiplier, max_stocks, max_price, min_t
             # 1. Get Live Data 
             ltp, _, _, open_p, current_volume, quote_data = get_live_price(api, symbol)
 
-            if ltp is None or ltp == 0 or open_p == 0: continue
+            if ltp is None or ltp == 0 or open_p == 0 or quote_data is None: 
+                continue
             
             # **STRICT PRICE FILTER**: Reject stocks priced above max_price
-            if ltp > max_price: continue
-            trade_value = current_volume * ltp
-            if trade_value < min_trade_value: continue
+            if ltp > max_price: 
+                continue
+            
+            # **NEW: LIQUIDITY FILTER** (replaces trade_value check)
+            is_liquid, liquidity_details = check_liquidity(quote_data, ltp, liquidity_filter_type, max_spread_pct, min_depth)
+            
+            if not is_liquid:
+                logging.debug(f"{symbol} failed liquidity filter. Spread: {liquidity_details.get('spread_pct', 0):.2f}%, Depth: ₹{liquidity_details.get('depth_value', 0):,.0f}")
+                continue
             
             # 2. Get Historical Volume Data 
             hist_df = get_historical_data_for_volume(api, symbol, days_back=5) 
@@ -423,7 +431,10 @@ def get_heavy_volume_stocks(api, volume_multiplier, max_stocks, max_price, min_t
                     'CurrentVolume': int(current_volume),
                     'AvgVolume': int(average_volume),
                     'VolumeRatio': volume_ratio,
-                    'TradeValue': trade_value
+                    'Spread': liquidity_details.get('spread_pct', 0),
+                    'Depth': liquidity_details.get('depth_value', 0),
+                    'BidQty': liquidity_details.get('bq1', 0),
+                    'AskQty': liquidity_details.get('sq1', 0)
                 })
 
         except Exception as e:
@@ -433,7 +444,6 @@ def get_heavy_volume_stocks(api, volume_multiplier, max_stocks, max_price, min_t
     results.sort(key=lambda x: x['VolumeRatio'], reverse=True)
     
     return results[:max_stocks]
-
 
 def check_and_sync_positions(api, strategy):
     try:
@@ -561,6 +571,77 @@ def get_total_positions_count(api):
         logging.error(f"Error getting total positions count: {e}")
         return 0
 
+def calculate_bid_ask_spread(quote_data):
+    """Calculate bid-ask spread percentage"""
+    try:
+        bp1 = float(quote_data.get('bp1', 0.0))
+        sp1 = float(quote_data.get('sp1', 0.0))
+        
+        if bp1 <= 0 or sp1 <= 0:
+            return 999.0  # Invalid spread
+        
+        mid_price = (bp1 + sp1) / 2
+        spread_pct = ((sp1 - bp1) / mid_price) * 100
+        
+        return spread_pct
+    except Exception as e:
+        logging.error(f"Error calculating spread: {e}")
+        return 999.0
+
+def calculate_orderbook_depth(quote_data, ltp):
+    """Calculate orderbook depth (combined value at best bid and ask)"""
+    try:
+        bp1 = float(quote_data.get('bp1', 0.0))
+        sp1 = float(quote_data.get('sp1', 0.0))
+        bq1 = int(quote_data.get('bq1', 0))
+        sq1 = int(quote_data.get('sq1', 0))
+        
+        if bp1 <= 0 or sp1 <= 0 or bq1 <= 0 or sq1 <= 0:
+            return 0.0
+        
+        # Total value at best bid and ask levels
+        bid_value = bp1 * bq1
+        ask_value = sp1 * sq1
+        total_depth = bid_value + ask_value
+        
+        return total_depth
+    except Exception as e:
+        logging.error(f"Error calculating depth: {e}")
+        return 0.0
+
+def check_liquidity(quote_data, ltp, filter_type, max_spread_pct, min_depth):
+    """
+    Check if stock passes liquidity filters
+    Returns: (is_liquid, details_dict)
+    """
+    try:
+        spread_pct = calculate_bid_ask_spread(quote_data)
+        depth_value = calculate_orderbook_depth(quote_data, ltp)
+        
+        details = {
+            'spread_pct': spread_pct,
+            'depth_value': depth_value,
+            'bp1': float(quote_data.get('bp1', 0.0)),
+            'sp1': float(quote_data.get('sp1', 0.0)),
+            'bq1': int(quote_data.get('bq1', 0)),
+            'sq1': int(quote_data.get('sq1', 0))
+        }
+        
+        if filter_type == "Bid-Ask Spread %":
+            is_liquid = spread_pct <= max_spread_pct
+            
+        elif filter_type == "Orderbook Depth":
+            is_liquid = depth_value >= min_depth
+            
+        else:  # Combined
+            is_liquid = (spread_pct <= max_spread_pct) and (depth_value >= min_depth)
+        
+        return is_liquid, details
+        
+    except Exception as e:
+        logging.error(f"Error in liquidity check: {e}")
+        return False, {}
+
 # --- MAIN APP ---
 
 def main():
@@ -597,19 +678,49 @@ def main():
         
         st.subheader("Volume Screening Parameters")
         
-        enable_daily_volume_screen = st.checkbox("✅ Enable Daily Heavy Volume Screen", value=True, key="enable_daily_vol_screen", help="If unchecked, the bot monitors F&O stocks but ignores the 3-day average cumulative volume filter.")
+        enable_daily_volume_screen = st.checkbox("✅ Enable Daily Heavy Volume Screen", value=False, key="enable_daily_vol_screen", help="If unchecked, the bot monitors F&O stocks but ignores the 3-day average cumulative volume filter.")
 
         if enable_daily_volume_screen:
             volume_multiplier = st.slider("Volume Multiplier (X times 3-day Avg)", 2.0, 10.0, 3.0, 0.5, key="vol_mult_slider", help="Current cumulative volume must be this many times the 3-day average volume for the same time.")
         else:
              volume_multiplier = 3.0 # Default value, ignored if screen is off
         
-        scan_limit = st.number_input("Max Stocks to Track (5-20)", min_value=5, max_value=200, value=20, step=1, key="scan_limit")
+        scan_limit = st.number_input("Max Stocks to Track (5-20)", min_value=5, max_value=200, value=100, step=1, key="scan_limit")
         
-        max_price = st.number_input("Stock Price Limit (₹)", min_value=10.0, max_value=20000.0, value=1000.0, step=100.0, key="max_prc")
+        max_price = st.number_input("Stock Price Limit (₹)", min_value=10.0, max_value=20000.0, value=1500.0, step=100.0, key="max_prc")
         
-        min_trade_value = st.number_input("Min Daily Trade Value (₹)", min_value=0, value=5000000, step=1000000, key="min_trade_value", help="Minimum total value of shares traded today (Volume * LTP).")
+        # NEW: Liquidity Filter (replaces Min Trade Value)
+        st.markdown("**💧 Liquidity Filter**")
+        liquidity_filter_type = st.selectbox(
+            "Filter Type",
+            ["Bid-Ask Spread %", "Orderbook Depth", "Combined (Spread + Depth)"],
+            index=2,
+            key="liquidity_filter_type",
+            help="Choose how to filter liquid stocks"
+        )
         
+        if liquidity_filter_type in ["Bid-Ask Spread %", "Combined (Spread + Depth)"]:
+            max_spread_pct = st.slider(
+                "Max Bid-Ask Spread %", 
+                0.1, 2.0, 0.5, 0.1, 
+                key="max_spread_pct",
+                help="Lower spread = more liquid. Typical liquid stocks: <0.5%"
+            )
+        else:
+            max_spread_pct = 2.0  # Default if not used
+        
+        if liquidity_filter_type in ["Orderbook Depth", "Combined (Spread + Depth)"]:
+            min_orderbook_depth = st.number_input(
+                "Min Orderbook Depth (₹)", 
+                min_value=10000, 
+                max_value=10000000, 
+                value=100000, 
+                step=10000,
+                key="min_orderbook_depth",
+                help="Minimum combined value at best bid + ask (in ₹)"
+            )
+        else:
+            min_orderbook_depth = 0  # Default if not used
         
         st.subheader("Entry Filters")
         
@@ -629,10 +740,10 @@ def main():
             entry_end_time = time(13, 0, 0)
         
         # NEW: Max Total Positions (Open + Closed) Limit
-        enable_total_positions_limit = st.checkbox("📊 Enable Max Total Positions Limit (Broker Account)", False, key="enable_total_pos_limit_toggle", help="Limits total positions (open + closed today) in broker account")
+        enable_total_positions_limit = st.checkbox("📊 Enable Max Total Positions Limit (Broker Account)", True, key="enable_total_pos_limit_toggle", help="Limits total positions (open + closed today) in broker account")
         
         if enable_total_positions_limit:
-            max_total_positions = st.number_input("Max Total Positions (Open + Closed Today)", min_value=1, max_value=100, value=20, step=1, key="max_total_pos_input", help="Total number of positions (open + settled) allowed in broker account today")
+            max_total_positions = st.number_input("Max Total Positions (Open + Closed Today)", min_value=1, max_value=100, value=15, step=1, key="max_total_pos_input", help="Total number of positions (open + settled) allowed in broker account today")
         else:
             max_total_positions = 999  # No limit
         
@@ -643,12 +754,12 @@ def main():
         max_positions = st.number_input("Max Open Positions Limit", min_value=1, value=10, step=1, key="max_pos_limit")
 
         st.subheader("Position Sizing")
-        sizing_mode = st.radio("Mode", ["Fixed Quantity", "Fixed Amount"], key="size_mode")
+        sizing_mode = st.radio("Mode", ["Fixed Amount", "Fixed Quantity"], key="size_mode")
         if sizing_mode == "Fixed Quantity":
             quantity = st.number_input("Qty", 1, value=1, key="qty_input")
             trade_amount = None
         else:
-            trade_amount = st.number_input("Amount (₹)", 1000, value=1000, key="amt_input")
+            trade_amount = st.number_input("Amount (₹)", 1000, value=1500, key="amt_input")
             quantity = None
             
         st.divider()
@@ -738,13 +849,21 @@ def main():
     if should_run_scan:
         if enable_daily_volume_screen:
             with st.spinner(f"Scanning Heavy Volume Stocks (Multiplier: {volume_multiplier}x, Max: {scan_limit})..."):
-                heavy_results = get_heavy_volume_stocks(api, volume_multiplier, int(scan_limit), max_price, min_trade_value)
+                heavy_results = get_heavy_volume_stocks(
+                    api, 
+                    volume_multiplier, 
+                    int(scan_limit), 
+                    max_price, 
+                    liquidity_filter_type,
+                    max_spread_pct,
+                    min_orderbook_depth
+                )
                 
                 strategy.screened_stocks = [x['Symbol'] for x in heavy_results]
                 strategy.stock_bias = {x['Symbol']: x['Bias'] for x in heavy_results}
                 st.session_state.heavy_results = {x['Symbol']: x for x in heavy_results}
                 st.session_state.run_scanning = False 
-                st.success(f"Screened {len(strategy.screened_stocks)} stocks meeting **3-day heavy volume** criteria.")
+                st.success(f"Screened {len(strategy.screened_stocks)} stocks meeting **3-day heavy volume + liquidity** criteria.")
         else:
             with st.spinner(f"Scanning F&O Stocks (Max: {scan_limit}, Max Price: ₹{max_price})..."):
                 
@@ -756,13 +875,18 @@ def main():
                     if len(filtered_symbols) >= scan_limit:
                         break
                         
-                    ltp, _, _, open_p, current_volume, _ = get_live_price(api, symbol)
+                    ltp, _, _, open_p, current_volume, quote_data = get_live_price(api, symbol)
 
-                    if ltp is None or ltp == 0 or open_p == 0: continue
+                    if ltp is None or ltp == 0 or open_p == 0 or quote_data is None: 
+                        continue
                     
-                    if ltp > max_price: continue
-                    trade_value = current_volume * ltp
-                    if trade_value < min_trade_value: continue
+                    if ltp > max_price: 
+                        continue
+                    
+                    # **LIQUIDITY FILTER**
+                    is_liquid, liquidity_details = check_liquidity(quote_data, ltp, liquidity_filter_type, max_spread_pct, min_orderbook_depth)
+                    if not is_liquid:
+                        continue
                     
                     filtered_symbols.append(symbol)
                     
@@ -770,17 +894,22 @@ def main():
                     bias = 'BUY' if ltp >= open_p else 'SELL'
 
                     temp_results[symbol] = {
-                        'Symbol': symbol, 'LTP': ltp, 'Change': chg, 'Bias': bias,
-                        'CurrentVolume': int(current_volume), 'AvgVolume': 0, 'VolumeRatio': 0.0,
-                        'TradeValue': trade_value
+                        'Symbol': symbol, 
+                        'LTP': ltp, 
+                        'Change': chg, 
+                        'Bias': bias,
+                        'CurrentVolume': int(current_volume), 
+                        'AvgVolume': 0, 
+                        'VolumeRatio': 0.0,
+                        'Spread': liquidity_details.get('spread_pct', 0),
+                        'Depth': liquidity_details.get('depth_value', 0)
                     }
 
                 strategy.screened_stocks = filtered_symbols
                 strategy.stock_bias = {s: temp_results[s]['Bias'] for s in filtered_symbols}
                 st.session_state.heavy_results = temp_results
                 st.session_state.run_scanning = False 
-                st.success(f"**Volume screening disabled.** Monitoring {len(strategy.screened_stocks)} stocks filtered by price/value criteria.")
-
+                st.success(f"**Volume screening disabled.** Monitoring {len(strategy.screened_stocks)} liquid stocks filtered by price/liquidity criteria.")
     tab_monitor, tab_positions, tab_orders, tab_trades = st.tabs([
         "📈 Strategy Monitor", "📍 Open Positions & Exit", "📋 Order Book", "📒 Trade Book"
     ])
@@ -1024,40 +1153,47 @@ def main():
                             w_data.append({
                                 "Symbol": sym,
                                 "Status": status_text,
-                                "Bias": m['Bias'],
-                                "Vol Ratio": f"{m['VolumeRatio']:.2f}x" if enable_daily_volume_screen else "N/A (Screen Off)",
-                                "Current Vol": f"{m['CurrentVolume']:,}",
-                                "Avg Vol (3d)": f"{m['AvgVolume']:,}" if enable_daily_volume_screen else "N/A",
-                                "LTP": f"{m['LTP']:.2f}",
-                                "Change (%)": f"{m['Change']:.2f}%"
+                                "LTP": f"₹{m['LTP']:.2f}",
+                                "Spread %": f"{m['Spread']:.2f}%" if m['Spread'] < 999 else "N/A",
+                                "Depth": f"₹{m['Depth']:,.0f}" if m['Depth'] > 0 else "N/A",
+                                "Vol Ratio": f"{m['VolumeRatio']:.2f}x" if enable_daily_volume_screen else "N/A",
+                                "Change %": f"{m['Change']:.2f}%"
                             })
                         else:
                             ltp, _, _, _, _, _ = get_live_price(api, sym)
                             status_text = "✅ OPEN" if is_open else "⛔ REJECTED" if is_rejected else "Monitoring"
-                            w_data.append({"Symbol": sym, "Status": status_text, "Bias": strategy.stock_bias.get(sym, 'N/A'), "Vol Ratio": "N/A (Screen Off)", "Current Vol": "N/A", "Avg Vol (3d)": "N/A", "LTP": f"{ltp:.2f}" if ltp else "N/A", "Change (%)": "N/A"})
+                            w_data.append({
+                                "Symbol": sym, 
+                                "Status": status_text, 
+                                "LTP": f"₹{ltp:.2f}" if ltp else "N/A",
+                                "Spread %": "N/A",
+                                "Depth": "N/A",
+                                "Vol Ratio": "N/A",
+                                "Change %": "N/A"
+                            })
 
                     st.dataframe(pd.DataFrame(w_data), hide_index=True, use_container_width=True)
                 else:
                     st.info("Run scan to populate the watchlist based on criteria.")
-                    
-            with col_live:
-                st.subheader("Live Chart")
-                all_tradable_symbols = list(set(strategy.screened_stocks) | set(strategy.open_positions.keys()))
-                if all_tradable_symbols:
-                    sorted_symbols = sorted(strategy.open_positions.keys()) + sorted([s for s in all_tradable_symbols if s not in strategy.open_positions])
-                    sel_stock = st.selectbox("Select Stock to Chart", sorted_symbols, key="chart_stock_select") 
-                else:
-                    sel_stock = None
-                    
-                if sel_stock:
-                    df = get_historical_data_for_volume(api, sel_stock, days_back=5) 
-                    position_data = strategy.open_positions.get(sel_stock)
-                    
-                    if df is not None and len(df) > 0:
-                        fig = create_chart(df.tail(100), position_data)
-                        st.plotly_chart(fig, use_container_width=True)
+                        
+                with col_live:
+                    st.subheader("Live Chart")
+                    all_tradable_symbols = list(set(strategy.screened_stocks) | set(strategy.open_positions.keys()))
+                    if all_tradable_symbols:
+                        sorted_symbols = sorted(strategy.open_positions.keys()) + sorted([s for s in all_tradable_symbols if s not in strategy.open_positions])
+                        sel_stock = st.selectbox("Select Stock to Chart", sorted_symbols, key="chart_stock_select") 
                     else:
-                        st.warning(f"Historical data is unavailable for charting {sel_stock}.")
+                        sel_stock = None
+                        
+                    if sel_stock:
+                        df = get_historical_data_for_volume(api, sel_stock, days_back=5) 
+                        position_data = strategy.open_positions.get(sel_stock)
+                        
+                        if df is not None and len(df) > 0:
+                            fig = create_chart(df.tail(100), position_data)
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.warning(f"Historical data is unavailable for charting {sel_stock}.")
         
         with tab_positions:
             st.subheader("📍 Open Positions Manager (Bot Tracked)")
