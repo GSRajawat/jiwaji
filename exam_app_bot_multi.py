@@ -81,7 +81,7 @@ def init_supabase():
 @st.cache_resource
 def init_flattrade_api():
     api = NorenApiPy()
-    api.set_session(userid=USER_ID, usertoken=USER_SESSION, password=FLATTRADE_PASSWORD)
+    api.set_session(userid=user_id, usertoken=session_token, password=password)
     return api
 
 class FnOBreakoutStrategy:
