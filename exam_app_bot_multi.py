@@ -29,10 +29,44 @@ from api_helper import NorenApiPy
 # Setting logging level to INFO for production use, but DEBUG for development/troubleshooting
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Flattrade API Credentials ---
-USER_SESSION = "77c9731f0ad26f10f670228c7acc4f6b46899fcd1a756c9d8f374cb8e524b5c3"
-USER_ID = "FZ03508"
-FLATTRADE_PASSWORD = "Shubhi@3"
+# trade_app_secure.py (Example)
+import streamlit as st
+from api_helper import NorenApiPy # Assuming this is your API wrapper
+
+# Initialize an empty NorenApiPy object in session state
+if 'api' not in st.session_state:
+    st.session_state['api'] = None
+
+# Create a login form
+with st.sidebar:
+    st.header("Login with Your Credentials")
+    user_id = st.text_input("User ID")
+    password = st.text_input("Password", type="password")
+    session_token = st.text_input("Session/API Key", type="password")
+    
+    if st.button("Login"):
+        # 1. Attempt to create and login the API object
+        api = NorenApiPy()
+        # You'll need to use your broker's specific login/session method here
+        login_successful = api.set_session(userid=user_id, session_token=session_token) 
+        
+        if login_successful == "Ok": # Adjust this check based on your actual api_helper logic
+            st.session_state['api'] = api
+            st.success(f"Successfully logged in as {user_id}!")
+        else:
+            st.error("Login failed. Check your User ID and Session Key.")
+
+# --- Main App Logic ---
+if st.session_state['api']:
+    # The rest of your app logic uses st.session_state['api']
+    api = st.session_state['api']
+    
+    st.title("Trading Dashboard")
+    # ... call api.get_order_book(), api.get_trade_book() etc.
+    orders = api.get_order_book()
+    st.write("Orders:", orders)
+else:
+    st.info("Please login in the sidebar to run the application.")
 
 # --- Supabase Credentials ---
 SUPABASE_URL = "https://zybakxpyibubzjhzdcwl.supabase.co"
