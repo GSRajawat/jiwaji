@@ -134,15 +134,10 @@ class FnOBreakoutStrategy:
             if pos['trailing_stop'] and current_price >= pos['trailing_stop']: return True, "Trailing stop hit"
         return False, None
 
-    def enter_position(self, signal_type, entry_price, day_high, day_low, quantity, symbol, product_type, custom_sl=None, custom_target=None, signal_source="Day H/L"):
-        """Enter a position. Can accept custom SL/Target from advanced strategies."""
+    def enter_position(self, signal_type, entry_price, day_high, day_low, quantity, symbol, product_type):
+        """Enter a position."""
         position_type = 'long' if signal_type == 'BUY' else 'short'
-        
-        if custom_sl is not None and custom_target is not None:
-            stop_loss = custom_sl
-            target = custom_target
-        elif position_type == 'long':
-            # Use fixed percentage logic (for Day H/L strategy)
+        if position_type == 'long':
             stop_loss = entry_price * (1 - self.stop_loss_pct)
             target = entry_price * (1 + self.target_pct)
         else:
@@ -152,8 +147,7 @@ class FnOBreakoutStrategy:
         self.open_positions[symbol] = {
             'type': position_type, 'entry_price': entry_price, 'size': quantity,
             'stop_loss': stop_loss, 'target': target, 'trailing_stop': None,
-            'day_high': day_high, 'day_low': day_low, 'product_type': product_type,
-            'signal_source': signal_source # Track which strategy opened the position
+            'day_high': day_high, 'day_low': day_low, 'product_type': product_type
         }
 
 # --- Helper Functions ---
@@ -569,68 +563,21 @@ def get_total_positions_count(api):
     try:
         all_positions = api.get_positions()
         
-        # Debug: Print the raw response
-        logging.debug(f"Raw positions response type: {type(all_positions)}")
-        logging.debug(f"Raw positions response: {all_positions}")
-        
-        # Check if response is valid
-        if not all_positions:
-            logging.warning("No positions data received from API (empty response)")
-            return 0
-            
-        # Check if it's an error response
-        if isinstance(all_positions, dict):
-            if all_positions.get('stat') != 'Ok':
-                logging.warning(f"API returned error: {all_positions.get('emsg', 'Unknown error')}")
-                return 0
-            # If it's a dict with 'stat'='Ok', there might be no positions
-            if 'stat' in all_positions and len(all_positions) <= 2:
-                logging.info("No positions found (API returned Ok but no data)")
-                return 0
-        
-        # Count all positions that have any activity today
-        total_count = 0
-        for pos in all_positions:
-            try:
-                symbol = pos.get('tsym', 'Unknown')
+        if all_positions and not (isinstance(all_positions, dict) and all_positions.get('stat') != 'Ok'):
+            # Count all positions that have any activity today
+            total_count = 0
+            for pos in all_positions:
+                # Count if there's any buy or sell activity
+                buyqty = int(pos.get('buyqty', 0))
+                sellqty = int(pos.get('sellqty', 0))
                 
-                # Get quantities - handle multiple possible field names
-                buyqty = 0
-                sellqty = 0
-                netqty = 0
-                
-                # Try different field names that the API might use
-                for buy_field in ['buyqty', 'daybuyqty', 'buymqty']:
-                    if buy_field in pos:
-                        buyqty = int(float(str(pos[buy_field]).strip() or 0))
-                        break
-                
-                for sell_field in ['sellqty', 'daysellqty', 'sellmqty']:
-                    if sell_field in pos:
-                        sellqty = int(float(str(pos[sell_field]).strip() or 0))
-                        break
-                        
-                for net_field in ['netqty', 'netmqty']:
-                    if net_field in pos:
-                        netqty = int(float(str(pos[net_field]).strip() or 0))
-                        break
-                
-                # Count position if there's any activity
-                if buyqty > 0 or sellqty > 0 or netqty != 0:
+                if buyqty > 0 or sellqty > 0:
                     total_count += 1
-                    logging.info(f"✓ Position #{total_count}: {symbol} - Buy: {buyqty}, Sell: {sellqty}, Net: {netqty}")
-                else:
-                    logging.debug(f"✗ Skipped {symbol} - No activity (Buy: {buyqty}, Sell: {sellqty}, Net: {netqty})")
-                    
-            except (ValueError, AttributeError, TypeError) as e:
-                logging.warning(f"Error parsing position {pos.get('tsym', 'Unknown')}: {e}")
-                continue
-        
-        logging.info(f"📊 TOTAL POSITIONS COUNT: {total_count}")
-        return total_count
-        
+            
+            return total_count
+        return 0
     except Exception as e:
-        logging.error(f"Error getting total positions count: {e}", exc_info=True)
+        logging.error(f"Error getting total positions count: {e}")
         return 0
 
 def calculate_bid_ask_spread(quote_data):
@@ -730,118 +677,6 @@ def get_closed_positions_today(api):
         logging.error(f"Error getting closed positions: {e}")
         return set()
 
-# --- NEW STRATEGY LOGIC: Institutional Volume Pattern Trading Strategy ---
-
-def check_institutional_volume_pattern(df: pd.DataFrame, 
-                                      vol_ma_period: int = 20, 
-                                      min_spike_multiple: float = 2.0,
-                                      min_consolidation_bars: int = 5,
-                                      max_consolidation_bars: int = 15,
-                                      max_consolidation_range_pct: float = 0.6,
-                                      min_breakout_volume_multiple: float = 1.3) -> dict:
-    """
-    Implements the Institutional Volume Pattern Trading Strategy.
-    Checks the historical data for a complete Phase 1 -> Phase 2 -> Phase 3 setup.
-    Expects DataFrame with Index='Date' (datetime) and columns: 
-    'Volume', 'Open', 'High', 'Low', 'Close'.
-
-    Returns:
-        A dictionary containing the trade signal ('BUY', 'SELL', or 'NONE'), 
-        entry price, SL, and minimum 1:4 R:R target.
-    """
-    
-    # 1. Data Preparation and Sanity Check
-    df = df.sort_index(ascending=True) # Ensure data is time-sorted
-    if len(df) < vol_ma_period + max_consolidation_bars + 2:
-        return {"signal": "NONE", "reason": "Insufficient data points for calculation."}
-
-    # Use existing column names
-    df['Vol_MA'] = df['Volume'].rolling(window=vol_ma_period).mean()
-    
-    current_bar_index = len(df) - 1
-    breakout_bar = df.iloc[current_bar_index]
-    
-    # Iterate backwards to find a Phase 1 spike
-    for phase1_end_index in range(current_bar_index - max_consolidation_bars - 1, 
-                                  current_bar_index - min_consolidation_bars + 1):
-        
-        if phase1_end_index < vol_ma_period:
-            continue
-        
-        phase1_bar = df.iloc[phase1_end_index]
-        
-        # --- 2. Phase 1: Institutional Volume Spike Detection ---
-        if phase1_bar['Volume'] < phase1_bar['Vol_MA'] * min_spike_multiple:
-            continue
-            
-        phase1_body = abs(phase1_bar['Close'] - phase1_bar['Open'])
-        
-        # Determine the initial direction 
-        initial_direction = "BULLISH" if phase1_bar['Close'] > phase1_bar['Open'] else "BEARISH"
-        
-        # --- 3. Phase 2: Sideways Consolidation (Low Volume) ---
-        consolidation_start_index = phase1_end_index + 1
-        consolidation_end_index = current_bar_index - 1
-        
-        consolidation_df = df.iloc[consolidation_start_index : consolidation_end_index + 1]
-        
-        # Check if consolidation is empty (i.e., min_consolidation_bars wasn't met)
-        if consolidation_df.empty:
-            continue
-        
-        # a. Volume Check: Low volume during consolidation
-        consolidation_avg_vol = consolidation_df['Volume'].mean()
-        if phase1_bar['Volume'] / consolidation_avg_vol < 2.0: 
-            continue 
-
-        # b. Price Check: Tight range formation
-        consolidation_high = consolidation_df['High'].max()
-        consolidation_low = consolidation_df['Low'].min()
-        consolidation_range = consolidation_high - consolidation_low
-        
-        # Consolidation range must be small relative to the Phase 1 body (move)
-        if phase1_body == 0 or consolidation_range / phase1_body > max_consolidation_range_pct:
-             continue 
-
-        # --- 4. Phase 3: Breakout with Volume Increase (Current Bar) ---
-        breakout_volume = breakout_bar['Volume']
-        
-        # a. Volume Confirmation
-        if breakout_volume < consolidation_avg_vol * min_breakout_volume_multiple:
-            continue
-            
-        # b. Price Confirmation and R:R calculation
-        
-        if initial_direction == "BULLISH":
-            if breakout_bar['Close'] > consolidation_high and breakout_bar['Open'] < consolidation_high:
-                
-                # SL: Consolidation Low | Risk: Entry - SL
-                risk_points = breakout_bar['Close'] - consolidation_low 
-                target_points = risk_points * 4.0 
-                target_price = breakout_bar['Close'] + target_points
-                
-                return {
-                    "signal": "BUY", "price": breakout_bar['Close'],
-                    "stop_loss": consolidation_low, "target": target_price,
-                    "reason": "Institutional Accumulation Breakout (1:4 R:R)"
-                }
-
-        elif initial_direction == "BEARISH":
-            if breakout_bar['Close'] < consolidation_low and breakout_bar['Open'] > consolidation_low:
-
-                # SL: Consolidation High | Risk: SL - Entry
-                risk_points = consolidation_high - breakout_bar['Close'] 
-                target_points = risk_points * 4.0 
-                target_price = breakout_bar['Close'] - target_points
-                
-                return {
-                    "signal": "SELL", "price": breakout_bar['Close'],
-                    "stop_loss": consolidation_high, "target": target_price,
-                    "reason": "Institutional Distribution Breakdown (1:4 R:R)"
-                }
-        
-    return {"signal": "NONE", "reason": "No complete Institutional Pattern found."}
-
 # --- MAIN APP ---
 
 def main():
@@ -876,39 +711,6 @@ def main():
         strategy.target_pct = target_pct / 100
         strategy.trailing_stop_pct = trailing_stop_pct / 100
         
-        st.subheader("Strategy Selection")
-        strategy_mode = st.radio(
-            "Select Trading Strategy",
-            ['Institutional Volume Pattern (New)', 'Day High/Low Breakout (Original)'],
-            index=0, key="strategy_mode_radio"
-        )
-        strategy.strategy_mode = strategy_mode
-
-        if strategy_mode == 'Institutional Volume Pattern (New)':
-            st.markdown("---")
-            st.subheader("Institutional Strategy Config")
-            strategy_interval = st.selectbox(
-                "Chart Interval",
-                ['15', '5'],
-                index=0, key="inst_interval", help="Recommended: 15-minute chart."
-            )
-            vol_ma_period = st.number_input("Volume MA Period", 10, 50, 20, 1, key="vol_ma_period")
-            min_spike_multiple = st.slider("Phase 1 Volume Multiple (X)", 1.5, 4.0, 2.0, 0.1, key="spike_mult")
-            min_consolidation_bars = st.number_input("Min Phase 2 Bars", 3, 10, 5, 1, key="min_phase2")
-            max_consolidation_bars = st.number_input("Max Phase 2 Bars", 10, 30, 15, 1, key="max_phase2")
-            max_consolidation_range_pct = st.slider("Max Phase 2 Range (% of P1 Move)", 0.2, 1.0, 0.6, 0.1, key="max_p2_range_pct")
-            min_breakout_volume_multiple = st.slider("Phase 3 Volume Multiple (X)", 1.0, 3.0, 1.3, 0.1, key="p3_vol_mult")
-            
-            # Store these parameters in the strategy object
-            strategy.inst_interval = strategy_interval
-            strategy.vol_ma_period = vol_ma_period
-            strategy.min_spike_multiple = min_spike_multiple
-            strategy.min_consolidation_bars = min_consolidation_bars
-            strategy.max_consolidation_bars = max_consolidation_bars
-            strategy.max_consolidation_range_pct = max_consolidation_range_pct
-            strategy.min_breakout_volume_multiple = min_breakout_volume_multiple
-        st.markdown("---")
-        
         st.subheader("Volume Screening Parameters")
         
         enable_daily_volume_screen = st.checkbox("✅ Enable Daily Heavy Volume Screen", value=False, key="enable_daily_vol_screen", help="If unchecked, the bot monitors F&O stocks but ignores the 3-day average cumulative volume filter.")
@@ -918,7 +720,7 @@ def main():
         else:
              volume_multiplier = 3.0 # Default value, ignored if screen is off
         
-        scan_limit = st.number_input("Max Stocks to Track (5-20)", min_value=5, max_value=200, value=200, step=1, key="scan_limit")
+        scan_limit = st.number_input("Max Stocks to Track (5-20)", min_value=5, max_value=200, value=100, step=1, key="scan_limit")
         
         max_price = st.number_input("Stock Price Limit (₹)", min_value=10.0, max_value=20000.0, value=1500.0, step=100.0, key="max_prc")
         
@@ -1198,94 +1000,67 @@ def main():
             
             if can_enter_new_positions:
                 for symbol in strategy.screened_stocks:
-                    if symbol in strategy.open_positions:
+                    if symbol in strategy.open_positions: 
                         logging.debug(f"Skipping {symbol}: Position already open.")
                         continue
-                    if symbol in strategy.rejected_symbols:
+                    if symbol in strategy.rejected_symbols: 
                         logging.debug(f"Skipping {symbol}: Previously rejected today.")
                         continue
+                    
                     if len(strategy.open_positions) >= max_positions:
                         entry_placeholder.warning(f"Position limit ({max_positions}) reached mid-scan. Stopping new entries.")
-                        break
+                        break 
                     
                     # **DOUBLE CHECK: Total positions limit before each order**
                     if enable_total_positions_limit:
                         if get_total_positions_count(api) >= max_total_positions:
-                            entry_placeholder.warning(f"Total positions limit reached for new order attempt. Stopping.")
+                            entry_placeholder.warning(f"🚫 Total positions limit reached during scan! No more entries.")
                             break
+                        
+                    ltp, day_h, day_l, open_price, _, quote_data = get_live_price(api, symbol)
                     
-                    # 1. Fetch Live Data
-                    ltp, day_h, day_l, open_p, current_vol, quote_data = get_live_price(api, symbol)
-                    if ltp is None or day_h is None or day_l is None or open_p is None or current_vol is None or ltp == 0.0:
-                        logging.warning(f"Could not get complete live data for {symbol}. Skipping.")
-                        continue
-                    
-                    signal = None
-                    custom_sl = None
-                    custom_target = None
-                    signal_source = strategy.strategy_mode
-                    
-                    if strategy.strategy_mode == 'Day High/Low Breakout (Original)':
-                        # --- ORIGINAL STRATEGY LOGIC ---
-                        signal = strategy.check_breakout_entry(None, ltp, open_p, day_h, day_l, symbol)
-                        # SL/Target are calculated based on percentages inside enter_position (default)
+                    if ltp is None or ltp == 0 or open_price == 0 or day_h == 0 or day_l == 0: continue
 
-                    elif strategy.strategy_mode == 'Institutional Volume Pattern (New)':
-                        # --- INSTITUTIONAL STRATEGY LOGIC ---
-                        
-                        # Fetch 15-minute historical data (required for this strategy)
-                        hist_df_inst = get_historical_data_for_volume(api, symbol, days_back=20, interval=strategy.inst_interval)
-                        
-                        if hist_df_inst is None or hist_df_inst.empty:
-                            logging.warning(f"Could not fetch {strategy.inst_interval}m historical data for Institutional Check on {symbol}. Skipping.")
+                    signal = None
+                    signal_source = None
+                    
+                    if enable_day_high_low_entry:
+                        if ltp >= day_h and ltp > open_price: 
+                             signal = 'BUY'
+                             signal_source = 'Day High Break'
+                        elif ltp <= day_l and ltp < open_price: 
+                             signal = 'SELL'
+                             signal_source = 'Day Low Break'
+
+                    if signal:
+                        # ... [rest of the existing signal processing code remains the same] ...
+                    # **CHECK FOR PENDING ORDERS FIRST**
+                        if has_pending_order(api, symbol):
+                            entry_placeholder.warning(f"⏳ Pending order already exists for **{symbol}**. Skipping to avoid duplicate orders.")
+                            time_module.sleep(0.5)  # Small delay before next iteration
                             continue
                         
-                        # Check for the pattern
-                        inst_signal = check_institutional_volume_pattern(
-                            hist_df_inst, 
-                            vol_ma_period=strategy.vol_ma_period, 
-                            min_spike_multiple=strategy.min_spike_multiple,
-                            min_consolidation_bars=strategy.min_consolidation_bars,
-                            max_consolidation_bars=strategy.max_consolidation_bars,
-                            max_consolidation_range_pct=strategy.max_consolidation_range_pct,
-                            min_breakout_volume_multiple=strategy.min_breakout_volume_multiple
-                        )
+                        # Determine correct limit price based on signal direction
+                        if signal == 'BUY':
+                            limit_price = get_ask_price(quote_data, ltp)
+                            price_type = "Ask/Offer"
+                        else:  # SELL
+                            limit_price = get_bid_price(quote_data, ltp)
+                            price_type = "Bid"
                         
-                        if inst_signal['signal'] != 'NONE':
-                            # Signal found! Use the calculated SL and Target (1:4 R:R)
-                            signal = inst_signal['signal']
-                            custom_sl = inst_signal['stop_loss']
-                            custom_target = inst_signal['target']
-                            signal_source = inst_signal['reason'] # e.g., "Institutional Accumulation Breakout (1:4 R:R)"
-                        else:
-                            logging.info(f"Institutional Check: {inst_signal['reason']} on {symbol}")
+                        if limit_price == 0.0: 
+                            entry_placeholder.warning(f"Cannot calculate {price_type} price for {symbol}. Skipping.")
+                            continue
+                            
+                        qty = int(trade_amount / limit_price) if sizing_mode == "Fixed Amount" and trade_amount else quantity
+                        if not quantity and not trade_amount or qty is None or qty <= 0: continue
 
-                    # 2. Execute Trade if Signal is found
-                    if signal in ['BUY', 'SELL']:
                         trantype = 'B' if signal == 'BUY' else 'S'
                         
-                        # Calculate limit price using best bid/ask
-                        limit_price = get_ask_price(quote_data, ltp) if signal == 'BUY' else get_bid_price(quote_data, ltp)
-                        price_type = "Ask" if signal == 'BUY' else "Bid"
-
-                        # Calculate quantity
-                        if sizing_mode == "Fixed Quantity":
-                            qty = quantity
-                        else:
-                            qty = int(trade_amount / limit_price) if trade_amount and limit_price else 0
-                        
-                        if qty <= 0:
-                            entry_placeholder.warning(f"Qty calculation failed for {symbol}. Skipping.")
-                            continue
-
-                        # 3. Attempt MIS (Intraday) entry (Product Priority)
+                        # 1. Attempt MIS (Intraday)
                         entry_placeholder.success(f"⚡ {signal_source} Signal FOUND on **{symbol}**! Placing **MIS** Limit Order @ {limit_price:.2f} ({price_type}, Tick Adjusted)...")
                         res_mis = execute_trade(api, trantype, qty, symbol, product_type='M', limit_price=limit_price)
-
-                        # ... (Rest of the trade execution/verification logic remains the same) ...
                         
-
-                                    
                         if res_mis and res_mis.get('stat') == 'Ok':
                             order_no = res_mis.get('norenordno')
                             if order_no and 'order_conditions' in st.session_state:
@@ -1303,17 +1078,14 @@ def main():
                                 for order in order_status:
                                     if order.get('norenordno') == order_no:
                                         status = order.get('status', '').upper()
-                                    # ... (Inside the 'is_filled' block for MIS)
                                         if status == 'COMPLETE':
                                             is_filled = True
                                             fill_price = float(order.get('avgprc', limit_price))
-                                            # Call enter_position with custom SL/Target
-                                            strategy.enter_position(signal, fill_price, day_h, day_l, qty, symbol, product_type='M', 
-                                                                    custom_sl=custom_sl, custom_target=custom_target, signal_source=signal_source) 
+                                            # NOW add to positions with actual fill price
+                                            strategy.enter_position(signal, fill_price, day_h, day_l, qty, symbol, product_type='M')
                                             entry_placeholder.success(f"✅ MIS Order FILLED for **{symbol}** @ {fill_price:.2f}. Position added.")
                                             time_module.sleep(1)
-                                            break 
-                                        # ... (End of is_filled block for MIS) ...
+                                            break
                                         elif status == 'REJECTED':
                                             is_rejected = True
                                             error_mis = order.get('rejreason', 'Order Rejected')
@@ -1332,21 +1104,6 @@ def main():
                                         break
                             else:
                                 error_mis = "Order not filled within 5 seconds"
-                                
-                            # **CANCEL UNFILLED ORDER**
-                            if not is_filled and not is_rejected:
-                                entry_placeholder.warning(f"⚠️ MIS Order not filled within 5s for **{symbol}**. Cancelling order...")
-                                try:
-                                    cancel_result = api.cancel_order(orderno=order_no)
-                                    if cancel_result and cancel_result.get('stat') == 'Ok':
-                                        entry_placeholder.info(f"✅ Order {order_no} cancelled successfully for **{symbol}**.")
-                                        error_mis = "Order cancelled - not filled within 5 seconds"
-                                    else:
-                                        error_mis = f"Order not filled. Cancel attempt: {cancel_result.get('emsg', 'Failed')}"
-                                        entry_placeholder.warning(f"⚠️ Cancel failed for {order_no}: {cancel_result.get('emsg', 'Unknown error')}")
-                                except Exception as cancel_error:
-                                    error_mis = f"Order not filled. Cancel error: {str(cancel_error)}"
-                                    entry_placeholder.error(f"❌ Error cancelling order {order_no}: {cancel_error}")
                         else:
                             error_mis = res_mis.get('emsg', 'No API Response') if res_mis else 'No API Response'
                             is_rejected = True  # API level rejection
@@ -1391,17 +1148,14 @@ def main():
                                 for order in order_status:
                                     if order.get('norenordno') == order_no:
                                         status = order.get('status', '').upper()
-                                        # ... (Inside the 'is_filled' block for CNC fallback)
                                         if status == 'COMPLETE':
                                             is_filled = True
                                             fill_price = float(order.get('avgprc', limit_price))
-                                            # Call enter_position with custom SL/Target
-                                            strategy.enter_position(signal, fill_price, day_h, day_l, qty, symbol, product_type='C', 
-                                                                    custom_sl=custom_sl, custom_target=custom_target, signal_source=signal_source)
+                                            # NOW add to positions with actual fill price
+                                            strategy.enter_position(signal, fill_price, day_h, day_l, qty, symbol, product_type='C')
                                             entry_placeholder.success(f"✅ CNC Order FILLED for **{symbol}** @ {fill_price:.2f}. Position added.")
                                             time_module.sleep(1)
                                             break
-                                        # ... (End of is_filled block for CNC) ...
                                         elif status == 'REJECTED':
                                             error_cnc = order.get('rejreason', 'Order Rejected')
                                             entry_placeholder.error(f"❌ CNC Order REJECTED for **{symbol}**. Reason: {error_cnc}")
@@ -1409,21 +1163,6 @@ def main():
                             
                             if is_filled:
                                 continue  # Move to next symbol - SUCCESS!
-                            
-                            # **CANCEL UNFILLED CNC ORDER**
-                            if not is_filled and not is_rejected:
-                                entry_placeholder.warning(f"⚠️ CNC Order not filled within 5s for **{symbol}**. Cancelling order...")
-                                try:
-                                    cancel_result = api.cancel_order(orderno=order_no)
-                                    if cancel_result and cancel_result.get('stat') == 'Ok':
-                                        entry_placeholder.info(f"✅ CNC Order {order_no} cancelled successfully for **{symbol}**.")
-                                        error_cnc = "Order cancelled - not filled within 5 seconds"
-                                    else:
-                                        error_cnc = f"Order not filled. Cancel attempt: {cancel_result.get('emsg', 'Failed')}"
-                                        entry_placeholder.warning(f"⚠️ Cancel failed for {order_no}: {cancel_result.get('emsg', 'Unknown error')}")
-                                except Exception as cancel_error:
-                                    error_cnc = f"Order not filled. Cancel error: {str(cancel_error)}"
-                                    entry_placeholder.error(f"❌ Error cancelling CNC order {order_no}: {cancel_error}")
                             
                             error_cnc = "Order not filled within 5 seconds" if not is_filled else res_cnc.get('emsg', 'Unknown Error')
                         else:
@@ -1696,13 +1435,9 @@ def main():
                         
                 pos_df['Status'] = pos_df.apply(determine_status, axis=1)
                 
-                # Convert columns to float, handling empty strings
-                pos_df['rpnl'] = pd.to_numeric(pos_df.get('rpnl', 0), errors='coerce').fillna(0.0)
-                pos_df['urmtom'] = pd.to_numeric(pos_df.get('urmtom', 0), errors='coerce').fillna(0.0)
-
-                # Calculate totals using urmtom instead of m2m_pnl
-                total_rpnl = pos_df['rpnl'].sum()
-                total_m2m = pos_df['urmtom'].sum()
+                # Calculate totals
+                total_rpnl = pos_df['rpnl'].astype(float).sum() if 'rpnl' in pos_df.columns else 0.0
+                total_m2m = pos_df['m2m_pnl'].astype(float).sum() if 'm2m_pnl' in pos_df.columns else 0.0
                 total_pnl = total_rpnl + total_m2m
                 
                 cols = ['tsym', 'netqty', 'buyqty', 'sellqty', 'netavgprc', 'ltp', 'rpnl', 'm2m_pnl', 'prd', 'Status']
