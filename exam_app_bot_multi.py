@@ -878,7 +878,7 @@ def main():
         st.subheader("Strategy Selection")
         strategy_mode = st.radio(
             "Select Trading Strategy",
-            ['Institutional Volume Pattern (New)', 'Day High/Low Breakout (Original)'],
+            ['Day High/Low Breakout (Original)', 'Institutional Volume Pattern (New)'],
             index=0, key="strategy_mode_radio"
         )
         strategy.strategy_mode = strategy_mode
