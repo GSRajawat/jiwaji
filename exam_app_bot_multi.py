@@ -40,15 +40,15 @@ if 'api' not in st.session_state:
 # Create a login form
 with st.sidebar:
     st.header("Login with Your Credentials")
-    USER_ID = st.text_input("User ID")
-    FLATTRADE_PASSWORD = st.text_input("Password", type="password")
-    USER_SESSION = st.text_input("Session/API Key", type="password")
+    user_id = st.text_input("User ID")
+    password = st.text_input("Password", type="password")
+    session_token = st.text_input("Session/API Key", type="password")
     
     if st.button("Login"):
         # 1. Attempt to create and login the API object
         api = NorenApiPy()
         # You'll need to use your broker's specific login/session method here
-        login_successful = api.set_session(userid=USER_ID, session_token=USER_SESSION) 
+        login_successful = api.set_session(userid=user_id, session_token=session_token) 
         
         if login_successful == "Ok": # Adjust this check based on your actual api_helper logic
             st.session_state['api'] = api
