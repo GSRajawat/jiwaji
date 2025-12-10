@@ -67,7 +67,6 @@ if st.session_state['api']:
     st.write("Orders:", orders)
 else:
     st.info("Please login in the sidebar to run the application.")
-
 # --- Supabase Credentials ---
 SUPABASE_URL = "https://zybakxpyibubzjhzdcwl.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp5YmFreHB5aWJ1YnpqaHpkY3dsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQ4OTQyMDgsImV4cCI6MjA3MDQ3MDIwOH0.8ZqreKy5zg_M-B1uH79T6lQXH62eRvvouh_OiMjwqGU"
