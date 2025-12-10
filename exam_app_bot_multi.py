@@ -975,7 +975,7 @@ def main():
         enable_total_positions_limit = st.checkbox("📊 Enable Max Total Positions Limit (Broker Account)", True, key="enable_total_pos_limit_toggle", help="Limits total positions (open + closed today) in broker account")
         
         if enable_total_positions_limit:
-            max_total_positions = st.number_input("Max Total Positions (Open + Closed Today)", min_value=1, max_value=100, value=10, step=1, key="max_total_pos_input", help="Total number of positions (open + settled) allowed in broker account today")
+            max_total_positions = st.number_input("Max Total Positions (Open + Closed Today)", min_value=1, max_value=100, value=15, step=1, key="max_total_pos_input", help="Total number of positions (open + settled) allowed in broker account today")
         else:
             max_total_positions = 999  # No limit
         
