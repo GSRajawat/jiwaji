@@ -28,14 +28,14 @@ from api_helper import NorenApiPy
 # Setting logging level to INFO for production use, but DEBUG for development/troubleshooting
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Flattrade API Credentials ---
-USER_SESSION = "85088163aa19d4e92afaa3a6efef85c5f2be37bb0eb8d8801d4c27145481b574"
-USER_ID = "FZ03508"
-FLATTRADE_PASSWORD = "Shubhi@3"
+USER_SESSION = st.secrets["FLATTRADE_USER_SESSION"]
+USER_ID = st.secrets["FLATTRADE_USER_ID"]
+FLATTRADE_PASSWORD = st.secrets["FLATTRADE_PASSWORD"]
+
 
 # --- Supabase Credentials ---
-SUPABASE_URL = "https://zybakxpyibubzjhzdcwl.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp5YmFreHB5aWJ1YnpqaHpkY3dsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQ4OTQyMDgsImV4cCI6MjA3MDQ3MDIwOH0.8ZqreKy5zg_M-B1uH79T6lQXH62eRvvouh_OiMjwqGU"
+SUPABASE_URL = st.secrets["SUPABASE_URL"]
+SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 
 # Initialize Supabase client
 @st.cache_resource
@@ -1585,11 +1585,11 @@ def main():
                     if auto_trading and should_exit:
                         # **CHECK FOR PENDING ORDERS**
                         if has_pending_order(api, sym):
-                            exit_message_placeholder.warning(f"â³ Pending order already exists for **{sym}**. Skipping auto-exit.")
+                            exit_message_placeholder.warning(f"⏳ Pending order already exists for **{sym}**. Skipping auto-exit.")
                             continue
                         
                         symbols_to_exit.append(sym)
-                        exit_message_placeholder.warning(f"âš¡ Auto-Exiting {sym} due to: {reason.upper()}... Placing Limit Order.")
+                        exit_message_placeholder.warning(f"⚡ Auto-Exiting {sym} due to: {reason.upper()}... Placing Limit Order.")
                         
                         trantype = 'S' if pos['type'] == 'long' else 'B'
                         product_type_to_use = pos['product_type']
@@ -1603,19 +1603,73 @@ def main():
                             price_type = "Ask"
                         
                         if exit_limit_price == 0.0:
-                            exit_message_placeholder.error(f"âŒ Exit Order FAILED for {sym}. Cannot calculate {price_type} price for Limit Order. Try placing manually.")
+                            exit_message_placeholder.error(f"❌ Exit Order FAILED for {sym}. Cannot calculate {price_type} price for Limit Order. Try placing manually.")
                             continue
                         
+                        # **STEP 1: Place LIMIT order**
                         res = execute_trade(api, trantype, pos['size'], sym, product_type=product_type_to_use, limit_price=exit_limit_price)
                         
                         if res and res.get('stat') == 'Ok':
                             order_no = res.get('norenordno')
                             if order_no and 'order_conditions' in st.session_state:
                                 st.session_state.order_conditions[order_no] = reason 
-                            exit_message_placeholder.success(f"âœ… Exit Limit Order Placed for {sym}. (Order No: {order_no}, Product: {product_type_to_use}, Price: {exit_limit_price:.2f} {price_type})")
+                            exit_message_placeholder.success(f"✅ Exit Limit Order Placed for {sym}. (Order No: {order_no}, Price: {exit_limit_price:.2f} {price_type}). Waiting 5s...")
                             time_module.sleep(5)  # **5 SECOND DELAY**
+                            
+                            # **STEP 2: Check if limit order filled**
+                            order_status = api.get_order_book()
+                            is_filled = False
+                            
+                            if order_status and not (isinstance(order_status, dict) and order_status.get('stat') != 'Ok'):
+                                for order in order_status:
+                                    if order.get('norenordno') == order_no:
+                                        status = order.get('status', '').upper()
+                                        if status == 'COMPLETE':
+                                            is_filled = True
+                                            exit_message_placeholder.success(f"✅ Exit Limit Order FILLED for {sym}.")
+                                            break
+                            
+                            # **STEP 3: If NOT filled, cancel limit order and place MARKET order**
+                            if not is_filled:
+                                exit_message_placeholder.warning(f"⚠️ Limit order not filled for {sym}. Cancelling and placing MARKET order...")
+                                
+                                # Cancel the limit order
+                                try:
+                                    cancel_result = api.cancel_order(orderno=order_no)
+                                    if cancel_result and cancel_result.get('stat') == 'Ok':
+                                        exit_message_placeholder.info(f"✅ Limit order {order_no} cancelled for {sym}.")
+                                    else:
+                                        exit_message_placeholder.warning(f"⚠️ Cancel failed for {order_no}: {cancel_result.get('emsg', 'Unknown')}")
+                                except Exception as cancel_error:
+                                    exit_message_placeholder.error(f"❌ Error cancelling order {order_no}: {cancel_error}")
+                                
+                                # **Place MARKET order**
+                                try:
+                                    api_product_type = 'I' if product_type_to_use == 'M' else 'C'
+                                    
+                                    market_order_res = api.place_order(
+                                        buy_or_sell=trantype,
+                                        product_type=api_product_type,
+                                        exchange='NSE',
+                                        tradingsymbol=f"{sym}-EQ",
+                                        quantity=pos['size'],
+                                        discloseqty=0,
+                                        price_type='MKT',  # **MARKET ORDER**
+                                        retention='DAY'
+                                    )
+                                    
+                                    if market_order_res and market_order_res.get('stat') == 'Ok':
+                                        market_order_no = market_order_res.get('norenordno')
+                                        if market_order_no and 'order_conditions' in st.session_state:
+                                            st.session_state.order_conditions[market_order_no] = f"{reason} (Market)"
+                                        exit_message_placeholder.success(f"✅ MARKET Exit Order Placed for {sym}. (Order No: {market_order_no})")
+                                    else:
+                                        exit_message_placeholder.error(f"❌ Market Order FAILED for {sym}. Error: {market_order_res.get('emsg', 'Unknown')}")
+                                        
+                                except Exception as market_error:
+                                    exit_message_placeholder.error(f"❌ Error placing market order for {sym}: {market_error}")
                         else:
-                            exit_message_placeholder.error(f"âŒ Exit Order FAILED for {sym}. Error: {res.get('emsg', 'Unknown Error')}")
+                            exit_message_placeholder.error(f"❌ Exit Order FAILED for {sym}. Error: {res.get('emsg', 'Unknown Error')}")
                             
                 manual_exits = [item for item in pos_data if item['Action']]
                 if manual_exits:
@@ -1628,10 +1682,14 @@ def main():
                         trantype = 'S' if pos['type'] == 'long' else 'B'
                         product_type_to_use = pos['product_type']
                         
-                        exit_limit_price = get_mid_price(quote_data, ltp) 
+                        # Use bid for SELL, ask for BUY
+                        if trantype == 'S':
+                            exit_limit_price = get_bid_price(quote_data, ltp)
+                        else:
+                            exit_limit_price = get_ask_price(quote_data, ltp)
                         
                         if exit_limit_price == 0.0:
-                            exit_message_placeholder.error(f"❌ Manual Exit Order FAILED for {sym}. Cannot calculate mid-price for Limit Order.")
+                            exit_message_placeholder.error(f"❌ Manual Exit Order FAILED for {sym}. Cannot calculate price for Limit Order.")
                             continue
                             
                         exit_message_placeholder.warning(f"Manual Exit: Placing {product_type_to_use} Limit Order for {sym} @ {exit_limit_price:.2f} (Tick Adjusted)...")
@@ -1642,7 +1700,53 @@ def main():
                             order_no = res.get('norenordno')
                             if order_no and 'order_conditions' in st.session_state:
                                 st.session_state.order_conditions[order_no] = "Manual Exit"
-                            exit_message_placeholder.success(f"✅ Manual Exit Limit Order Placed for {sym}. (Order No: {order_no})")
+                            exit_message_placeholder.success(f"✅ Manual Exit Limit Order Placed for {sym}. (Order No: {order_no}). Waiting 5s...")
+                            time_module.sleep(5)
+                            
+                            # Check if filled
+                            order_status = api.get_order_book()
+                            is_filled = False
+                            
+                            if order_status and not (isinstance(order_status, dict) and order_status.get('stat') != 'Ok'):
+                                for order in order_status:
+                                    if order.get('norenordno') == order_no:
+                                        status = order.get('status', '').upper()
+                                        if status == 'COMPLETE':
+                                            is_filled = True
+                                            exit_message_placeholder.success(f"✅ Manual Exit FILLED for {sym}.")
+                                            break
+                            
+                            # If not filled, place market order
+                            if not is_filled:
+                                exit_message_placeholder.warning(f"⚠️ Limit order not filled for {sym}. Placing MARKET order...")
+                                
+                                # Cancel limit order
+                                try:
+                                    api.cancel_order(orderno=order_no)
+                                except:
+                                    pass
+                                
+                                # Place market order
+                                try:
+                                    api_product_type = 'I' if product_type_to_use == 'M' else 'C'
+                                    
+                                    market_res = api.place_order(
+                                        buy_or_sell=trantype,
+                                        product_type=api_product_type,
+                                        exchange='NSE',
+                                        tradingsymbol=f"{sym}-EQ",
+                                        quantity=pos['size'],
+                                        discloseqty=0,
+                                        price_type='MKT',
+                                        retention='DAY'
+                                    )
+                                    
+                                    if market_res and market_res.get('stat') == 'Ok':
+                                        exit_message_placeholder.success(f"✅ MARKET Exit Order Placed for {sym}.")
+                                    else:
+                                        exit_message_placeholder.error(f"❌ Market Exit FAILED for {sym}.")
+                                except Exception as e:
+                                    exit_message_placeholder.error(f"❌ Error placing market exit for {sym}: {e}")
                         else:
                             exit_message_placeholder.error(f"❌ Manual Exit Order FAILED for {sym}. Error: {res.get('emsg', 'Unknown Error')}")
                     
