@@ -65,7 +65,7 @@ with st.sidebar:
                     
                     # 2. Call the set_session method with valid strings
                     # The variables user_id and session_token are guaranteed to be non-empty strings here.
-                    login_result = api.set_session(userid=user_id, session_token=session_token) 
+                    login_result = api.set_session(userid=user_id, session=session_token) 
 
                     if login_result == "Ok": # Adjust this check based on your actual api_helper logic
                         st.session_state['api'] = api
