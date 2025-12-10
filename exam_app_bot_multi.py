@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -29,69 +28,10 @@ from api_helper import NorenApiPy
 # Setting logging level to INFO for production use, but DEBUG for development/troubleshooting
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# trade_app_secure.py (Example)
-import streamlit as st
-from api_helper import NorenApiPy # Assuming this import is at the top of your file
-
-# Initialize session state for the API object
-if 'api' not in st.session_state:
-    st.session_state['api'] = None
-
-# --- Secure Login Sidebar ---
-with st.sidebar:
-    st.header("Login with Your Credentials")
-    
-    # Use a form to group inputs and control submission
-    with st.form(key='login_form'):
-        user_id = st.text_input("User ID (e.g., FZ03508)")
-        session_token = st.text_input("Session/API Key", type="password")
-        
-        # Checkbox for agreement (Optional, but good practice)
-        agree_to_run = st.checkbox("I confirm these are my credentials and I agree to run the trading application.")
-        
-        login_submitted = st.form_submit_button("Login")
-
-        if login_submitted:
-            # --- CRITICAL FIX: Validation Check ---
-            if not user_id or not session_token:
-                st.error("❌ User ID and Session/API Key cannot be empty.")
-            elif not agree_to_run:
-                st.warning("Please check the confirmation box to proceed.")
-            else:
-                # --- The API Call (Only runs on valid input) ---
-                try:
-                    # 1. Initialize the API object
-                    api = NorenApiPy()
-                    
-                    # 2. Call the set_session method with valid strings
-                    # The variables user_id and session_token are guaranteed to be non-empty strings here.
-                    login_result = api.set_session(userid=user_id, session=session_token) 
-
-                    if login_result == "Ok": # Adjust this check based on your actual api_helper logic
-                        st.session_state['api'] = api
-                        st.success(f"✅ Successfully logged in as {user_id}!")
-                        st.balloons()
-                        # Use st.rerun() in newer Streamlit versions (>= 1.28)
-                        st.experimental_rerun() 
-                    else:
-                        # API returned an error message (e.g., Invalid session)
-                        st.error(f"⚠️ Login failed. Check your credentials. API Response: {login_result}")
-
-                except TypeError as e:
-                    # This catches the specific error, often related to argument type
-                    st.error(f"System Error (TypeError): Check that your Session Key is a valid string. Details: {e}")
-                except Exception as e:
-                    # Catch all other API or network errors
-                    st.error(f"An unexpected error occurred during login: {e}")
-
-# --- Main App Logic (Unchanged from previous step) ---
-if st.session_state['api']:
-    api = st.session_state['api']
-    st.title(f"🚀 Trading Dashboard for {api.uid}")
-    # ... The rest of your app logic ...
-else:
-    st.info("Please login in the sidebar to run the application.")
-
+# --- Flattrade API Credentials ---
+USER_SESSION = "85088163aa19d4e92afaa3a6efef85c5f2be37bb0eb8d8801d4c27145481b574"
+USER_ID = "FZ03508"
+FLATTRADE_PASSWORD = "Shubhi@3"
 
 # --- Supabase Credentials ---
 SUPABASE_URL = "https://zybakxpyibubzjhzdcwl.supabase.co"
@@ -106,7 +46,7 @@ def init_supabase():
 @st.cache_resource
 def init_flattrade_api():
     api = NorenApiPy()
-    api.set_session(userid=user_id, usertoken=session_token, password=password)
+    api.set_session(userid=USER_ID, usertoken=USER_SESSION, password=FLATTRADE_PASSWORD)
     return api
 
 class FnOBreakoutStrategy:
