@@ -934,7 +934,7 @@ def main():
         if liquidity_filter_type in ["Bid-Ask Spread %", "Combined (Spread + Depth)"]:
             max_spread_pct = st.slider(
                 "Max Bid-Ask Spread %", 
-                0.1, 2.0, 0.5, 0.1, 
+                0.1, 2.0, 0.3, 0.1, 
                 key="max_spread_pct",
                 help="Lower spread = more liquid. Typical liquid stocks: <0.5%"
             )
@@ -983,7 +983,7 @@ def main():
         
         st.radio("New Entry Product Priority", ['MIS (Intraday) -> CNC (Delivery)'], index=0, disabled=True, help="Bot will attempt MIS first, then CNC if MIS fails.")
             
-        max_positions = st.number_input("Max Open Positions Limit", min_value=1, value=10, step=1, key="max_pos_limit")
+        max_positions = st.number_input("Max Open Positions Limit", min_value=1, value=15, step=1, key="max_pos_limit")
 
         st.subheader("Position Sizing")
         sizing_mode = st.radio("Mode", ["Fixed Amount", "Fixed Quantity"], key="size_mode")
