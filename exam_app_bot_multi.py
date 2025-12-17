@@ -587,7 +587,7 @@ def trading_dashboard():
         
         st.subheader("Volume Screening Parameters")
         
-        enable_daily_volume_screen = st.checkbox("✅ Enable Daily Heavy Volume Screen", value=False, key="enable_daily_vol_screen", help="If unchecked, the bot monitors F&O stocks but ignores the 3-day average cumulative volume filter.")
+        enable_daily_volume_screen = st.checkbox("✅ Enable Daily Heavy Volume Screen", value=True, key="enable_daily_vol_screen", help="If unchecked, the bot monitors F&O stocks but ignores the 3-day average cumulative volume filter.")
 
         if enable_daily_volume_screen:
             volume_multiplier = st.slider("Volume Multiplier (X times 3-day Avg)", 0.5, 10.0, 2.0, 0.5, key="vol_mult_slider", help="Current cumulative volume must be this many times the 3-day average volume for the same time.")
